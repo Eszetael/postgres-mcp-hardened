@@ -1,0 +1,24 @@
+# Dependency updates arrive as pull requests, which means they arrive through the same checks as
+# everything else: the PostgreSQL matrix, the adversarial corpus, the TLS suite. An update that
+# breaks a refusal cannot merge.
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule: { interval: weekly }
+    open-pull-requests-limit: 5
+    groups:
+      # One pull request for the routine bumps, so the interesting ones are not buried in noise.
+      patch-and-minor:
+        update-types: [minor, patch]
+
+  # The workflows hold `contents: write` and `id-token: write`. An action left on a tag that moves
+  # is an unreviewed dependency with permission to publish under our name, so these get watched too.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule: { interval: weekly }
+    open-pull-requests-limit: 5
+
+  - package-ecosystem: docker
+    directory: /
+    schedule: { interval: weekly }

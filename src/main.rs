@@ -1376,7 +1376,13 @@ pub(crate) fn handle_initialize(params: &Value) -> Value {
             // The one channel that reaches the person, through the agent, on a transport where
             // stderr is invisible. Kept to a few sentences: a wall of text here is ignored.
             "instructions": posture::instructions(),
-            "serverInfo": { "name": server_label(), "version": "0.1.0" },
+            "serverInfo": {
+                "name": server_label(),
+                "version": "0.1.0",
+                // `description` on Implementation, from 2025-11-25: a client listing several
+                // servers can say what each one is without the user opening its documentation.
+                "description": "Read-only PostgreSQL for AI agents, with the read-only part enforced before the database sees the statement."
+            },
             "capabilities": { "tools": {}, "resources": {} }
         }
     })
@@ -1979,6 +1985,16 @@ pub(crate) fn handle_analyze_indexes(args: &Value) -> Value {
 /// else; `idempotentHint: true` because a repeated call changes nothing (the DATA may have changed
 /// underneath, which is a different property and not what this hint describes).
 pub(crate) fn tool_def(name: &str, title: &str, desc: &str, input_schema: Value) -> Value {
+    // MCP schemas are JSON Schema 2020-12. Saying which dialect a schema is written in is not
+    // decoration: a validator that guesses will guess wrong on the keywords that differ between
+    // drafts, and the caller reading our schema is a machine choosing how to build the call.
+    let mut input_schema = input_schema;
+    if let Some(obj) = input_schema.as_object_mut() {
+        obj.insert(
+            "$schema".into(),
+            json!("https://json-schema.org/draft/2020-12/schema"),
+        );
+    }
     json!({
         "name": name,
         "title": title,

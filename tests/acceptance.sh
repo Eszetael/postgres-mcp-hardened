@@ -495,10 +495,36 @@ done
 stop
 rm -f "$PAUD"
 
+section "What a 401 tells a client that has not authenticated yet"
+# RFC 9728: the 401 must point at the metadata document, or a client cannot discover WHERE to
+# authenticate and the operator is left explaining it by hand.
+start DATABASE_URL="$URL" MCP_BEARER_TOKEN=acc_wa_tok MCP_PUBLIC_URL="http://localhost:$PORT"
+h=$(curl -s -i -m 15 -H content-type:application/json "http://127.0.0.1:$PORT/mcp" \
+     -d '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}' | tr -d '\r')
+echo "$h" | grep -qi '^HTTP/1.1 401' && ok "an unauthenticated call is refused" || no "not refused" "$(echo "$h" | head -1)"
+echo "$h" | grep -qi '^www-authenticate:' && ok "and the refusal carries WWW-Authenticate" || no "no WWW-Authenticate header" "$(echo "$h" | head -12)"
+echo "$h" | grep -qi 'resource_metadata=' && ok "which names where the metadata lives (RFC 9728)" || no "no resource_metadata" "$(echo "$h" | grep -i www-authenticate)"
+m=$(curl -s -m 15 "http://127.0.0.1:$PORT/.well-known/oauth-protected-resource")
+echo "$m" | grep -q 'resource' && ok "and that document answers" || no "metadata document missing" "$m"
+stop
+# Without a public URL the pointer cannot be built — we will not take it from the caller's own Host
+# header, because then the caller decides where the client goes to authenticate. The gap has to
+# surface as posture rather than as silence.
+start DATABASE_URL="$URL" MCP_BEARER_TOKEN=acc_wa_tok2
+h=$(curl -s -i -m 15 -H content-type:application/json "http://127.0.0.1:$PORT/mcp" \
+     -d '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}' | tr -d '\r')
+echo "$h" | grep -qi '^www-authenticate: *Bearer *$' && ok "with no public URL the header degrades honestly" || no "unexpected header" "$(echo "$h" | grep -i www-auth)"
+p=$(curl -s -m 25 -H content-type:application/json -H 'authorization: Bearer acc_wa_tok2' "http://127.0.0.1:$PORT/mcp" \
+     -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"security_posture","arguments":{}}}' | body)
+echo "$p" | grep -q 'auth.undiscoverable' && ok "and the posture says the login is undiscoverable" || no "gap not reported" "$p"
+stop
+
 section "The next revision, behind the switch it ships behind"
 # The draft removes the handshake, so discovery has to work with the switch OFF too: a client
 # probing an older server is exactly how the specification says backwards compatibility is found.
 start DATABASE_URL="$URL"
+t=$(call '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}')
+echo "$t" | grep -q 'json-schema.org/draft/2020-12/schema' && ok "tool schemas say which JSON Schema dialect they are" || no "no dialect declared" "$(echo "$t" | head -c 300)"
 d=$(call '{"jsonrpc":"2.0","id":1,"method":"server/discover"}')
 echo "$d" | grep -q '2025-11-25' && ok "server/discover answers even with the preview off" || no "no discovery" "$d"
 echo "$d" | grep -q '2026-07-28' && no "the draft is advertised without being asked for" "$d" || ok "and does not advertise the draft nobody enabled"

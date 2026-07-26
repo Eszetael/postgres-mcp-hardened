@@ -93,8 +93,16 @@ server checks each one rather than assuming it.
 | Rate and concurrency limits | `ratelimit.rs`, `pipeline.rs` | many source addresses; per-IP limiting does not isolate an actor, and we say so in the code |
 | Provenance wrapper | `tools.rs` | a client that renders `structuredContent` straight into a prompt — off by default, documented |
 | Hash-chained audit | `audit_log.rs` | truncating the tail, unless an anchor is kept elsewhere |
+| Request/header agreement | `protocol.rs` | nothing, for a gateway that authorises on `Mcp-Method`/`Mcp-Name` — but only from `2026-07-28`, where those headers exist. Earlier revisions have no such headers, so a gateway on those transports must read the body |
+| Origin refusal | `http.rs` | a non-browser client, which never sends `Origin` — this defends against a page in someone's browser reaching a loopback server, not against a program |
 
 ## Residual risks, unfixed and named
+
+- **A gateway that authorises on headers, on an older revision.** `Mcp-Method`/`Mcp-Name` only
+  exist from `2026-07-28`. If you put an authorising proxy in front of this server on `2025-11-25`
+  or `2025-06-18`, the proxy has nothing to route on but the body — and if it decides without
+  parsing it, it is deciding about a request it has not seen. We refuse the mismatch where the
+  headers exist; we cannot invent them where they do not.
 
 - **Side channels.** Query cost and timing reveal information about data the caller may not read.
   Unaddressed; addressing it properly would mean refusing legitimate work.

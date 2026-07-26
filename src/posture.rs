@@ -401,6 +401,28 @@ pub(crate) fn report(db: Option<&str>) -> Value {
             fix: Some("set MCP_BEARER_TOKEN, or JWT_PUBKEY_PEM with JWT_AUD and JWT_ISS".into()),
         });
     }
+    // Authentication that a client cannot discover is authentication the operator will end up
+    // explaining by hand. RFC 9728 says the 401 points at the metadata document; we refuse to build
+    // that pointer from the request's own Host header, because then the answer to "where do I
+    // authenticate" would be chosen by whoever asked. So it needs configuring — and when it is
+    // missing, that has to be visible somewhere other than a packet capture.
+    if authed && !env_set("MCP_PUBLIC_URL") {
+        findings.push(Finding {
+            id: "auth.undiscoverable",
+            // On a loopback listener this is usually a client with a hardcoded token, so it is a
+            // note. Exposed, it is a warning: the people who will hit it are the ones who cannot
+            // ask you how to log in.
+            severity: if exposed {
+                Severity::Warn
+            } else {
+                Severity::Note
+            },
+            fact: "authentication is required, but a 401 cannot tell a client where to authenticate: \
+                   MCP_PUBLIC_URL is unset, so the WWW-Authenticate header degrades to a bare \"Bearer\""
+                .into(),
+            fix: Some("set MCP_PUBLIC_URL to the address clients reach this server on".into()),
+        });
+    }
     if !env_set("MCP_AUDIT_LOG") {
         findings.push(Finding {
             id: "audit.stderr_only",

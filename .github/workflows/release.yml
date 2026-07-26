@@ -1,5 +1,9 @@
 name: Release
 
+# Third-party actions are pinned to a commit, not a tag. These jobs hold `contents: write` and
+# `id-token: write`: a tag that moves is an unreviewed dependency with permission to publish under
+# our name. Dependabot proposes the bumps, and they arrive as reviewable pull requests.
+
 # Zero-friction distribution: on a v* tag, build binaries for 5 platforms and attach them to the GitHub Release.
 # A user downloads one file and points claude_desktop_config.json at it - no npx, no cargo.
 on:
@@ -86,7 +90,7 @@ jobs:
           done
 
       - name: Upload to release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           # A `-rc` tag is a rehearsal of this workflow, not a release: it stays a draft so the
           # artefacts can be inspected before anything is visible to anyone.
@@ -121,7 +125,7 @@ jobs:
     steps:
       - uses: actions/download-artifact@v4
         with: { path: dist, merge-multiple: true }
-      - uses: sigstore/cosign-installer@v3
+      - uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3
       - name: Sign every artefact and its checksum file
         run: |
           shopt -s nullglob
@@ -140,14 +144,14 @@ jobs:
       # exactly the failure nobody notices until someone checks a release that has no provenance.
       - name: Build provenance (public repositories only)
         if: ${{ !github.event.repository.private }}
-        uses: actions/attest-build-provenance@v2
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
         with:
           subject-path: 'dist/*'
       - name: Say plainly when provenance was not produced
         if: ${{ github.event.repository.private }}
         run: |
           echo "::warning title=No provenance::This repository is private, so GitHub will not persist           a build attestation. The artefacts ARE signed (cosign keyless, see the .sig/.pem files);           only the SLSA provenance is missing, and it will be produced once the repository is public."
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           draft: ${{ contains(github.ref, '-rc') }}
           prerelease: ${{ contains(github.ref, '-rc') }}
@@ -165,7 +169,7 @@ jobs:
       - run: cargo install cargo-cyclonedx --locked
       - run: cargo cyclonedx --format json --all
       - name: Attach the SBOM to the release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           draft: ${{ contains(github.ref, '-rc') }}
           prerelease: ${{ contains(github.ref, '-rc') }}
@@ -179,12 +183,12 @@ jobs:
       packages: write
     steps:
       - uses: actions/checkout@v4
-      - uses: docker/login-action@v3
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - uses: docker/metadata-action@v5
+      - uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
         id: meta
         with:
           images: ghcr.io/${{ github.repository }}
@@ -192,8 +196,8 @@ jobs:
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
             type=raw,value=latest
-      - uses: docker/setup-buildx-action@v3
-      - uses: docker/build-push-action@v6
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: .
           push: true

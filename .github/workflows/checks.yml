@@ -204,3 +204,15 @@ jobs:
             -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"query","arguments":{"sql":"SELECT id FROM demo"}}}' \
             | grep -q '"id":1'
           docker rm -f mcpci pgci; docker network rm mcpci
+
+      # An image people are told to trust has to be looked at, not only started. Unfixed findings
+      # are reported but do not fail the run: a gate nobody can pass is a gate people switch off,
+      # and there is nothing to do about a vulnerability with no patch except know about it.
+      - name: Scan the image for known vulnerabilities
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: mcp-pg:ci
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: '1'
+          format: table

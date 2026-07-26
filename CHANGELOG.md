@@ -5,6 +5,20 @@
 First release — a secure, read-only PostgreSQL MCP server in Rust; a hardened
 alternative to the deprecated `@modelcontextprotocol/server-postgres`.
 
+- **Speaks three MCP revisions:** `2025-06-18` (what shipping clients speak), `2025-11-25`
+  (current — refusals arrive as tool execution errors, so the model rewrites the query instead of
+  the user seeing a broken call), and `2026-07-28` behind `MCP_PROTOCOL_PREVIEW=1` while it is
+  still a draft upstream. `server/discover` answers under every revision, and carries the security
+  posture as structured data — so a client can learn it is talking to a superuser connection
+  before it sends a query.
+- **Two of the draft's rules are treated as security controls:** `Mcp-Method`/`Mcp-Name` must
+  agree with the request body, and a mismatch is refused and audited — the headers exist so a
+  gateway can authorise without parsing the body, and if the two may disagree then whatever
+  authorised and whatever runs saw different requests. A protocol version we do not implement is
+  refused rather than silently served under a contract nobody agreed to.
+- **Signed releases:** every artefact is signed with Sigstore keyless signing, verifiable with
+  `cosign verify-blob` against the workflow identity; public releases additionally carry SLSA
+  build provenance. Release actions are pinned to commit hashes, not moving tags.
 - **Read-only, enforced three ways:** every query runs inside an explicit
   `BEGIN TRANSACTION READ ONLY` that is always rolled back, so nothing this server does
   can ever be committed — on top of the AST validation and the session flag.
