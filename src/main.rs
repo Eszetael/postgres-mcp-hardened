@@ -1026,13 +1026,14 @@ pub(crate) async fn mcp_handler(
     // both here, because the header agreement check below needs to know which contract applies
     // before the request reaches the thread that runs it.
     let body_params = req.get("params").cloned().unwrap_or_else(|| json!({}));
-    let wire_rev = Some(protocol::rev_from_meta(&body_params).unwrap_or_else(|| {
+    let rev_for_request = protocol::rev_from_meta(&body_params).unwrap_or_else(|| {
         headers
             .get("mcp-protocol-version")
             .and_then(|v| v.to_str().ok())
             .and_then(protocol::Rev::parse)
             .unwrap_or(protocol::Rev::V20250618)
-    }));
+    });
+    let wire_rev = Some(rev_for_request);
 
     // `Mcp-Method`/`Mcp-Name` must agree with the body from 2026-07-28. A proxy that routed or
     // authorised on the header while we executed the body would be deciding about a different
@@ -1040,7 +1041,7 @@ pub(crate) async fn mcp_handler(
     // trust. The refusal is audited: it is a security event, not a parse hiccup.
     let body_method = req.get("method").and_then(|v| v.as_str()).unwrap_or("");
     if let Err((code, msg)) = protocol::check_header_agreement(
-        wire_rev.unwrap(),
+        rev_for_request,
         body_method,
         protocol::body_target_name(body_method, &body_params).as_deref(),
         headers.get("mcp-method").and_then(|v| v.to_str().ok()),
