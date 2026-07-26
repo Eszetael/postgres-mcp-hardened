@@ -41,7 +41,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       # The toolchain comes from rust-toolchain.toml — one file, read by rustup, so the version
       # cannot differ between a laptop, the test matrix and the artefacts people download. The
@@ -163,7 +163,7 @@ jobs:
     needs: [checks]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       # rustup honours rust-toolchain.toml, so the version stays in exactly one file.
       - run: rustup show
       - run: cargo install cargo-cyclonedx --locked
@@ -182,7 +182,7 @@ jobs:
       contents: read
       packages: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           registry: ghcr.io
