@@ -115,6 +115,17 @@ name columns — `describe_table` lists them and marks the redacted one.
 With that in place a bypass returns a permission error instead of a secret, and the setting above
 becomes what it should be: a second layer, and a clear signal of intent to whoever reads the config.
 
+## Found a way through?
+
+Open a pull request with the line that proves it — `tests/adversarial/corpus/` is where every
+bypass this project has suffered already lives, with the round in which it stopped working. An
+accepted report becomes a permanent test, credited to whoever found it. The corpus runs on every
+build and anyone can run it against their own database:
+
+```bash
+ADV_URL='postgres://…' ADV_TABLE=people ADV_REDACT_COL=ssn ./tests/adversarial/run.sh
+```
+
 ## Supported versions
 
 The latest published release is supported. This is pre-1.0; APIs may change.

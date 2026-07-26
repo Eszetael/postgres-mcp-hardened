@@ -276,6 +276,19 @@ to stay hidden gets handed back.
 The output ends with checks that return no rows when it worked, and a reminder that the server itself
 will tell you what the role can do the moment you point it at the database.
 
+## The corpus of things that got through
+
+Every shape that defeated a control during review lives in `tests/adversarial/`, with the round in
+which it stopped working. It runs on every build, and — because the cases are written against
+placeholders rather than our fixture — you can point it at your own database:
+
+```bash
+ADV_URL='postgres://…' ADV_TABLE=people ADV_REDACT_COL=ssn ./tests/adversarial/run.sh
+```
+
+A security claim you can only check by reading our source is a claim you have to take on trust, and
+this project's own history is the argument against that.
+
 ## Security model
 
 The full statement of what this server guarantees, what it does not, and which control enforces

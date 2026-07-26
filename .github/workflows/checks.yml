@@ -88,6 +88,40 @@ jobs:
       - run: cargo build --locked --release
       - run: ./tests/acceptance.sh
 
+  adversarial:
+    # The corpus is the public form of every claim this project makes about refusals. It runs here on
+    # a throwaway schema, and anyone can run the same file against their own database — which is the
+    # only version of a security claim that can be checked without trusting us.
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: ci  # pragma: allowlist secret - throwaway CI database, dies with the runner
+        options: >-
+          --health-cmd pg_isready --health-interval 5s --health-timeout 5s --health-retries 10
+        ports: ["5432:5432"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.83.0
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --locked --release
+      - name: Seed a schema for the corpus to run against
+        env:
+          PGPASSWORD: ci  # pragma: allowlist secret
+        run: |
+          psql -h 127.0.0.1 -U postgres -v ON_ERROR_STOP=1 <<'SQL'
+          CREATE TABLE staff (staff_id int, first_name text, password text);
+          INSERT INTO staff VALUES (1, 'Ada', 'a-secret-hash');
+          CREATE TABLE film (title text);
+          INSERT INTO film VALUES ('Casablanca');
+          CREATE SEQUENCE seq;
+          SQL
+      - name: Run the adversarial corpus
+        env:
+          ADV_URL: postgres://postgres:ci@127.0.0.1:5432/postgres  # pragma: allowlist secret
+        run: ./tests/adversarial/run.sh
+
   docs-claims:
     # Documentation honesty as a build gate. Claims drift from code silently — a "verified" that
     # names no test, a settings table that has fallen behind — and by the time a user notices, the

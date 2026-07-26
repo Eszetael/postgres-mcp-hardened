@@ -1,0 +1,28 @@
+# Attempts to change data through a server that only reads.
+#
+# expect	SQL	why this case exists
+deny	INSERT INTO {{T2}} VALUES ('x')	the obvious one
+deny	UPDATE {{T2}} SET x = 1	and its siblings
+deny	DELETE FROM {{T2}}	.
+deny	DROP TABLE {{T2}}	.
+deny	TRUNCATE {{T2}}	.
+deny	CREATE TABLE t (x int)	.
+deny	ALTER TABLE {{T2}} ADD COLUMN zz int	.
+deny	GRANT SELECT ON {{T2}} TO PUBLIC	privilege changes are writes too
+deny	WITH d AS (DELETE FROM {{T2}} RETURNING *) SELECT * FROM d	a data-modifying CTE parses as a query
+deny	WITH u AS (UPDATE {{T2}} SET x=1 RETURNING *) SELECT * FROM u	.
+deny	SELECT 1; DROP TABLE {{T2}}	two statements in one message
+deny	SELECT * FROM {{T2}} FOR UPDATE	a row lock is a write intent
+deny	EXPLAIN ANALYZE INSERT INTO {{T2}} VALUES ('x')	ANALYZE executes what it explains
+deny	COMMIT	transaction control ends the read-only transaction we rely on
+deny	COMMIT WORK	.
+deny	COMMIT TRANSACTION	.
+deny	COMMIT AND CHAIN	.
+deny	END	.
+deny	END WORK	.
+deny	END TRANSACTION	.
+deny	END AND NO CHAIN	.
+deny	ROLLBACK	.
+deny	ABORT	.
+allow	SELECT 1 AS x FROM {{T2}} LIMIT 1	reading still works
+allow	WITH x AS (SELECT 1 AS x FROM {{T2}} LIMIT 1) SELECT * FROM x	so does a read-only CTE

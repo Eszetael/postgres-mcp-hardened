@@ -1,0 +1,26 @@
+# Functions that reach outside the query: they write, they touch the filesystem, they hold locks, or
+# they take SQL as text and so are invisible to a validator that reads syntax trees.
+#
+# expect	SQL	why this case exists
+deny	SELECT pg_read_file('postgresql.conf', 0, 60)	reads server files
+deny	SELECT pg_ls_dir('.')	lists the data directory
+deny	SELECT pg_import_system_collations(11)	writes to the catalog DESPITE a read-only transaction
+deny	SELECT gin_clean_pending_list('idx')	rewrites index structures, likewise
+deny	SELECT pg_advisory_lock(42)	takes a session lock on a pooled connection
+deny	SELECT pg_terminate_backend(1)	kills other people's work
+deny	SELECT setval('seq', 1)	changes a sequence
+deny	SELECT nextval('seq')	so does reading one
+deny	SELECT lo_import('/etc/passwd')	large objects are a filesystem path
+deny	SELECT dblink('dbname=x', 'SELECT 1')	a bridge to another database routes around everything
+deny	SELECT pg_export_snapshot()	round 5: a function outside every family we had listed
+deny	SELECT query_to_xml('SELECT pg_read_file(''postgresql.conf'')', true, false, '')	round 7: SQL as TEXT — the AST cannot see inside a string
+deny	SELECT query_to_xml('SELECT 1; SELECT 2', true, false, '')	and it swallows two statements
+deny	SELECT query_to_xmlschema('SELECT 1', true, false, '')	same family, other name
+deny	SELECT query_to_xml_and_xmlschema('SELECT 1', true, false, '')	.
+deny	SELECT table_to_xml('{{T}}'::regclass, true, false, '')	dumps a whole table, redaction included
+deny	SELECT cursor_to_xml('c', 1, true, false, '')	.
+deny	SELECT schema_to_xml('public', true, false, '')	.
+deny	SELECT database_to_xml(true, false, '')	.
+allow	SELECT version()	an ordinary read-only builtin
+allow	SELECT pg_size_pretty(pg_relation_size('{{T2}}'))	catalog functions known to read
+allow	SELECT generate_series(1, 3)	set-returning builtins are fine

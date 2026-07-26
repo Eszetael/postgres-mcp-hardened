@@ -1,0 +1,35 @@
+# Every shape that reached a redacted column during adversarial review, and the ones that never did.
+# Run with MCP_REDACT_COLUMNS set (the runner does this). Column name assumed: {{COL}}.
+#
+# expect	SQL	why this case exists
+deny-under-redaction	SELECT {{COL}} FROM {{T}} LIMIT 1	the direct reference
+deny-under-redaction	SELECT "PASSWORD" FROM {{T}} LIMIT 1	quoting and case must not matter
+deny-under-redaction	SELECT {{COL}} AS pw FROM {{T}} LIMIT 1	renaming defeats a filter that inspects result keys
+deny-under-redaction	SELECT md5({{COL}}) FROM {{T}} LIMIT 1	wrapping in a function
+deny-under-redaction	SELECT left({{COL}}, 4) FROM {{T}} LIMIT 1	a prefix is still the value, one character at a time
+deny-under-redaction	SELECT 1 FROM {{T}} WHERE {{COL}} = 'x'	an oracle: the value never leaves, the answer does
+deny-under-redaction	SELECT 1 FROM {{T}} ORDER BY {{COL}}	ordering leaks the same way
+deny-under-redaction	SELECT row_to_json(t) FROM {{T}} t LIMIT 1	round 6: the whole row as one nested value
+deny-under-redaction	SELECT to_jsonb(t) FROM {{T}} t LIMIT 1	same, other function
+deny-under-redaction	SELECT json_agg(t) FROM {{T}} t	same, and it returns every row at once
+deny-under-redaction	SELECT t::text FROM {{T}} t LIMIT 1	round 7: cast the record to text and the tree becomes one leaf
+deny-under-redaction	SELECT {{T}}::text FROM {{T}} LIMIT 1	same, using the table name rather than an alias
+deny-under-redaction	SELECT row_to_json(t)::text FROM {{T}} t LIMIT 1	JSON first, then flattened
+deny-under-redaction	SELECT json_agg(t)::text FROM {{T}} t	the whole column in one string
+deny-under-redaction	SELECT to_jsonb(t) -> '{{COL}}' FROM {{T}} t LIMIT 1	round 7: the name as a literal, not an identifier
+deny-under-redaction	SELECT to_jsonb(t) ->> '{{COL}}' AS x FROM {{T}} t LIMIT 1	same, text extraction
+deny-under-redaction	SELECT to_jsonb(t) #>> '{{{COL}}}' AS x FROM {{T}} t LIMIT 1	path syntax names the key differently
+deny-under-redaction	SELECT jsonb_path_query(to_jsonb(t), '$.{{COL}}') FROM {{T}} t LIMIT 1	jsonpath names it a third way
+deny-under-redaction	SELECT string_agg(to_jsonb(t) ->> '{{COL}}', ',') FROM {{T}} t	aggregation over the same trick
+deny-under-redaction	SELECT array_agg(to_jsonb(t) ->> '{{COL}}') FROM {{T}} t	and again as an array
+deny-under-redaction	SELECT json_build_object('safe', to_jsonb(t) -> '{{COL}}') FROM {{T}} t LIMIT 1	hidden under an innocent key
+deny-under-redaction	SELECT md5(to_jsonb(t) ->> '{{COL}}') FROM {{T}} t LIMIT 1	a digest is still a channel
+deny-under-redaction	WITH x AS (SELECT to_jsonb(t) AS j FROM {{T}} t) SELECT j ->> '{{COL}}' FROM x	one level of indirection
+deny-under-redaction	SELECT ROW(t.*)::text FROM {{T}} t LIMIT 1	round 8: a qualified wildcard is a different AST node than an identifier
+deny-under-redaction	SELECT to_jsonb(t.*)::text FROM {{T}} t LIMIT 1	same shape, other function
+deny-under-redaction	SELECT row_to_json({{T}}.*)::text FROM {{T}} LIMIT 1	same shape, table-qualified
+deny-under-redaction	SELECT x.c9 FROM (SELECT * FROM {{T}}) AS x(c1,c2,c3,c4,c5,c6,c7,c8,c9,c10,c11) LIMIT 1	positional renaming: the name never appears anywhere
+deny-under-redaction	WITH x(c1,c2,c3,c4,c5,c6,c7,c8,c9,c10,c11) AS (SELECT * FROM {{T}}) SELECT c9 FROM x LIMIT 1	the same, through a CTE
+allow	SELECT 1 AS x FROM {{T}} LIMIT 1	an ordinary query must keep working
+allow	SELECT count(*) FROM {{T}}	so must an aggregate
+allow	SELECT * FROM {{T}} LIMIT 1	the value is masked here, not refused: the column is never named
