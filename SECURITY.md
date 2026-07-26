@@ -65,6 +65,25 @@ Verify a log with `postgres-mcp-hardened --verify-audit <file>`. Be precise abou
   old keys go in `MCP_AUDIT_HMAC_KEYS_OLD`, so a rotated log still verifies end to end instead of
   looking like sabotage.
 
+## What `MCP_REDACT_COLUMNS` is, and is not
+
+It masks matching columns at every depth of the result and refuses a query that references them —
+including by alias, inside a function, as a whole-row serialisation (`t::text`, `row_to_json(t)`,
+`json_agg(t)`) or under a name given as a string (`to_jsonb(t) ->> 'password'`, `#>> '{password}'`,
+`'$.password'`). Every one of those was a working bypass before an adversarial review, and each is
+covered by a check in `tests/acceptance.sh`.
+
+It is still filtering by name, and SQL has more ways to name a value than any filter can enumerate.
+Treat it as defence in depth. The control that does not depend on our cleverness is the one the
+database enforces:
+
+```sql
+REVOKE SELECT (password) ON staff FROM your_mcp_role;
+```
+
+With that in place a bypass returns a permission error instead of a secret, and the setting above
+becomes what it should be: a second layer, and a clear signal of intent to whoever reads the config.
+
 ## Supported versions
 
 The latest published release is supported. This is pre-1.0; APIs may change.

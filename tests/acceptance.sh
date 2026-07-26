@@ -198,8 +198,20 @@ start DATABASE_URL="$URL"
 r=$(tool analyze_indexes '{"schema":"public"}' | body)
 d=$(echo "$r" | python3 -c "import sys,json;print(json.dumps(json.load(sys.stdin)['duplicate_indexes']))")
 case "$d" in *probe_active_*) no "partial indexes over disjoint rows called duplicates" "$d";; *) ok "partial indexes over disjoint rows are not duplicates";; esac
-case "$d" in *probe_val_uniq*) no "a unique index was clustered with ordinary ones" "$d";; *) ok "a unique index is not offered up as a redundant copy";; esac
+# An ordinary index sitting next to a UNIQUE on the same column IS the most common real duplicate,
+# and grouping them apart hid exactly the one worth dropping. They belong in one group, with the
+# unique one marked so the answer says which of them earns its keep.
+case "$d" in *"probe_val_uniq [unique"*) ok "a unique index is marked as the one to keep, not hidden";; *) no "unique index not reported with its duplicates" "$d";; esac
 case "$d" in *probe_val_dup1*probe_val_dup2*) ok "genuine duplicates are still reported";; *) no "genuine duplicates missed" "$d";; esac
+docker exec -i acc_pg psql -U postgres -q -v ON_ERROR_STOP=1 <<'SQL' >/dev/null || { echo "fixture failed: expression indexes"; exit 1; }
+CREATE INDEX probe_lower ON idx_probe(lower(val::text));
+CREATE INDEX probe_upper ON idx_probe(upper(val::text));
+CREATE INDEX probe_desc  ON idx_probe(id DESC);
+CREATE INDEX probe_asc   ON idx_probe(id);
+SQL
+d=$(tool analyze_indexes '{"schema":"public"}' | body | python3 -c "import sys,json;print(json.dumps(json.load(sys.stdin)['duplicate_indexes']))")
+case "$d" in *probe_lower*|*probe_upper*) no "different expressions grouped as duplicates" "$d";; *) ok "expression indexes are compared by expression, not by empty indkey";; esac
+case "$d" in *probe_desc*) no "opposite sort orders called duplicates" "$d";; *) ok "sort order counts as part of the index shape";; esac
 r=$(tool database_health '{}' | body)
 echo "$r" | grep -q 'in_use_cluster_wide' && ok "connections separate this database from the cluster" || no "connections scope" "$r"
 echo "$r" | grep -q 'longest_idle_in_transaction_seconds' && ok "an abandoned transaction is named, not disguised as a slow query" || no "idle in transaction" "$r"
@@ -210,6 +222,47 @@ case "$r" in *hidden_*) no "index metadata leaked to a role without access to th
 r=$(tool database_health '{}' | body)
 case "$r" in *hidden_idx*) no "invalid_indexes leaked to a narrow role" "$r";; *) ok "health checks respect table privileges";; esac
 echo "$r" | grep -q 'sequences_unreadable' && ok "sequences it cannot read are declared, not silently dropped" || no "unreadable sequences hidden" "$r"
+stop
+
+section "Controls that were bypassed once (they stay closed)"
+start DATABASE_URL="$URL" MCP_REDACT_COLUMNS=email
+for sql in "SELECT customers::text FROM customers" \
+           "SELECT c::text FROM customers c" \
+           "SELECT row_to_json(c)::text FROM customers c" \
+           "SELECT json_agg(c)::text FROM customers c" \
+           "SELECT to_jsonb(c) ->> 'email' FROM customers c" \
+           "SELECT to_jsonb(c) #>> '{email}' FROM customers c" \
+           "SELECT jsonb_path_query(to_jsonb(c), '\$.email') FROM customers c" \
+           "SELECT md5(to_jsonb(c) ->> 'email') FROM customers c"; do
+  r=$(tool query "{\"sql\":\"$sql\"}" | body)
+  case "$r" in ERROR:*) ok "redaction holds: ${sql:0:44}";; *) case "$r" in *example.com*) no "REDACTED VALUE LEAKED" "$sql -> $r";; *) ok "redaction holds: ${sql:0:44}";; esac;; esac
+done
+# SQL passed as text is invisible to an AST validator, so the whole family is refused.
+for sql in "SELECT query_to_xml('SELECT 1', true, false, '')" \
+           "SELECT table_to_xml('customers'::regclass, true, false, '')" \
+           "SELECT database_to_xml(true, false, '')"; do
+  r=$(tool query "{\"sql\":\"$sql\"}" | body)
+  case "$r" in ERROR:*) ok "refused: ${sql:0:40}";; *) no "SQL-as-text function executed" "$sql -> $r";; esac
+done
+r=$(tool describe_table '{"schema":"public","table":"customers"}' | body)
+echo "$r" | grep -q '"redacted":true' && ok "describe_table marks a redacted column while planning" || no "redaction invisible in describe_table" "$r"
+r=$(tool query '{"sql":"SELECT id FROM orders LIMIT 1"}' | body)
+case "$r" in *redactedColumns*) no "redactedColumns reported where nothing was masked" "$r";; *) ok "redactedColumns describes the result, not the configuration";; esac
+stop
+
+section "Answers an agent can act on"
+start DATABASE_URL="$URL"
+r=$(tool list_tables '{"schema":"publik"}' | body)
+case "$r" in ERROR:*) ok "a mistyped schema is an error, not an empty success";; *) no "mistyped schema returned a clean-looking result" "$r";; esac
+r=$(tool query '{"sql":"SELECT totl FROM orders LIMIT 1"}' | body)
+case "$r" in *totl*) ok "the error names the identifier the caller wrote";; *) no "error does not name the caller's own column" "$r";; esac
+r=$(tool query '{"sql":"SELECT id FROM orders","limit":1,"offset":1}' | body)
+echo "$r" | grep -q pagingNote && ok "paging without ORDER BY says the pages are unstable" || no "no paging warning" "$r"
+r=$(tool explain_query '{"sql":"SELECT count(*) FROM orders","analyze":true}' | body)
+echo "$r" | grep -q '"most_time_in"' && ok "explain_query says where the time went" || no "no plan summary" "$r"
+r=$(tool database_health '{}' | body)
+echo "$r" | grep -q 'tables_never_analyzed' && ok "never-analysed tables are reported (no planner statistics)" || no "missing statistics check" "$r"
+echo "$r" | grep -q 'statistics_window' && ok "the window the counters cover is stated" || no "no statistics window" "$r"
 stop
 
 section "Deployment shapes"

@@ -23,6 +23,33 @@ pub(crate) fn handle_list_schemas(args: &Value) -> Value {
     }
 }
 
+/// An empty list for a schema that does not exist reads exactly like a schema with nothing in it.
+/// `describe_table` already refuses a missing table by name; these two returned a complete, reassuring
+/// structure for `publik` instead — and an agent that has learned to trust the errors takes that as
+/// "nothing to report".
+fn schema_missing(schema: &str, db: Option<&str>) -> Option<Value> {
+    match query_catalog(
+        "SELECT nspname FROM pg_namespace WHERE nspname = $1",
+        &[&schema],
+        db,
+    ) {
+        Ok(v)
+            if v.get("rows")
+                .and_then(|r| r.as_array())
+                .is_some_and(|a| a.is_empty()) =>
+        {
+            Some(err_content(
+                -32602,
+                format!(
+                    "schema {:?} does not exist — list_schemas shows the ones that do",
+                    schema
+                ),
+            ))
+        }
+        _ => None,
+    }
+}
+
 pub(crate) fn handle_list_tables(args: &Value) -> Value {
     let schema = args
         .get("schema")
@@ -42,6 +69,10 @@ pub(crate) fn handle_list_tables(args: &Value) -> Value {
         "  AND has_table_privilege(c.oid, 'SELECT') AND (NOT c.relispartition OR $2) ",
         "ORDER BY c.relname"
     );
+    if let Some(e) = schema_missing(schema, db) {
+        audit("list_tables", "error", None);
+        return e;
+    }
     let show_parts = show_partitions();
     match query_catalog(SQL, &[&schema, &show_parts], db) {
         Ok(v) => {
@@ -221,6 +252,33 @@ pub(crate) fn handle_resources_read(params: &Value) -> Value {
     }
 }
 
+/// Flags the columns this server will refuse to hand over, so the caller learns it while planning
+/// rather than when a finished query is rejected.
+fn mark_redacted_columns(v: &mut Value) {
+    let pats = redacted_columns();
+    if pats.is_empty() {
+        return;
+    }
+    if let Some(rows) = v.get_mut("rows").and_then(|r| r.as_array_mut()) {
+        for row in rows.iter_mut() {
+            let hit = row
+                .get("column_name")
+                .and_then(|c| c.as_str())
+                .map(|c| pats.iter().any(|p| *p == c.to_lowercase()))
+                .unwrap_or(false);
+            if hit {
+                if let Some(o) = row.as_object_mut() {
+                    o.insert("redacted".into(), json!(true));
+                    o.insert(
+                        "redaction_note".into(),
+                        json!("configured in MCP_REDACT_COLUMNS: values are masked and the column cannot be referenced"),
+                    );
+                }
+            }
+        }
+    }
+}
+
 pub(crate) fn handle_describe_table(args: &Value) -> Value {
     let schema = args
         .get("schema")
@@ -264,8 +322,16 @@ pub(crate) fn handle_describe_table(args: &Value) -> Value {
         "  AND has_table_privilege(rel.oid, 'SELECT') ",
         "ORDER BY a.attnum"
     );
+    if let Some(e) = schema_missing(schema, db) {
+        audit("describe_table", "error", None);
+        return e;
+    }
     match query_catalog(SQL, &[&schema, &table], db) {
-        Ok(v) => {
+        Ok(mut v) => {
+            // Planning a query against a redacted column and finding out only when the finished
+            // statement is refused costs a rewrite. The column list is where that belongs.
+            mark_redacted_columns(&mut v);
+            let v = v;
             // Pusty wynik = tabela nie istnieje albo rola jej nie widzi. Bez tego agent dostaje
             // `returnedRows: 0` and reads it as "a table with no columns" — a hallucination instead of an error.
             if v.get("returnedRows").and_then(|n| n.as_u64()) == Some(0) {
@@ -311,7 +377,7 @@ pub(crate) fn cost_guard(sql: &str, max_cost: f64, db: Option<&str>) -> Result<(
         .map_err(|e| CostErr::QueryError(e.to_string()))?;
     let row = client
         .query_one(&format!("EXPLAIN (FORMAT JSON) {}", sql), &[])
-        .map_err(|e| CostErr::QueryError(friendly_pg_error(&e)))?;
+        .map_err(|e| CostErr::QueryError(friendly_pg_error_for(&e, Some(sql))))?;
     let plan: Value = row.get(0); // kolumna json: [{"Plan":{"Total Cost":..}}]
     let total = plan
         .get(0)
@@ -329,9 +395,35 @@ pub(crate) fn cost_guard(sql: &str, max_cost: f64, db: Option<&str>) -> Result<(
     }
 }
 
-pub(crate) fn friendly_pg_error(e: &postgres::Error) -> String {
+/// As above, but names the identifier the caller themselves wrote.
+///
+/// Errors here never echo schema details — that is how a stranger maps a database through error
+/// messages. An identifier taken from the caller's OWN statement is not a disclosure: they typed it.
+/// Without it, a mistyped column in a twenty-column join sent an agent bisecting the query instead of
+/// fixing one word, so the policy was costing accuracy without buying secrecy.
+pub(crate) fn friendly_pg_error_for(e: &postgres::Error, sql: Option<&str>) -> String {
     if let Some(db) = e.as_db_error() {
         let code = db.code().code();
+        if matches!(code, "42703" | "42P01") {
+            if let (Some(sql), Some(name)) = (sql, error_identifier(db.message())) {
+                if sql.to_lowercase().contains(&name.to_lowercase()) {
+                    let what = if code == "42703" {
+                        "column"
+                    } else {
+                        "relation"
+                    };
+                    let how = if code == "42703" {
+                        "describe_table"
+                    } else {
+                        "list_tables"
+                    };
+                    return format!(
+                        "{} {:?} does not exist — check the spelling, or list what does with {} [SQLSTATE {}]",
+                        what, name, how, code
+                    );
+                }
+            }
+        }
         let msg = match code {
             "42501" => "permission denied for this object — the role lacks access",
             "42P01" => "relation does not exist — verify the table name via list_tables",
@@ -346,6 +438,26 @@ pub(crate) fn friendly_pg_error(e: &postgres::Error) -> String {
     } else {
         "database connection/protocol error".to_string()
     }
+}
+
+/// The identifier PostgreSQL names in an "X does not exist" message.
+///
+/// It quotes a bare name (`column "titel" does not exist`) and leaves a qualified one unquoted
+/// (`column f.titel does not exist`) — matching only the quoted form meant the error stayed vague in
+/// exactly the queries where finding the typo by hand is hardest, the ones with several joins.
+fn error_identifier(msg: &str) -> Option<String> {
+    for prefix in ["column ", "relation "] {
+        if let Some(i) = msg.find(prefix) {
+            let rest = &msg[i + prefix.len()..];
+            if let Some(j) = rest.find(" does not exist") {
+                let name = rest[..j].trim().trim_matches('"');
+                if !name.is_empty() && name.len() <= 128 {
+                    return Some(name.to_string());
+                }
+            }
+        }
+    }
+    None
 }
 
 /// Usuwa niewidzialne/bidi znaki (zero-width, bidi override/isolate „Trojan Source", word-joiner, BOM),

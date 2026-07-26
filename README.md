@@ -219,10 +219,16 @@ offered, plus column comments, primary keys and **foreign keys** in the payload.
 ## Tools
 
 - **`explain_query`** — the execution plan; with `analyze` it runs the statement and reports real
-  timings and buffer usage, which is safe here because the statement is validated read-only and
-  runs inside a transaction that is always rolled back.
-- **`database_health`** — cache hit ratio, connection use, longest running statement and
-  transaction, vacuum backlog, invalid indexes, sequences near their limit, replication lag.
+  timings and buffer usage, which is safe here because the statement is validated read-only and runs
+  inside a transaction that is always rolled back. The plan comes with a `summary`: which node spent
+  the time (self time, not inclusive), and where the planner's row estimate was furthest from
+  reality — because a bad estimate is usually why the plan is bad.
+- **`database_health`** — cache hit ratio, connections (this database and the cluster), the longest
+  running statement and the longest abandoned transaction as separate figures, vacuum backlog,
+  invalid indexes, sequences near their ceiling, replication lag, **tables that have never been
+  analysed** (no planner statistics — the usual reason a database looks healthy and runs slowly), and
+  the window the counters cover. Anything the role cannot see is declared rather than returned as a
+  confident zero.
 - **`analyze_indexes`** — unused indexes, duplicates, and tables scanned sequentially often enough
   that an index would pay off.
 - **`top_queries`** — the heaviest statements, from `pg_stat_statements`.
@@ -242,12 +248,15 @@ offered, plus column comments, primary keys and **foreign keys** in the payload.
   verification always on, private CAs via `MCP_SSLROOTCERT`.
 - **Read-only, two ways:** every statement is parsed with `sqlparser` and rejected unless it's a `SELECT`/`WITH`/`EXPLAIN`/`SHOW`; the DB session is additionally set `default_transaction_read_only = on`.
 - **Anti-DoS:** enforced `statement_timeout`, auto-injected `LIMIT`, and an `EXPLAIN`-based cost guard that rejects expensive plans before they run.
-- **Sensitive columns never leave the database:** list them in `MCP_REDACT_COLUMNS` and their
-  values are masked in results *and* the column may not be referenced at all — renaming it
-  (`SELECT password AS pw`) or wrapping it (`SELECT md5(password)`) is refused, because a filter
-  that a model can rename its way past is worse than none. Masking applies at every depth, so
-  serialising a whole row (`row_to_json(t)`, `to_jsonb(t.*)`, `json_agg(t)`) does not smuggle the
-  value out one level down.
+- **Sensitive columns — defence in depth, and honest about it:** `MCP_REDACT_COLUMNS` masks values
+  at every depth and refuses to run a query that references those columns, including the ways round
+  it that an adversarial panel actually found — renaming (`SELECT password AS pw`), wrapping
+  (`md5(password)`), serialising the whole row (`row_to_json(t)`, `t::text`, `json_agg(t)`), and
+  naming the column as a string rather than an identifier (`to_jsonb(t) ->> 'password'`,
+  `#>> '{password}'`, `$.password`). It is still name-based filtering, and name-based filtering
+  cannot be a boundary against the whole SQL language. **The boundary is a privilege the role does
+  not have:** `REVOKE SELECT (password) ON staff FROM your_mcp_role;`. The server says this at
+  startup rather than letting the setting imply a guarantee it cannot keep.
 - **Prompt-injection aware:** row data is returned inside a `trusted="false"` provenance block with delimiters escaped, so a malicious cell can't hijack the agent.
 - **No schema leaks:** database errors are mapped to structured, actionable messages that never echo table/column names.
 - **OAuth 2.1:** optional RS256 bearer-token validation (signature, `exp`, `aud`, `iss`) with scope enforcement; disabled when unconfigured for local/self-host use.
@@ -284,8 +293,8 @@ left resident memory flat and file descriptors unchanged.
 | `MCP_AUDIT_LOG` | path to the append-only audit log (hash-chained); verify with `--verify-audit <file> [--expect-last <hash>]` |
 | `MCP_AUDIT_HMAC_KEY` / `MCP_AUDIT_HMAC_KEY_FILE` | key that turns the audit chain into HMAC-SHA256 — keep it off the host so the log cannot be rewritten (a trailing newline in the file is ignored) |
 | `MCP_AUDIT_HMAC_KEYS_OLD` | comma-separated previous keys, so a log that survived a key rotation still verifies |
-| `MCP_REDACT_COLUMNS` | columns whose values must never reach the model, e.g. `password, ssn, card_number` — masked in results and refused if referenced |
-| `MCP_BEARER_TOKEN` | shared token required on every request, for deployments without an identity provider |
+| `MCP_REDACT_COLUMNS` | columns to keep out of results, e.g. `password, ssn, card_number` — masked at any depth and refused if referenced. Defence in depth, not a boundary: pair it with `REVOKE SELECT (col)` |
+| `MCP_BEARER_TOKEN` | shared token required on every request, for deployments without an identity provider. Ignored when OAuth is configured — accepting it as an alternative would give its holder full scope and leave the audit with no identity |
 | `MCP_STATEMENT_TIMEOUT` | query time limit (PostgreSQL interval, default `30s`) |
 | `MCP_SEARCH_PATH` | schemas to search when a table name is unqualified, e.g. `analytics, public` |
 | `MCP_PASSWORD_FILE` | read the database password from a file instead of putting it in the connection string |
@@ -297,8 +306,8 @@ left resident memory flat and file descriptors unchanged.
 | `MCP_MAX_INFLIGHT_PER_CLIENT` | max concurrent requests from one client (default 4; `0` disables) |
 | `MCP_RATE_RPM` | per-client request rate limit (default 120/min; `0` disables) |
 | `MCP_RATE_BURST` | burst allowance for that limit (default `MCP_RATE_RPM / 4`, min 5) |
-| `MCP_METRICS_TOKEN` | require this token on `/metrics` (open by default, for scraping from a private network; when `MCP_BEARER_TOKEN` is set and this is not, the bearer token is required instead) |
-| `MCP_STRUCTURED_CONTENT` | `1` to also return MCP `structuredContent`; off by default because a client that ignores it pays for every result twice |
+| `MCP_METRICS_TOKEN` | token required on `/metrics`. Without it, `/metrics` follows whatever the server itself requires: open when the server has no authentication, the bearer token when one is set, and closed when OAuth is configured (a JWT is the wrong shape for a scraper — set this instead) |
+| `MCP_STRUCTURED_CONTENT` | `1` to also return MCP `structuredContent`; off by default because a client that ignores it pays for every result twice. The provenance marker travels inside the object, but the delimiter escaping that protects the text block does not apply — a client that pastes structured output straight into a prompt loses that layer |
 | `MCP_RESERVED_AUTH_SLOTS` | database slots kept for authenticated traffic so an anonymous flood cannot take the pool (default: a quarter) |
 | `MCP_PUBLIC_URL` | this server's public base URL, used in the OAuth discovery metadata |
 | `MCP_AUTH_SERVERS` | authorization server URLs advertised in that metadata |

@@ -314,7 +314,10 @@ fn url_for(name: Option<&str>) -> Option<String> {
             .split(';')
             .map(str::trim)
             .filter(|s| !s.is_empty())
-            .filter_map(|e| e.split_once('=').map(|(k, v)| (k.trim().to_string(), v.trim().to_string())))
+            .filter_map(|e| {
+                e.split_once('=')
+                    .map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
+            })
             .collect();
         return match name {
             Some(n) => entries.iter().find(|(k, _)| k == n).map(|(_, u)| u.clone()),
@@ -453,14 +456,21 @@ pub(crate) fn redacted_columns() -> Vec<String> {
     redact_patterns().to_vec()
 }
 
-pub(crate) fn redact_rows(rows: &mut [Value]) {
+/// Returns the column names actually masked in these rows.
+///
+/// Reporting the configured list instead was an echo of the settings, not a description of what
+/// happened: a query against a table with no sensitive column still came back saying
+/// `redactedColumns: ["password"]`, which reads as "something here was hidden".
+pub(crate) fn redact_rows(rows: &mut [Value]) -> std::collections::BTreeSet<String> {
     let pats = redact_patterns();
+    let mut masked = std::collections::BTreeSet::new();
     if pats.is_empty() {
-        return;
+        return masked;
     }
     for row in rows.iter_mut() {
-        redact_value(row, pats);
+        redact_value(row, pats, &mut masked);
     }
+    masked
 }
 
 /// Masks matching keys at EVERY depth, in objects and inside arrays.
@@ -471,20 +481,21 @@ pub(crate) fn redact_rows(rows: &mut [Value]) {
 /// and `json_agg` returned every row at once. Walking the tree closes the whole class of
 /// row-serialising functions, including ones PostgreSQL has not shipped yet, instead of listing
 /// them one by one.
-fn redact_value(v: &mut Value, pats: &[String]) {
+fn redact_value(v: &mut Value, pats: &[String], masked: &mut std::collections::BTreeSet<String>) {
     match v {
         Value::Object(map) => {
             for (k, val) in map.iter_mut() {
                 if pats.iter().any(|p| p == &k.to_lowercase()) {
                     *val = Value::String("[redacted]".into());
+                    masked.insert(k.clone());
                 } else {
-                    redact_value(val, pats);
+                    redact_value(val, pats, masked);
                 }
             }
         }
         Value::Array(items) => {
             for item in items.iter_mut() {
-                redact_value(item, pats);
+                redact_value(item, pats, masked);
             }
         }
         _ => {}
@@ -594,10 +605,13 @@ pub(crate) fn execute_readonly(final_sql: &str, db: Option<&str>) -> Result<Valu
         let streamed: Result<Vec<Value>, String> = (|| {
             let mut it = client
                 .query_raw(&wrapped, std::iter::empty::<&(dyn ToSql + Sync)>())
-                .map_err(|e| friendly_pg_error(&e))?;
+                .map_err(|e| friendly_pg_error_for(&e, Some(final_sql)))?;
             let mut acc: Vec<Value> = Vec::new();
             let mut bytes = 0usize;
-            while let Some(row) = it.next().map_err(|e| friendly_pg_error(&e))? {
+            while let Some(row) = it
+                .next()
+                .map_err(|e| friendly_pg_error_for(&e, Some(final_sql)))?
+            {
                 // A jsonb deserialisation error is PROPAGATED (a silent null means lost data and a misled agent).
                 let txt: Option<String> = row
                     .try_get::<_, Option<String>>(0)
@@ -629,7 +643,7 @@ pub(crate) fn execute_readonly(final_sql: &str, db: Option<&str>) -> Result<Valu
         // defence here — `EXPLAIN VERBOSE` of a long UNION can return hundreds of KB of plan.
         let rows = client
             .query(final_sql, &[])
-            .map_err(|e| friendly_pg_error(&e))?;
+            .map_err(|e| friendly_pg_error_for(&e, Some(final_sql)))?;
         let mut acc: Vec<Value> = Vec::new();
         let mut bytes = 0usize;
         for row in rows.iter() {
@@ -653,10 +667,14 @@ pub(crate) fn execute_readonly(final_sql: &str, db: Option<&str>) -> Result<Valu
     // Redact configured columns before the data can reach the model. Defence in depth, not a
     // replacement for database permissions: it hides values an agent should never see even when
     // somebody writes `SELECT *`. Applied to query results only — column names are not secrets.
-    redact_rows(&mut out);
+    let masked = redact_rows(&mut out);
     // ROLLBACK on EVERY exit path — including success (we never commit anything).
     let _ = client.batch_execute("ROLLBACK");
-    Ok(json!({ "returnedRows": out.len(), "rows": out }))
+    let mut res = json!({ "returnedRows": out.len(), "rows": out });
+    if !masked.is_empty() {
+        res["redactedColumns"] = json!(masked.iter().collect::<Vec<_>>());
+    }
+    Ok(res)
 }
 
 use postgres::types::ToSql;
@@ -696,7 +714,7 @@ pub(crate) fn query_catalog(
         Ok(r) => r,
         Err(e) => {
             let _ = client.batch_execute("ROLLBACK");
-            return Err(friendly_pg_error(&e));
+            return Err(friendly_pg_error_for(&e, Some(sql)));
         }
     };
     let mut out = Vec::with_capacity(rows.len());
@@ -743,9 +761,15 @@ mod tests {
             ]}),
             json!({"id": 3, "PassWord": "case-insensitive"}),
         ];
+        let mut masked = std::collections::BTreeSet::new();
         for row in rows.iter_mut() {
-            redact_value(row, &pats);
+            redact_value(row, &pats, &mut masked);
         }
+        assert_eq!(
+            masked.iter().cloned().collect::<Vec<_>>(),
+            vec!["PassWord", "password", "secret"],
+            "the response must report the columns actually masked, at any depth"
+        );
         let dump = serde_json::to_string(&rows).unwrap();
         assert!(
             !dump.contains("hash") && !dump.contains("deep") && !dump.contains("case-insensitive"),

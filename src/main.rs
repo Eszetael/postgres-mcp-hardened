@@ -827,10 +827,10 @@ pub(crate) fn handle_tools_list() -> Value {
             json!({
                 "type": "object",
                 "properties": {
-                    "sql": { "type": "string", "description": "a single read-only statement: SELECT, WITH, VALUES, TABLE, EXPLAIN or SHOW" },
+                    "sql": { "type": "string", "description": "a single read-only statement: SELECT, WITH, VALUES, EXPLAIN or SHOW (write `SELECT * FROM t`, not `TABLE t`)" },
                     "database": { "type": "string", "description": "which configured database to use; omit when only one is configured" },
                     "limit": { "type": "integer", "minimum": 1, "maximum": 10000, "default": 1000, "description": "maximum rows to return; larger values are capped at 10000 and the response says so" },
-                    "offset": { "type": "integer", "minimum": 0, "default": 0, "description": "rows to skip, for paging; pair it with ORDER BY for stable pages" }
+                    "offset": { "type": "integer", "minimum": 0, "maximum": 1000000000, "default": 0, "description": "rows to skip, for paging; pair it with ORDER BY for stable pages" }
                 },
                 "required": ["sql"]
             })
@@ -943,14 +943,130 @@ pub(crate) fn handle_explain_query(args: &Value) -> Value {
     };
     let stmt = format!("EXPLAIN ({}) {}", opts, sql);
     match query_catalog(&stmt, &[], db) {
-        Ok(v) => {
+        Ok(mut v) => {
             audit("explain_query", "allowed", Some(sql));
+            attach_plan_summary(&mut v);
             ok_content(&v)
         }
         Err(e) => {
             audit("explain_query", "error", Some(sql));
             err_content(-32000, e)
         }
+    }
+}
+
+/// A few lines of conclusion in front of the plan.
+///
+/// A plan for a ten-row query is eleven kilobytes of JSON across seventeen nodes, every one carrying
+/// `Local Dirtied Blocks: 0`. The caller asked why the statement is slow; handing back the raw tree
+/// makes that their problem, and for an agent it is also several thousand tokens per call. The tree
+/// stays — this only says which node cost the most and where the planner's estimate was furthest
+/// from reality, because a bad estimate is the usual reason a plan is wrong at all.
+fn attach_plan_summary(v: &mut Value) {
+    let Some(plan) = v
+        .get("rows")
+        .and_then(|r| r.as_array())
+        .and_then(|a| a.first())
+        .and_then(|r| r.as_object())
+        .and_then(|o| o.values().next())
+        .and_then(|p| p.as_array())
+        .and_then(|a| a.first())
+        .cloned()
+    else {
+        return;
+    };
+    let root = match plan.get("Plan") {
+        Some(p) => p.clone(),
+        None => return,
+    };
+
+    let mut slowest: Option<(String, f64)> = None;
+    let mut worst_estimate: Option<(String, f64, f64)> = None;
+    let mut stack = vec![root.clone()];
+    while let Some(node) = stack.pop() {
+        let label = node
+            .get("Relation Name")
+            .and_then(|r| r.as_str())
+            .map(|r| {
+                format!(
+                    "{} on {}",
+                    node.get("Node Type")
+                        .and_then(|n| n.as_str())
+                        .unwrap_or("?"),
+                    r
+                )
+            })
+            .unwrap_or_else(|| {
+                node.get("Node Type")
+                    .and_then(|n| n.as_str())
+                    .unwrap_or("?")
+                    .to_string()
+            });
+
+        // Self time, not inclusive time: an inclusive figure always names the root and tells nobody
+        // anything.
+        if let Some(total) = node.get("Actual Total Time").and_then(|t| t.as_f64()) {
+            let children: f64 = node
+                .get("Plans")
+                .and_then(|p| p.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|c| c.get("Actual Total Time").and_then(|t| t.as_f64()))
+                        .sum()
+                })
+                .unwrap_or(0.0);
+            let self_ms = (total - children).max(0.0);
+            if slowest.as_ref().is_none_or(|(_, s)| self_ms > *s) {
+                slowest = Some((label.clone(), self_ms));
+            }
+        }
+        if let (Some(est), Some(act)) = (
+            node.get("Plan Rows").and_then(|r| r.as_f64()),
+            node.get("Actual Rows").and_then(|r| r.as_f64()),
+        ) {
+            let off = (est.max(1.0) / act.max(1.0)).max(act.max(1.0) / est.max(1.0));
+            if worst_estimate.as_ref().is_none_or(|(_, e, a)| {
+                off > (e.max(1.0) / a.max(1.0)).max(a.max(1.0) / e.max(1.0))
+            }) {
+                worst_estimate = Some((label, est, act));
+            }
+        }
+        if let Some(children) = node.get("Plans").and_then(|p| p.as_array()) {
+            stack.extend(children.iter().cloned());
+        }
+    }
+
+    let mut summary = serde_json::Map::new();
+    for (field, key) in [
+        ("execution_ms", "Execution Time"),
+        ("planning_ms", "Planning Time"),
+    ] {
+        if let Some(t) = plan.get(key).and_then(|t| t.as_f64()) {
+            summary.insert(field.into(), json!((t * 100.0).round() / 100.0));
+        }
+    }
+    if let Some((label, ms)) = slowest {
+        summary.insert(
+            "most_time_in".into(),
+            json!({ "node": label, "self_ms": (ms * 100.0).round() / 100.0 }),
+        );
+    }
+    if let Some((label, est, act)) = worst_estimate {
+        let off = (est.max(1.0) / act.max(1.0)).max(act.max(1.0) / est.max(1.0));
+        summary.insert(
+            "worst_row_estimate".into(),
+            json!({ "node": label, "estimated": est, "actual": act, "off_by": (off * 10.0).round() / 10.0 }),
+        );
+        if off >= 10.0 {
+            summary.insert(
+                "note".into(),
+                json!("the planner's row estimate is off by an order of magnitude here — usually stale \
+                       or missing statistics; run ANALYZE on the tables involved and read the plan again"),
+            );
+        }
+    }
+    if !summary.is_empty() {
+        v["summary"] = Value::Object(summary);
     }
 }
 
@@ -1313,10 +1429,16 @@ pub(crate) fn handle_query_tool(args: &Value) -> Value {
             }
             if offset > 0 {
                 data["offset"] = json!(offset);
-            }
-            let redacted = redacted_columns();
-            if !redacted.is_empty() {
-                data["redactedColumns"] = json!(redacted);
+                // The description says to add ORDER BY; the loop that pages through a table reads the
+                // response, not the description. Without an ordering PostgreSQL may return the same
+                // row twice across pages and never return another, and nothing in the result would
+                // show it.
+                if !sql.to_uppercase().contains("ORDER BY") {
+                    data["pagingNote"] = json!(
+                        "this query has no ORDER BY, so page boundaries are not stable — rows may \
+                         repeat or be skipped between pages"
+                    );
+                }
             }
             audit("query", "allowed", Some(sql));
             METRICS.query_allowed.fetch_add(1, Ordering::Relaxed);
