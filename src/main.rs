@@ -1121,6 +1121,22 @@ static SECRET_CMP_KEY: Lazy<Vec<u8>> = Lazy::new(|| {
     k
 });
 
+/// The scope a tool call needs. Running SQL is a different privilege from reading the schema, and
+/// `security_posture` deliberately sits with the read tools: an operator investigating a deployment
+/// should not need the scope that lets them query it.
+pub(crate) fn required_scope(tool: &str) -> &'static str {
+    match tool {
+        "query" | "explain_query" => "mcp:query",
+        _ => "mcp:read",
+    }
+}
+
+/// `mcp:admin` stands in for any scope. Kept as its own function so the rule is one line to read and
+/// one line to test, rather than a condition buried in a long authorisation path.
+pub(crate) fn scope_satisfied(ctx: &auth::AuthContext, needed: &str) -> bool {
+    ctx.has_scope(needed) || ctx.has_scope("mcp:admin")
+}
+
 pub(crate) fn enforce_auth(
     headers: &HeaderMap,
     req: &Value,
@@ -1199,13 +1215,9 @@ pub(crate) fn enforce_auth(
             .and_then(|v| v.as_str())
             .unwrap_or("");
 
-        let needed = if name == "query" {
-            "mcp:query"
-        } else {
-            "mcp:read"
-        };
+        let needed = required_scope(name);
 
-        if !ctx.has_scope(needed) && !ctx.has_scope("mcp:admin") {
+        if !scope_satisfied(&ctx, needed) {
             // The identity IS known (the token is valid, only the scope is missing) — it must reach the audit,
             // because this is the insider/escalation case, exactly what the log exists to catch.
             return Err((
@@ -2031,6 +2043,50 @@ pub(crate) fn mark_truncation(data: &mut Value, limit: u64) {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// A read-only token must not be able to run SQL. `explain_query` counts as running SQL because
+    /// with `analyze` it really does — a distinction that would be easy to get wrong and invisible
+    /// if it were.
+    #[test]
+    fn running_sql_needs_a_different_scope_from_reading_the_schema() {
+        assert_eq!(required_scope("query"), "mcp:query");
+        assert_eq!(required_scope("explain_query"), "mcp:query");
+        for read_only in [
+            "list_tables",
+            "list_schemas",
+            "describe_table",
+            "security_posture",
+            "database_health",
+            "analyze_indexes",
+            "top_queries",
+            "anything_added_later",
+        ] {
+            assert_eq!(required_scope(read_only), "mcp:read", "{read_only}");
+        }
+    }
+
+    #[test]
+    fn a_reader_cannot_run_sql_and_admin_can_do_both() {
+        let reader = auth::AuthContext {
+            tenant: "t".into(),
+            scopes: vec!["mcp:read".into()],
+        };
+        assert!(scope_satisfied(&reader, "mcp:read"));
+        assert!(!scope_satisfied(&reader, "mcp:query"));
+
+        let admin = auth::AuthContext {
+            tenant: "t".into(),
+            scopes: vec!["mcp:admin".into()],
+        };
+        assert!(scope_satisfied(&admin, "mcp:read"));
+        assert!(scope_satisfied(&admin, "mcp:query"));
+
+        let none = auth::AuthContext {
+            tenant: "t".into(),
+            scopes: vec![],
+        };
+        assert!(!scope_satisfied(&none, "mcp:read"));
+    }
 
     /// Cloud connection strings (and our own documentation) use `verify-full`/`verify-ca`, which the
     /// driver does not know. Without the rewrite a new user hit "invalid connection string" on the very

@@ -53,7 +53,12 @@ pub fn validate_token(
         required.push("iss".into());
     }
     validation.set_required_spec_claims(&required);
-    // exp is validated by default (validate_exp = true)
+    // exp is validated by default (validate_exp = true).
+    //
+    // nbf is NOT, unless asked: a token minted for later use — the shape an identity provider issues
+    // when it pre-authorises something — was accepted the moment it was created. Validated when
+    // present, not required, because plenty of providers never set it.
+    validation.validate_nbf = true;
 
     let token_data =
         decode::<Claims>(token, &key, &validation).map_err(|e| format!("token invalid: {e}"))?;
@@ -95,6 +100,35 @@ mod tests {
     }
     fn pub_pem() -> Vec<u8> {
         KEYS.1.as_bytes().to_vec()
+    }
+
+    /// A second, unrelated key pair: "signed with a real RSA key" and "signed with OUR key" must be
+    /// distinguishable, and only a different key proves that.
+    fn other_priv_pem() -> Vec<u8> {
+        static OTHER: Lazy<String> = Lazy::new(|| {
+            let mut rng = rand::thread_rng();
+            RsaPrivateKey::new(&mut rng, 2048)
+                .expect("gen rsa")
+                .to_pkcs8_pem(LineEnding::LF)
+                .expect("priv pem")
+                .as_str()
+                .to_string()
+        });
+        OTHER.as_bytes().to_vec()
+    }
+
+    /// base64url without padding, for hand-assembling a token the library would never produce.
+    fn base64_url(bytes: &[u8]) -> String {
+        const A: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+        let mut out = String::new();
+        for c in bytes.chunks(3) {
+            let b = [c[0], *c.get(1).unwrap_or(&0), *c.get(2).unwrap_or(&0)];
+            let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | b[2] as u32;
+            for i in 0..(c.len() + 1) {
+                out.push(A[((n >> (18 - 6 * i)) & 0x3F) as usize] as char);
+            }
+        }
+        out
     }
 
     fn now() -> usize {
@@ -139,5 +173,94 @@ mod tests {
         let token = mint("mcp:read", "mcp.pg", "https://idp", 3600);
         let err = validate_token(&token, &pub_pem(), "other.aud", "https://idp").unwrap_err();
         assert!(err.contains("token invalid"));
+    }
+
+    /// Algorithm confusion, the attack this class of code exists to fail: the RSA PUBLIC key is
+    /// public by definition, so an attacker signs an HS256 token using it as the shared secret. A
+    /// validator that trusts the token's own `alg` header verifies it happily and hands out access.
+    /// Ours pins RS256, so the header cannot choose the algorithm — but that has to be a test, not a
+    /// belief, because the failure is invisible and total.
+    #[test]
+    fn hs256_signed_with_the_public_key_is_refused() {
+        let claims = json!({"sub":"attacker","exp":now()+3600,"aud":"mcp.pg",
+                            "iss":"https://idp","scope":"mcp:admin"});
+        let forged = encode(
+            &Header::new(Algorithm::HS256),
+            &claims,
+            &EncodingKey::from_secret(&pub_pem()),
+        )
+        .expect("forge");
+        let err = validate_token(&forged, &pub_pem(), "mcp.pg", "https://idp")
+            .expect_err("HS256 signed with the public key MUST be refused");
+        assert!(err.contains("token invalid"), "{err}");
+    }
+
+    /// `alg: none` — the other half of the same family.
+    #[test]
+    fn an_unsigned_token_is_refused() {
+        let header = base64_url(br#"{"alg":"none","typ":"JWT"}"#);
+        let body = base64_url(
+            format!(
+                r#"{{"sub":"attacker","exp":{},"aud":"mcp.pg","iss":"https://idp","scope":"mcp:admin"}}"#,
+                now() + 3600
+            )
+            .as_bytes(),
+        );
+        let unsigned = format!("{}.{}.", header, body);
+        validate_token(&unsigned, &pub_pem(), "mcp.pg", "https://idp")
+            .expect_err("an unsigned token MUST be refused");
+    }
+
+    #[test]
+    fn a_token_from_another_issuer_is_refused() {
+        let token = mint("mcp:read", "mcp.pg", "https://attacker.example", 3600);
+        let err = validate_token(&token, &pub_pem(), "mcp.pg", "https://idp")
+            .expect_err("a foreign issuer MUST be refused");
+        assert!(err.contains("token invalid"), "{err}");
+    }
+
+    /// A token carrying no `aud`/`iss` at all must not slip past a configured expectation: the
+    /// library only checks a claim it can see, so their absence has to be a rejection in itself.
+    #[test]
+    fn a_token_missing_the_claims_we_require_is_refused() {
+        let key = EncodingKey::from_rsa_pem(&priv_pem()).unwrap();
+        let bare = encode(
+            &Header::new(Algorithm::RS256),
+            &json!({"sub":"x","exp":now()+3600,"scope":"mcp:read"}),
+            &key,
+        )
+        .unwrap();
+        validate_token(&bare, &pub_pem(), "mcp.pg", "https://idp")
+            .expect_err("a token without aud/iss MUST be refused when both are configured");
+    }
+
+    /// Signed by a real RSA key — just not ours.
+    #[test]
+    fn a_token_signed_by_a_different_key_is_refused() {
+        let other = other_priv_pem();
+        let token = encode(
+            &Header::new(Algorithm::RS256),
+            &json!({"sub":"x","exp":now()+3600,"aud":"mcp.pg","iss":"https://idp","scope":"mcp:admin"}),
+            &EncodingKey::from_rsa_pem(&other).unwrap(),
+        )
+        .unwrap();
+        validate_token(&token, &pub_pem(), "mcp.pg", "https://idp")
+            .expect_err("another key's signature MUST be refused");
+    }
+
+    /// A token that is not valid yet. jsonwebtoken does not check `nbf` unless told to, so this
+    /// asserts the configuration rather than the library.
+    #[test]
+    fn a_token_not_yet_valid_is_refused() {
+        let key = EncodingKey::from_rsa_pem(&priv_pem()).unwrap();
+        let future = encode(
+            &Header::new(Algorithm::RS256),
+            &json!({"sub":"x","exp":now()+7200,"nbf":now()+3600,
+                    "aud":"mcp.pg","iss":"https://idp","scope":"mcp:read"}),
+            &key,
+        )
+        .unwrap();
+        validate_token(&future, &pub_pem(), "mcp.pg", "https://idp")
+            .expect_err("a token whose validity has not begun MUST be refused");
     }
 }
