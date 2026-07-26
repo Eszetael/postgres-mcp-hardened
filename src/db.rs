@@ -1,0 +1,617 @@
+//! Connection pools, TLS and read-only execution against PostgreSQL.
+
+use crate::*;
+use once_cell::sync::Lazy;
+use serde_json::{json, Map, Value};
+use std::sync::Arc;
+
+pub(crate) type PgTls = tokio_postgres_rustls::MakeRustlsConnect;
+pub(crate) type PgPool = Pool<PostgresConnectionManager<PgTls>>;
+
+/// Connection string: `DATABASE_URL`, or the first positional argument.
+///
+/// The deprecated server took the URL as `argv[2]`, so people migrating paste exactly that command
+/// into their config. Accepting both means their existing invocation keeps working (issue #845 in
+/// the upstream tracker asked for the environment variable; we support both rather than either).
+pub(crate) fn database_url() -> Option<String> {
+    // A password kept in a file (Kubernetes secret, systemd credential, .pgpass-style) rather than
+    // in the client configuration: `MCP_PASSWORD_FILE` is substituted into the connection string.
+    let with_password = |u: String| -> String {
+        match std::env::var("MCP_PASSWORD_FILE")
+            .ok()
+            .and_then(|p| std::fs::read_to_string(p).ok())
+        {
+            Some(pw) => {
+                let pw = pw.trim_end_matches(['\n', '\r']);
+                let enc: String = pw
+                    .chars()
+                    .map(|c| match c {
+                        '@' => "%40".to_string(),
+                        ':' => "%3A".to_string(),
+                        '/' => "%2F".to_string(),
+                        '#' => "%23".to_string(),
+                        '?' => "%3F".to_string(),
+                        c => c.to_string(),
+                    })
+                    .collect();
+                if let Some(rest) = u
+                    .strip_prefix("postgres://")
+                    .or_else(|| u.strip_prefix("postgresql://"))
+                {
+                    let scheme = if u.starts_with("postgresql://") {
+                        "postgresql://"
+                    } else {
+                        "postgres://"
+                    };
+                    // user[:pw]@host…  →  user:<file password>@host…
+                    if let Some((userinfo, hostpart)) = rest.split_once('@') {
+                        let user = userinfo.split(':').next().unwrap_or(userinfo);
+                        return format!("{}{}:{}@{}", scheme, user, enc, hostpart);
+                    }
+                }
+                u
+            }
+            None => u,
+        }
+    };
+    if let Ok(u) = std::env::var("DATABASE_URL") {
+        if !u.trim().is_empty() {
+            return Some(with_password(u));
+        }
+    }
+    std::env::args().skip(1).find(|a| {
+        a.starts_with("postgres://") || a.starts_with("postgresql://") || a.contains("host=")
+    })
+}
+
+/// The database name inside a connection string — used to label a single-database deployment.
+pub(crate) fn database_name_of(url: &str) -> String {
+    normalize_sslmode(url)
+        .parse::<postgres::Config>()
+        .ok()
+        .and_then(|c| c.get_dbname().map(|s| s.to_string()))
+        .unwrap_or_else(|| "postgres".to_string())
+}
+
+/// The `postgres` driver understands only `disable`/`prefer`/`require`, while libpq (and every cloud
+/// console, and OUR OWN documentation) also uses `verify-ca`, `verify-full` and `allow`. Without this
+/// rewrite, pasting a connection string from RDS or Supabase ended in "invalid connection string" —
+/// on the very first step, for every new user.
+///
+/// The mapping is safe because OUR TLS connector always verifies the chain and the hostname anyway:
+/// `verify-ca`/`verify-full` → `require` weakens nothing, and `allow` → `prefer` keeps the meaning
+/// "use TLS if it is available".
+pub(crate) fn normalize_sslmode(url: &str) -> String {
+    let lower = url.to_ascii_lowercase();
+    for (from, to) in [
+        ("verify-full", "require"),
+        ("verify-ca", "require"),
+        ("allow", "prefer"),
+    ] {
+        let needle = format!("sslmode={}", from);
+        if let Some(pos) = lower.find(&needle) {
+            let mut out = String::with_capacity(url.len());
+            out.push_str(&url[..pos]);
+            out.push_str(&format!("sslmode={}", to));
+            out.push_str(&url[pos + needle.len()..]);
+            // recursion handles any further occurrence
+            return normalize_sslmode(&out);
+        }
+    }
+    url.to_string()
+}
+
+/// TLS connector for PostgreSQL. Without it the server cannot reach any hosted PostgreSQL
+/// (RDS/Supabase/Neon/Render all require SSL) — and `NoTls` did not report that as an error, it
+/// entered a retry loop and HUNG. Certificate verification is ALWAYS on: a "safe by default"
+/// product does not ship a "trust anything" switch. A private CA (an RDS bundle, say) is supplied
+/// through `MCP_SSLROOTCERT`. WHETHER TLS is used follows from `sslmode` in DATABASE_URL
+/// (`disable` = no TLS, `prefer` = default, `require`/`verify-full` = mandatory).
+pub(crate) fn build_tls() -> Result<PgTls, String> {
+    // rustls 0.23 wymaga jawnego wyboru dostawcy kryptografii; ring = czysty Rust, bez OpenSSL
+    // (obraz jest distroless — nie ma tam libssl).
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
+    let mut roots = rustls::RootCertStore::empty();
+    // 1. the system store, if the image has one
+    for cert in rustls_native_certs::load_native_certs().certs {
+        let _ = roots.add(cert);
+    }
+    // 2. bundled Mozilla roots — so it also works without a system store
+    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    // 3. prywatne CA operatora (bundle RDS/Supabase, self-signed w intranecie)
+    if let Ok(path) = std::env::var("MCP_SSLROOTCERT") {
+        let f = std::fs::File::open(&path)
+            .map_err(|e| format!("MCP_SSLROOTCERT: cannot open {}: {}", path, e))?;
+        let mut rd = std::io::BufReader::new(f);
+        let mut added = 0usize;
+        for cert in rustls_pemfile::certs(&mut rd) {
+            let cert = cert.map_err(|e| format!("MCP_SSLROOTCERT: invalid PEM: {}", e))?;
+            roots
+                .add(cert)
+                .map_err(|e| format!("MCP_SSLROOTCERT: rejected certificate: {}", e))?;
+            added += 1;
+        }
+        if added == 0 {
+            return Err(format!(
+                "MCP_SSLROOTCERT: no certificates found in {}",
+                path
+            ));
+        }
+    }
+    eprintln!(
+        "TLS: {} trust anchors ({})",
+        roots.len(),
+        match std::env::var("MCP_SSLROOTCERT") {
+            Ok(p) => format!("including private CA from {}", p),
+            Err(_) => "system + bundled Mozilla roots".to_string(),
+        }
+    );
+    let cfg = rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    Ok(tokio_postgres_rustls::MakeRustlsConnect::new(cfg))
+}
+
+/// Named connection pools. One server can serve several databases — the second most requested
+/// feature against the deprecated server, where the connection string was a command-line argument
+/// and a client config could therefore hold only one database per instance.
+///
+/// `MCP_DATABASE_URLS="prod=postgres://…;dev=postgres://…"` defines them; `DATABASE_URL` (or the
+/// positional argument) remains the single-database form and is registered under the database name.
+pub(crate) static PG_POOLS: Lazy<Result<Vec<(String, PgPool)>, String>> = Lazy::new(|| {
+    let mut out: Vec<(String, PgPool)> = Vec::new();
+    if let Ok(spec) = std::env::var("MCP_DATABASE_URLS") {
+        for entry in spec.split(';').map(str::trim).filter(|s| !s.is_empty()) {
+            let (name, url) = entry
+                .split_once('=')
+                .ok_or_else(|| format!("MCP_DATABASE_URLS: expected name=url, got {:?}", entry))?;
+            let name = name.trim().to_string();
+            if name.is_empty() {
+                return Err("MCP_DATABASE_URLS: empty connection name".to_string());
+            }
+            out.push((name, build_pool(url.trim())?));
+        }
+        if out.is_empty() {
+            return Err("MCP_DATABASE_URLS is set but defines no connections".to_string());
+        }
+        return Ok(out);
+    }
+    let url = database_url().ok_or_else(|| {
+        "no connection string: set DATABASE_URL, MCP_DATABASE_URLS, or pass it as the first argument"
+            .to_string()
+    })?;
+    let name = database_name_of(&url);
+    out.push((name, build_pool(&url)?));
+    Ok(out)
+});
+
+pub(crate) fn build_pool(url: &str) -> Result<PgPool, String> {
+    let mut config = normalize_sslmode(url)
+        .parse::<postgres::Config>()
+        .map_err(|_| {
+            "invalid connection string — if the password contains @ : / # or ?, percent-encode it \
+             (@ becomes %40, : becomes %3A, / becomes %2F, # becomes %23)"
+                .to_string()
+        })?;
+    // Without it, on a network that DROPS packets (rather than refusing connections) the worker
+    // thread hangs forever and cannot be cancelled — requests pile up until the thread pool is gone.
+    if config.get_connect_timeout().is_none() {
+        config.connect_timeout(std::time::Duration::from_secs(10));
+    }
+    let mgr = PostgresConnectionManager::new(config, build_tls()?);
+    // `build_unchecked` = a LAZY pool. `build()` connects eagerly up to max_size with a retry loop,
+    // so a typo in the password made the server simply HANG for tens of seconds with no message.
+    Ok(Pool::builder()
+        .max_size(MAX_DB_CONNS)
+        .min_idle(Some(0))
+        .connection_timeout(std::time::Duration::from_secs(5))
+        .build_unchecked(mgr))
+}
+
+/// The pool for a request. `None` picks the only configured database, or reports the choices.
+pub(crate) fn pool_for(name: Option<&str>) -> Result<&'static PgPool, String> {
+    let pools = PG_POOLS.as_ref().map_err(|e| e.clone())?;
+    match name {
+        Some(n) => pools
+            .iter()
+            .find(|(k, _)| k == n)
+            .map(|(_, p)| p)
+            .ok_or_else(|| {
+                format!(
+                    "unknown database {:?} — configured: {}",
+                    n,
+                    pools
+                        .iter()
+                        .map(|(k, _)| k.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            }),
+        None if pools.len() == 1 => Ok(&pools[0].1),
+        None => Err(format!(
+            "several databases are configured ({}) — pass \"database\" in the tool arguments",
+            pools
+                .iter()
+                .map(|(k, _)| k.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )),
+    }
+}
+
+/// Names of all configured databases, in configuration order.
+pub(crate) fn database_names() -> Vec<String> {
+    PG_POOLS
+        .as_ref()
+        .map(|p| p.iter().map(|(k, _)| k.clone()).collect())
+        .unwrap_or_default()
+}
+
+/// Upper bound on database connections and concurrent operations (pool exhaustion / DoS defence).
+pub(crate) const MAX_DB_CONNS: u32 = 16;
+/// Semaphore gating concurrent database work — excess gets a fast "busy" instead of blocking the pool.
+pub(crate) static DB_SEM: Lazy<Arc<tokio::sync::Semaphore>> =
+    Lazy::new(|| Arc::new(tokio::sync::Semaphore::new(MAX_DB_CONNS as usize)));
+
+/// Why is the pool not handing out a connection? r2d2 says only "timed out" and the driver says
+/// "db error" — neither tells the user what to fix. We make ONE direct connection attempt and
+/// translate the cause into a hint. The CLIENT gets the error class only (no user, host or database
+/// name — this is still an unauthenticated surface); the full text goes to the operator stderr.
+pub(crate) fn pool_error_detail() -> String {
+    let Some(url) = database_url() else {
+        return "no connection string: set DATABASE_URL or pass it as the first argument"
+            .to_string();
+    };
+    // the same normalisation as when building the pool — otherwise the ERROR path reports a false
+    // cause ("invalid connection string") where the certificate was what actually failed.
+    let mut cfg = match normalize_sslmode(&url).parse::<postgres::Config>() {
+        Ok(c) => c,
+        // The upstream tracker is full of "INVALID_URL" reports whose real cause is a password with
+        // `@`, `:`, `/` or `#` in it. Say that outright instead of leaving the user to guess.
+        Err(e) => {
+            let _ = e;
+            return "invalid connection string — if the password contains @ : / # or ?, percent-encode it \
+                    (@ becomes %40, : becomes %3A, / becomes %2F, # becomes %23)"
+                .to_string();
+        }
+    };
+    // The pool has already waited its own timeout; this attempt only explains WHY, so keep it short.
+    cfg.connect_timeout(std::time::Duration::from_secs(3));
+    let tls = match build_tls() {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
+    match cfg.connect(tls) {
+        Ok(_) => "connection pool exhausted — too many concurrent queries".to_string(),
+        Err(e) => {
+            eprintln!("DB CONNECT FAILED: {}", e); // full message only to the server log
+            if let Some(db) = e.as_db_error() {
+                let hint = match db.code().code() {
+                    "28P01" => "authentication failed — check the password in DATABASE_URL",
+                    // The most common form of 28000 in the wild is "no pg_hba.conf entry ... SSL off":
+                    // the server demands TLS and the client did not offer it. Say that plainly.
+                    "28000" => {
+                        // PostgreSQL words this differently across versions: "SSL off" in older
+                        // releases, "no encryption" from 15 onwards. Match both.
+                        let msg = db.message();
+                        if msg.contains("SSL off") || msg.contains("no encryption") {
+                            "the server requires TLS for this host/user — add ?sslmode=require to DATABASE_URL"
+                        } else {
+                            "connection rejected by pg_hba.conf — check the host, user and database rules"
+                        }
+                    }
+                    "3D000" => "database does not exist",
+                    "53300" => "too many connections on the server",
+                    _ => "server refused the connection",
+                };
+                format!(
+                    "cannot connect to PostgreSQL: {} [SQLSTATE {}]",
+                    hint,
+                    db.code().code()
+                )
+            } else {
+                // No DbError = the transport layer. The precise cause sits in the error source
+                // chain; surfacing it turns "TLS handshake failed" into an actionable sentence.
+                // Two of the most-reported problems against the deprecated server were exactly
+                // this: "self-signed certificate in certificate chain" and "unable to verify the
+                // first certificate" — both a private CA (GCP, RDS) that nobody had supplied.
+                let mut detail = e.to_string();
+                detail.push(' ');
+                let mut src: Option<&(dyn std::error::Error + 'static)> =
+                    std::error::Error::source(&e);
+                while let Some(s) = src {
+                    detail.push_str(&s.to_string());
+                    detail.push(' ');
+                    src = std::error::Error::source(s);
+                }
+                let d = detail.to_ascii_lowercase();
+                if d.contains("unknownissuer")
+                    || d.contains("self-signed")
+                    || d.contains("selfsigned")
+                {
+                    "cannot connect to PostgreSQL: the server certificate is not signed by any CA we \
+                     trust — typical of a private CA (GCP, RDS, self-hosted). Download that provider \
+                     CA bundle and point MCP_SSLROOTCERT at the PEM file"
+                        .to_string()
+                } else if d.contains("notvalidforname") || d.contains("not valid for name") {
+                    "cannot connect to PostgreSQL: the server certificate does not cover this host \
+                     name — connect using the name in the certificate rather than an IP address"
+                        .to_string()
+                } else if d.contains("expired") {
+                    "cannot connect to PostgreSQL: the server certificate has expired".to_string()
+                } else {
+                    format!(
+                        "cannot connect to PostgreSQL: {} — check host, port and sslmode; \
+                         for a private CA (e.g. an RDS bundle) point MCP_SSLROOTCERT at the PEM file",
+                        e
+                    )
+                }
+            }
+        }
+    }
+}
+
+/// Column patterns whose values never leave the database: `MCP_REDACT_COLUMNS="password,ssn,card_number"`.
+/// Matching is on the column name, case-insensitively; a `table.column` pattern also matches the
+/// bare column, because a query may alias or join its way past the table name.
+pub(crate) fn redact_patterns() -> &'static [String] {
+    static P: Lazy<Vec<String>> = Lazy::new(|| {
+        std::env::var("MCP_REDACT_COLUMNS")
+            .map(|v| {
+                v.split(',')
+                    .map(|s| s.trim().to_lowercase())
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.rsplit('.').next().unwrap_or(&s).to_string())
+                    .collect()
+            })
+            .unwrap_or_default()
+    });
+    &P
+}
+
+pub(crate) fn redact_rows(rows: &mut [Value]) {
+    let pats = redact_patterns();
+    if pats.is_empty() {
+        return;
+    }
+    for row in rows.iter_mut() {
+        if let Some(obj) = row.as_object_mut() {
+            for (k, v) in obj.iter_mut() {
+                if pats.iter().any(|p| p == &k.to_lowercase()) {
+                    *v = Value::String("[redacted]".into());
+                }
+            }
+        }
+    }
+}
+
+pub(crate) fn col_to_json(row: &Row, i: usize) -> Value {
+    if let Ok(v) = row.try_get::<_, Option<String>>(i) {
+        return v.map(Value::String).unwrap_or(Value::Null);
+    }
+    if let Ok(v) = row.try_get::<_, Option<i32>>(i) {
+        return v.map(|n| json!(n)).unwrap_or(Value::Null);
+    }
+    if let Ok(v) = row.try_get::<_, Option<i64>>(i) {
+        return v.map(|n| json!(n)).unwrap_or(Value::Null);
+    }
+    if let Ok(v) = row.try_get::<_, Option<f64>>(i) {
+        return v.map(|n| json!(n)).unwrap_or(Value::Null);
+    }
+    if let Ok(v) = row.try_get::<_, Option<bool>>(i) {
+        return v.map(|b| json!(b)).unwrap_or(Value::Null);
+    }
+    // json/jsonb columns — EXPLAIN (FORMAT JSON) returns one, and losing it to null would be
+    // exactly the silent-emptiness class this project exists to avoid.
+    if let Ok(v) = row.try_get::<_, Option<Value>>(i) {
+        return v.unwrap_or(Value::Null);
+    }
+    Value::Null
+}
+
+/// Hard cap on result size (serialised bytes) — OOM/DoS defence against enormous values.
+pub(crate) const MAX_RESULT_BYTES: usize = 8 * 1_048_576; // 8 MB
+/// Hard upper bound on rows — the `limit` parameter is clamped to this value.
+pub(crate) const MAX_LIMIT: u64 = 10_000;
+
+/// A row-returning query that can be wrapped in a `(sql) t` subquery and planned with EXPLAIN.
+/// SELECT/WITH/VALUES/TABLE — yes; EXPLAIN/SHOW — no (you cannot EXPLAIN an EXPLAIN).
+pub(crate) fn is_row_query(sql: &str) -> bool {
+    // Strip leading `(` and whitespace — `(SELECT ...)` is still a row query. Without this a leading
+    // parenthesis bypassed the cost guard and routed the query down the wrong serialisation branch.
+    let mut s = sql.trim_start();
+    while let Some(rest) = s.strip_prefix('(') {
+        s = rest.trim_start();
+    }
+    let up = s.to_uppercase();
+    up.starts_with("SELECT")
+        || up.starts_with("WITH")
+        || up.starts_with("VALUES")
+        || up.starts_with("TABLE")
+}
+
+pub(crate) fn execute_readonly(final_sql: &str, db: Option<&str>) -> Result<Value, String> {
+    let pool = pool_for(db)?;
+    let mut client = pool.get().map_err(|_| pool_error_detail())?;
+    // Session-level defence in depth: timeouts + read-only (the database refuses a write even if the
+    // validator let something through). DISCARD ALL resets pooled session state (Session Pollution).
+    // It MUST be its own statement — a multi-statement batch is an implicit transaction, and
+    client
+        .batch_execute("DISCARD ALL")
+        .map_err(|e| e.to_string())?;
+    // Configurable, because a hardcoded ceiling is either too low for analytics or too high for a
+    // shared database — the most requested setting against the leading alternative.
+    client
+        .batch_execute(&format!(
+            "SET statement_timeout='{}'; SET idle_in_transaction_session_timeout='10s'; \
+             SET default_transaction_read_only=on;{}",
+            statement_timeout(),
+            search_path_stmt()
+        ))
+        .map_err(|e| e.to_string())?;
+    // EXPLICIT READ ONLY TRANSACTION, always finished with ROLLBACK.
+    //
+    // The session flag alone is not enough: in autocommit every statement commits immediately, so
+    // anything that slipped past the validator stays in the database PERMANENTLY. Comparing with the
+    // deprecated `@modelcontextprotocol/server-postgres` was sobering — it wraps each query in
+    // `BEGIN TRANSACTION READ ONLY` and ends with `ROLLBACK`, so `pg_import_system_collations()`
+    // (which writes DESPITE read-only) is undone there, while here it persisted 874 rows.
+    // A third layer of defence, in the one place where we were weaker than what we replace.
+    client
+        .batch_execute("BEGIN TRANSACTION READ ONLY")
+        .map_err(|e| e.to_string())?;
+
+    let mut out: Vec<Value> = if is_row_query(final_sql) {
+        // PostgreSQL serialises EVERY type to jsonb (numeric/enum/array/uuid/timestamptz/jsonb/point…).
+        // Hand-written type mapping in Rust silently lost unhandled types to null — a bug found
+        // na pagila (SUM(amount)→null, enum/array→null). to_jsonb(t) = jedna kolumna jsonb na wiersz.
+        // STREAMING (query_raw) + an early bail on the byte budget. client.query() buffered the WHOLE
+        // result in RAM BEFORE the cap could act — query_raw pulls rows in batches through a portal, so
+        // nothing is materialised at once and we stop before it grows.
+        use postgres::fallible_iterator::FallibleIterator;
+        // A per-row SIZE cap computed IN POSTGRES: if a row exceeds the limit, PG returns a marker instead
+        // of the value — our process NEVER receives a giant cell (streaming bounds many rows, but one huge
+        // row would still materialise here).
+        // The trailing `::text` MATTERS: we take ready JSON TEXT from the database and parse it ourselves
+        // instead of letting the driver deserialise jsonb its own way — that path lost digits from
+        // `numeric` (avg(amount) 4.2006673312979002 → 4.2006673312979). Parsing the text with
+        // `arbitrary_precision` preserves exactly what PostgreSQL computed.
+        let wrapped = format!(
+            "SELECT (CASE WHEN octet_length(_r::text) > {cap} \
+             THEN to_jsonb('[row omitted: exceeds {cap}-byte limit]'::text) ELSE _r END)::text \
+             FROM (SELECT to_jsonb(t) AS _r FROM ({sql}) t) _s",
+            cap = MAX_RESULT_BYTES,
+            sql = final_sql
+        );
+        // The iterator borrows `client`, so ROLLBACK cannot be issued inside the loop — we collect the
+        // result or error into a variable and close the transaction once the borrow ends, on one path.
+        let streamed: Result<Vec<Value>, String> = (|| {
+            let mut it = client
+                .query_raw(&wrapped, std::iter::empty::<&(dyn ToSql + Sync)>())
+                .map_err(|e| friendly_pg_error(&e))?;
+            let mut acc: Vec<Value> = Vec::new();
+            let mut bytes = 0usize;
+            while let Some(row) = it.next().map_err(|e| friendly_pg_error(&e))? {
+                // A jsonb deserialisation error is PROPAGATED (a silent null means lost data and a misled agent).
+                let txt: Option<String> = row
+                    .try_get::<_, Option<String>>(0)
+                    .map_err(|_| "result serialization error".to_string())?;
+                let txt = txt.unwrap_or_else(|| "null".to_string());
+                bytes = bytes.saturating_add(txt.len());
+                let v: Value = serde_json::from_str(&txt)
+                    .map_err(|_| "result serialization error".to_string())?;
+                if bytes > MAX_RESULT_BYTES {
+                    return Err(format!(
+                        "result too large (>{} MB) — add a tighter filter or smaller LIMIT",
+                        MAX_RESULT_BYTES / 1_048_576
+                    ));
+                }
+                acc.push(v);
+            }
+            Ok(acc)
+        })();
+        match streamed {
+            Ok(a) => a,
+            Err(e) => {
+                let _ = client.batch_execute("ROLLBACK");
+                return Err(e);
+            }
+        }
+    } else {
+        // EXPLAIN / SHOW — cannot be wrapped in a subquery; text columns, col_to_json is enough.
+        // This branch has NO cost guard (you cannot EXPLAIN an EXPLAIN), so the byte cap is the only
+        // defence here — `EXPLAIN VERBOSE` of a long UNION can return hundreds of KB of plan.
+        let rows = client
+            .query(final_sql, &[])
+            .map_err(|e| friendly_pg_error(&e))?;
+        let mut acc: Vec<Value> = Vec::new();
+        let mut bytes = 0usize;
+        for row in rows.iter() {
+            let mut mp = Map::new();
+            for (i, col) in row.columns().iter().enumerate() {
+                mp.insert(col.name().to_owned(), col_to_json(row, i));
+            }
+            let v = Value::Object(mp);
+            bytes = bytes.saturating_add(serde_json::to_string(&v).map(|s| s.len()).unwrap_or(0));
+            if bytes > MAX_RESULT_BYTES {
+                let _ = client.batch_execute("ROLLBACK");
+                return Err(format!(
+                    "result too large (>{} MB) — narrow the query",
+                    MAX_RESULT_BYTES / 1_048_576
+                ));
+            }
+            acc.push(v);
+        }
+        acc
+    };
+    // Redact configured columns before the data can reach the model. Defence in depth, not a
+    // replacement for database permissions: it hides values an agent should never see even when
+    // somebody writes `SELECT *`. Applied to query results only — column names are not secrets.
+    redact_rows(&mut out);
+    // ROLLBACK on EVERY exit path — including success (we never commit anything).
+    let _ = client.batch_execute("ROLLBACK");
+    Ok(json!({ "rowCount": out.len(), "rows": out }))
+}
+
+use postgres::types::ToSql;
+
+pub(crate) fn query_catalog(
+    sql: &str,
+    params: &[&(dyn ToSql + Sync)],
+    db: Option<&str>,
+) -> Result<Value, String> {
+    let pool = pool_for(db)?;
+    let mut client = pool.get().map_err(|_| pool_error_detail())?;
+    client
+        .batch_execute("DISCARD ALL")
+        .map_err(|e| e.to_string())?;
+    client
+        .batch_execute(&format!(
+            "SET statement_timeout='{}'; SET default_transaction_read_only=on;{}",
+            statement_timeout(),
+            search_path_stmt()
+        ))
+        .map_err(|e| e.to_string())?;
+    client
+        .batch_execute("BEGIN TRANSACTION READ ONLY")
+        .map_err(|e| e.to_string())?;
+    // Let PostgreSQL serialise the row, exactly as the query path does. Reading catalog values
+    // through the driver's per-type mapping silently lost anything it did not know — a `numeric`
+    // came back as null while psql showed 100.00. Wrapping is skipped for EXPLAIN, which cannot
+    // live inside a subquery and already returns json.
+    let wrapped;
+    let (sql, wrapped_mode) = if sql.trim_start().to_ascii_uppercase().starts_with("SELECT") {
+        wrapped = format!("SELECT to_jsonb(t)::text AS _r FROM ({}) t", sql);
+        (wrapped.as_str(), true)
+    } else {
+        (sql, false)
+    };
+    let rows = match client.query(sql, params) {
+        Ok(r) => r,
+        Err(e) => {
+            let _ = client.batch_execute("ROLLBACK");
+            return Err(friendly_pg_error(&e));
+        }
+    };
+    let mut out = Vec::with_capacity(rows.len());
+    for row in rows {
+        if wrapped_mode {
+            let txt: Option<String> = row
+                .try_get::<_, Option<String>>(0)
+                .map_err(|_| "result serialization error".to_string())?;
+            let v: Value = serde_json::from_str(&txt.unwrap_or_else(|| "null".into()))
+                .map_err(|_| "result serialization error".to_string())?;
+            out.push(v);
+            continue;
+        }
+        let mut obj = serde_json::Map::new();
+        for i in 0..row.columns().len() {
+            let col_name = row.columns()[i].name().to_string();
+            obj.insert(col_name, col_to_json(&row, i));
+        }
+        out.push(Value::Object(obj));
+    }
+    let _ = client.batch_execute("ROLLBACK");
+    Ok(json!({ "rowCount": out.len(), "rows": out }))
+}

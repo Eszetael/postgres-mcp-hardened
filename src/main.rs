@@ -9,13 +9,25 @@
 //!
 //! See the README for configuration and the security model.
 
-use serde_json::{json, Map, Value};
+use serde_json::{json, Value};
+mod audit_log;
 #[allow(dead_code)]
 mod auth;
+mod db;
 mod fuzz;
+mod http;
+mod tools;
+
+// Everything the modules share lives behind one crate-root prelude, so each module needs a single
+// `use crate::*;` rather than a shifting list of paths.
+pub(crate) use audit_log::*;
+pub(crate) use db::*;
+pub(crate) use http::*;
+pub(crate) use tools::*;
 mod ratelimit;
 mod validate;
 
+use axum::routing::get;
 use axum::{
     extract::{ConnectInfo, Json, State},
     http::{HeaderMap, HeaderValue, StatusCode},
@@ -23,13 +35,14 @@ use axum::{
     routing::post,
     Router,
 };
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use uuid::Uuid;
 
 // --- Session state (simple, in memory) ---
 #[derive(Clone, Default)]
-struct AppState {
+pub(crate) struct AppState {
     /// value = last use (seconds since process start). The map MUST have a cap and a TTL:
     /// `initialize` is unauthenticated by design, so without one anybody could inflate it
     /// without bound — the very defence already present in the rate limiter.
@@ -37,17 +50,17 @@ struct AppState {
 }
 
 /// How many sessions we keep, and for how long while idle.
-const MAX_SESSIONS: usize = 10_000;
-const SESSION_IDLE_SECS: u64 = 3_600;
+pub(crate) const MAX_SESSIONS: usize = 10_000;
+pub(crate) const SESSION_IDLE_SECS: u64 = 3_600;
 
-static PROC_START: Lazy<std::time::Instant> = Lazy::new(std::time::Instant::now);
-fn uptime_secs() -> u64 {
+pub(crate) static PROC_START: Lazy<std::time::Instant> = Lazy::new(std::time::Instant::now);
+pub(crate) fn uptime_secs() -> u64 {
     PROC_START.elapsed().as_secs()
 }
 
 // --- MAIN ENTRY POINT ---
 #[tokio::main]
-async fn main() {
+pub(crate) async fn main() {
     let args: Vec<String> = std::env::args().collect();
     // Dev/CI: run one statement through the validator and exit.
     if let Some(pos) = args.iter().position(|a| a == "--validate") {
@@ -143,7 +156,7 @@ async fn main() {
 /// three such cases: an unreadable HMAC key file made the audit quietly fall back to plain SHA-256;
 /// `MCP_RATE_RPM=-5` silently disabled rate limiting; an unparsable `JWT_PUBKEY_PEM` produced a
 /// server with "working" auth that nobody could ever authenticate against.
-fn preflight_config() {
+pub(crate) fn preflight_config() {
     let mut fatal: Vec<String> = Vec::new();
 
     // numbers: a typo must not silently change a threshold or switch a limit off
@@ -218,7 +231,7 @@ fn preflight_config() {
 }
 
 // --- STDIO TRANSPORT (stara logika main, bez zmian) ---
-fn run_stdio() {
+pub(crate) fn run_stdio() {
     use std::io::{self, BufRead, Write};
     let stdin = io::stdin();
     let mut stdout = io::stdout();
@@ -288,7 +301,7 @@ fn run_stdio() {
 }
 
 // --- HTTP TRANSPORT ---
-async fn run_http() {
+pub(crate) async fn run_http() {
     let addr = std::env::var("MCP_ADDR").unwrap_or_else(|_| "127.0.0.1:8080".into());
     let state = AppState::default();
 
@@ -320,7 +333,7 @@ async fn run_http() {
 
 /// `DELETE /mcp` — explicit session termination (Streamable HTTP). Without it a client had no way
 /// to clean up and the entry lingered until the TTL expired; the specification provides for this.
-async fn delete_session_handler(
+pub(crate) async fn delete_session_handler(
     ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
     headers: HeaderMap,
     State(state): State<AppState>,
@@ -349,7 +362,7 @@ async fn delete_session_handler(
 }
 
 // --- HANDLER /mcp (STREAMABLE HTTP) ---
-async fn mcp_handler(
+pub(crate) async fn mcp_handler(
     ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
     headers: HeaderMap,
     State(state): State<AppState>,
@@ -559,1352 +572,13 @@ use postgres::Row;
 use r2d2::Pool;
 use r2d2_postgres::PostgresConnectionManager;
 
-type PgTls = tokio_postgres_rustls::MakeRustlsConnect;
-type PgPool = Pool<PostgresConnectionManager<PgTls>>;
-
-/// Connection string: `DATABASE_URL`, or the first positional argument.
-///
-/// The deprecated server took the URL as `argv[2]`, so people migrating paste exactly that command
-/// into their config. Accepting both means their existing invocation keeps working (issue #845 in
-/// the upstream tracker asked for the environment variable; we support both rather than either).
-fn database_url() -> Option<String> {
-    // A password kept in a file (Kubernetes secret, systemd credential, .pgpass-style) rather than
-    // in the client configuration: `MCP_PASSWORD_FILE` is substituted into the connection string.
-    let with_password = |u: String| -> String {
-        match std::env::var("MCP_PASSWORD_FILE")
-            .ok()
-            .and_then(|p| std::fs::read_to_string(p).ok())
-        {
-            Some(pw) => {
-                let pw = pw.trim_end_matches(['\n', '\r']);
-                let enc: String = pw
-                    .chars()
-                    .map(|c| match c {
-                        '@' => "%40".to_string(),
-                        ':' => "%3A".to_string(),
-                        '/' => "%2F".to_string(),
-                        '#' => "%23".to_string(),
-                        '?' => "%3F".to_string(),
-                        c => c.to_string(),
-                    })
-                    .collect();
-                if let Some(rest) = u
-                    .strip_prefix("postgres://")
-                    .or_else(|| u.strip_prefix("postgresql://"))
-                {
-                    let scheme = if u.starts_with("postgresql://") {
-                        "postgresql://"
-                    } else {
-                        "postgres://"
-                    };
-                    // user[:pw]@host…  →  user:<file password>@host…
-                    if let Some((userinfo, hostpart)) = rest.split_once('@') {
-                        let user = userinfo.split(':').next().unwrap_or(userinfo);
-                        return format!("{}{}:{}@{}", scheme, user, enc, hostpart);
-                    }
-                }
-                u
-            }
-            None => u,
-        }
-    };
-    if let Ok(u) = std::env::var("DATABASE_URL") {
-        if !u.trim().is_empty() {
-            return Some(with_password(u));
-        }
-    }
-    std::env::args().skip(1).find(|a| {
-        a.starts_with("postgres://") || a.starts_with("postgresql://") || a.contains("host=")
-    })
-}
-
-/// The database name inside a connection string — used to label a single-database deployment.
-fn database_name_of(url: &str) -> String {
-    normalize_sslmode(url)
-        .parse::<postgres::Config>()
-        .ok()
-        .and_then(|c| c.get_dbname().map(|s| s.to_string()))
-        .unwrap_or_else(|| "postgres".to_string())
-}
-
-/// The `postgres` driver understands only `disable`/`prefer`/`require`, while libpq (and every cloud
-/// console, and OUR OWN documentation) also uses `verify-ca`, `verify-full` and `allow`. Without this
-/// rewrite, pasting a connection string from RDS or Supabase ended in "invalid connection string" —
-/// on the very first step, for every new user.
-///
-/// The mapping is safe because OUR TLS connector always verifies the chain and the hostname anyway:
-/// `verify-ca`/`verify-full` → `require` weakens nothing, and `allow` → `prefer` keeps the meaning
-/// "use TLS if it is available".
-fn normalize_sslmode(url: &str) -> String {
-    let lower = url.to_ascii_lowercase();
-    for (from, to) in [
-        ("verify-full", "require"),
-        ("verify-ca", "require"),
-        ("allow", "prefer"),
-    ] {
-        let needle = format!("sslmode={}", from);
-        if let Some(pos) = lower.find(&needle) {
-            let mut out = String::with_capacity(url.len());
-            out.push_str(&url[..pos]);
-            out.push_str(&format!("sslmode={}", to));
-            out.push_str(&url[pos + needle.len()..]);
-            // recursion handles any further occurrence
-            return normalize_sslmode(&out);
-        }
-    }
-    url.to_string()
-}
-
-/// TLS connector for PostgreSQL. Without it the server cannot reach any hosted PostgreSQL
-/// (RDS/Supabase/Neon/Render all require SSL) — and `NoTls` did not report that as an error, it
-/// entered a retry loop and HUNG. Certificate verification is ALWAYS on: a "safe by default"
-/// product does not ship a "trust anything" switch. A private CA (an RDS bundle, say) is supplied
-/// through `MCP_SSLROOTCERT`. WHETHER TLS is used follows from `sslmode` in DATABASE_URL
-/// (`disable` = no TLS, `prefer` = default, `require`/`verify-full` = mandatory).
-fn build_tls() -> Result<PgTls, String> {
-    // rustls 0.23 wymaga jawnego wyboru dostawcy kryptografii; ring = czysty Rust, bez OpenSSL
-    // (obraz jest distroless — nie ma tam libssl).
-    let _ = rustls::crypto::ring::default_provider().install_default();
-
-    let mut roots = rustls::RootCertStore::empty();
-    // 1. the system store, if the image has one
-    for cert in rustls_native_certs::load_native_certs().certs {
-        let _ = roots.add(cert);
-    }
-    // 2. bundled Mozilla roots — so it also works without a system store
-    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-    // 3. prywatne CA operatora (bundle RDS/Supabase, self-signed w intranecie)
-    if let Ok(path) = std::env::var("MCP_SSLROOTCERT") {
-        let f = std::fs::File::open(&path)
-            .map_err(|e| format!("MCP_SSLROOTCERT: cannot open {}: {}", path, e))?;
-        let mut rd = std::io::BufReader::new(f);
-        let mut added = 0usize;
-        for cert in rustls_pemfile::certs(&mut rd) {
-            let cert = cert.map_err(|e| format!("MCP_SSLROOTCERT: invalid PEM: {}", e))?;
-            roots
-                .add(cert)
-                .map_err(|e| format!("MCP_SSLROOTCERT: rejected certificate: {}", e))?;
-            added += 1;
-        }
-        if added == 0 {
-            return Err(format!(
-                "MCP_SSLROOTCERT: no certificates found in {}",
-                path
-            ));
-        }
-    }
-    eprintln!(
-        "TLS: {} trust anchors ({})",
-        roots.len(),
-        match std::env::var("MCP_SSLROOTCERT") {
-            Ok(p) => format!("including private CA from {}", p),
-            Err(_) => "system + bundled Mozilla roots".to_string(),
-        }
-    );
-    let cfg = rustls::ClientConfig::builder()
-        .with_root_certificates(roots)
-        .with_no_client_auth();
-    Ok(tokio_postgres_rustls::MakeRustlsConnect::new(cfg))
-}
-
-/// Named connection pools. One server can serve several databases — the second most requested
-/// feature against the deprecated server, where the connection string was a command-line argument
-/// and a client config could therefore hold only one database per instance.
-///
-/// `MCP_DATABASE_URLS="prod=postgres://…;dev=postgres://…"` defines them; `DATABASE_URL` (or the
-/// positional argument) remains the single-database form and is registered under the database name.
-static PG_POOLS: Lazy<Result<Vec<(String, PgPool)>, String>> = Lazy::new(|| {
-    let mut out: Vec<(String, PgPool)> = Vec::new();
-    if let Ok(spec) = std::env::var("MCP_DATABASE_URLS") {
-        for entry in spec.split(';').map(str::trim).filter(|s| !s.is_empty()) {
-            let (name, url) = entry
-                .split_once('=')
-                .ok_or_else(|| format!("MCP_DATABASE_URLS: expected name=url, got {:?}", entry))?;
-            let name = name.trim().to_string();
-            if name.is_empty() {
-                return Err("MCP_DATABASE_URLS: empty connection name".to_string());
-            }
-            out.push((name, build_pool(url.trim())?));
-        }
-        if out.is_empty() {
-            return Err("MCP_DATABASE_URLS is set but defines no connections".to_string());
-        }
-        return Ok(out);
-    }
-    let url = database_url().ok_or_else(|| {
-        "no connection string: set DATABASE_URL, MCP_DATABASE_URLS, or pass it as the first argument"
-            .to_string()
-    })?;
-    let name = database_name_of(&url);
-    out.push((name, build_pool(&url)?));
-    Ok(out)
-});
-
-fn build_pool(url: &str) -> Result<PgPool, String> {
-    let mut config = normalize_sslmode(url)
-        .parse::<postgres::Config>()
-        .map_err(|_| {
-            "invalid connection string — if the password contains @ : / # or ?, percent-encode it \
-             (@ becomes %40, : becomes %3A, / becomes %2F, # becomes %23)"
-                .to_string()
-        })?;
-    // Without it, on a network that DROPS packets (rather than refusing connections) the worker
-    // thread hangs forever and cannot be cancelled — requests pile up until the thread pool is gone.
-    if config.get_connect_timeout().is_none() {
-        config.connect_timeout(std::time::Duration::from_secs(10));
-    }
-    let mgr = PostgresConnectionManager::new(config, build_tls()?);
-    // `build_unchecked` = a LAZY pool. `build()` connects eagerly up to max_size with a retry loop,
-    // so a typo in the password made the server simply HANG for tens of seconds with no message.
-    Ok(Pool::builder()
-        .max_size(MAX_DB_CONNS)
-        .min_idle(Some(0))
-        .connection_timeout(std::time::Duration::from_secs(5))
-        .build_unchecked(mgr))
-}
-
-/// The pool for a request. `None` picks the only configured database, or reports the choices.
-fn pool_for(name: Option<&str>) -> Result<&'static PgPool, String> {
-    let pools = PG_POOLS.as_ref().map_err(|e| e.clone())?;
-    match name {
-        Some(n) => pools
-            .iter()
-            .find(|(k, _)| k == n)
-            .map(|(_, p)| p)
-            .ok_or_else(|| {
-                format!(
-                    "unknown database {:?} — configured: {}",
-                    n,
-                    pools
-                        .iter()
-                        .map(|(k, _)| k.as_str())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                )
-            }),
-        None if pools.len() == 1 => Ok(&pools[0].1),
-        None => Err(format!(
-            "several databases are configured ({}) — pass \"database\" in the tool arguments",
-            pools
-                .iter()
-                .map(|(k, _)| k.as_str())
-                .collect::<Vec<_>>()
-                .join(", ")
-        )),
-    }
-}
-
-/// Names of all configured databases, in configuration order.
-fn database_names() -> Vec<String> {
-    PG_POOLS
-        .as_ref()
-        .map(|p| p.iter().map(|(k, _)| k.clone()).collect())
-        .unwrap_or_default()
-}
-
-/// Upper bound on database connections and concurrent operations (pool exhaustion / DoS defence).
-const MAX_DB_CONNS: u32 = 16;
-/// Semaphore gating concurrent database work — excess gets a fast "busy" instead of blocking the pool.
-static DB_SEM: Lazy<Arc<tokio::sync::Semaphore>> =
-    Lazy::new(|| Arc::new(tokio::sync::Semaphore::new(MAX_DB_CONNS as usize)));
-
-/// Why is the pool not handing out a connection? r2d2 says only "timed out" and the driver says
-/// "db error" — neither tells the user what to fix. We make ONE direct connection attempt and
-/// translate the cause into a hint. The CLIENT gets the error class only (no user, host or database
-/// name — this is still an unauthenticated surface); the full text goes to the operator stderr.
-fn pool_error_detail() -> String {
-    let Some(url) = database_url() else {
-        return "no connection string: set DATABASE_URL or pass it as the first argument"
-            .to_string();
-    };
-    // the same normalisation as when building the pool — otherwise the ERROR path reports a false
-    // cause ("invalid connection string") where the certificate was what actually failed.
-    let mut cfg = match normalize_sslmode(&url).parse::<postgres::Config>() {
-        Ok(c) => c,
-        // The upstream tracker is full of "INVALID_URL" reports whose real cause is a password with
-        // `@`, `:`, `/` or `#` in it. Say that outright instead of leaving the user to guess.
-        Err(e) => {
-            let _ = e;
-            return "invalid connection string — if the password contains @ : / # or ?, percent-encode it \
-                    (@ becomes %40, : becomes %3A, / becomes %2F, # becomes %23)"
-                .to_string();
-        }
-    };
-    // The pool has already waited its own timeout; this attempt only explains WHY, so keep it short.
-    cfg.connect_timeout(std::time::Duration::from_secs(3));
-    let tls = match build_tls() {
-        Ok(t) => t,
-        Err(e) => return e,
-    };
-    match cfg.connect(tls) {
-        Ok(_) => "connection pool exhausted — too many concurrent queries".to_string(),
-        Err(e) => {
-            eprintln!("DB CONNECT FAILED: {}", e); // full message only to the server log
-            if let Some(db) = e.as_db_error() {
-                let hint = match db.code().code() {
-                    "28P01" => "authentication failed — check the password in DATABASE_URL",
-                    // The most common form of 28000 in the wild is "no pg_hba.conf entry ... SSL off":
-                    // the server demands TLS and the client did not offer it. Say that plainly.
-                    "28000" => {
-                        // PostgreSQL words this differently across versions: "SSL off" in older
-                        // releases, "no encryption" from 15 onwards. Match both.
-                        let msg = db.message();
-                        if msg.contains("SSL off") || msg.contains("no encryption") {
-                            "the server requires TLS for this host/user — add ?sslmode=require to DATABASE_URL"
-                        } else {
-                            "connection rejected by pg_hba.conf — check the host, user and database rules"
-                        }
-                    }
-                    "3D000" => "database does not exist",
-                    "53300" => "too many connections on the server",
-                    _ => "server refused the connection",
-                };
-                format!(
-                    "cannot connect to PostgreSQL: {} [SQLSTATE {}]",
-                    hint,
-                    db.code().code()
-                )
-            } else {
-                // No DbError = the transport layer. The precise cause sits in the error source
-                // chain; surfacing it turns "TLS handshake failed" into an actionable sentence.
-                // Two of the most-reported problems against the deprecated server were exactly
-                // this: "self-signed certificate in certificate chain" and "unable to verify the
-                // first certificate" — both a private CA (GCP, RDS) that nobody had supplied.
-                let mut detail = e.to_string();
-                detail.push(' ');
-                let mut src: Option<&(dyn std::error::Error + 'static)> =
-                    std::error::Error::source(&e);
-                while let Some(s) = src {
-                    detail.push_str(&s.to_string());
-                    detail.push(' ');
-                    src = std::error::Error::source(s);
-                }
-                let d = detail.to_ascii_lowercase();
-                if d.contains("unknownissuer")
-                    || d.contains("self-signed")
-                    || d.contains("selfsigned")
-                {
-                    "cannot connect to PostgreSQL: the server certificate is not signed by any CA we \
-                     trust — typical of a private CA (GCP, RDS, self-hosted). Download that provider \
-                     CA bundle and point MCP_SSLROOTCERT at the PEM file"
-                        .to_string()
-                } else if d.contains("notvalidforname") || d.contains("not valid for name") {
-                    "cannot connect to PostgreSQL: the server certificate does not cover this host \
-                     name — connect using the name in the certificate rather than an IP address"
-                        .to_string()
-                } else if d.contains("expired") {
-                    "cannot connect to PostgreSQL: the server certificate has expired".to_string()
-                } else {
-                    format!(
-                        "cannot connect to PostgreSQL: {} — check host, port and sslmode; \
-                         for a private CA (e.g. an RDS bundle) point MCP_SSLROOTCERT at the PEM file",
-                        e
-                    )
-                }
-            }
-        }
-    }
-}
-
-/// Column patterns whose values never leave the database: `MCP_REDACT_COLUMNS="password,ssn,card_number"`.
-/// Matching is on the column name, case-insensitively; a `table.column` pattern also matches the
-/// bare column, because a query may alias or join its way past the table name.
-fn redact_patterns() -> &'static [String] {
-    static P: Lazy<Vec<String>> = Lazy::new(|| {
-        std::env::var("MCP_REDACT_COLUMNS")
-            .map(|v| {
-                v.split(',')
-                    .map(|s| s.trim().to_lowercase())
-                    .filter(|s| !s.is_empty())
-                    .map(|s| s.rsplit('.').next().unwrap_or(&s).to_string())
-                    .collect()
-            })
-            .unwrap_or_default()
-    });
-    &P
-}
-
-fn redact_rows(rows: &mut [Value]) {
-    let pats = redact_patterns();
-    if pats.is_empty() {
-        return;
-    }
-    for row in rows.iter_mut() {
-        if let Some(obj) = row.as_object_mut() {
-            for (k, v) in obj.iter_mut() {
-                if pats.iter().any(|p| p == &k.to_lowercase()) {
-                    *v = Value::String("[redacted]".into());
-                }
-            }
-        }
-    }
-}
-
-fn col_to_json(row: &Row, i: usize) -> Value {
-    if let Ok(v) = row.try_get::<_, Option<String>>(i) {
-        return v.map(Value::String).unwrap_or(Value::Null);
-    }
-    if let Ok(v) = row.try_get::<_, Option<i32>>(i) {
-        return v.map(|n| json!(n)).unwrap_or(Value::Null);
-    }
-    if let Ok(v) = row.try_get::<_, Option<i64>>(i) {
-        return v.map(|n| json!(n)).unwrap_or(Value::Null);
-    }
-    if let Ok(v) = row.try_get::<_, Option<f64>>(i) {
-        return v.map(|n| json!(n)).unwrap_or(Value::Null);
-    }
-    if let Ok(v) = row.try_get::<_, Option<bool>>(i) {
-        return v.map(|b| json!(b)).unwrap_or(Value::Null);
-    }
-    // json/jsonb columns — EXPLAIN (FORMAT JSON) returns one, and losing it to null would be
-    // exactly the silent-emptiness class this project exists to avoid.
-    if let Ok(v) = row.try_get::<_, Option<Value>>(i) {
-        return v.unwrap_or(Value::Null);
-    }
-    Value::Null
-}
-
-/// Hard cap on result size (serialised bytes) — OOM/DoS defence against enormous values.
-const MAX_RESULT_BYTES: usize = 8 * 1_048_576; // 8 MB
-/// Hard upper bound on rows — the `limit` parameter is clamped to this value.
-const MAX_LIMIT: u64 = 10_000;
-
-/// A row-returning query that can be wrapped in a `(sql) t` subquery and planned with EXPLAIN.
-/// SELECT/WITH/VALUES/TABLE — yes; EXPLAIN/SHOW — no (you cannot EXPLAIN an EXPLAIN).
-fn is_row_query(sql: &str) -> bool {
-    // Strip leading `(` and whitespace — `(SELECT ...)` is still a row query. Without this a leading
-    // parenthesis bypassed the cost guard and routed the query down the wrong serialisation branch.
-    let mut s = sql.trim_start();
-    while let Some(rest) = s.strip_prefix('(') {
-        s = rest.trim_start();
-    }
-    let up = s.to_uppercase();
-    up.starts_with("SELECT")
-        || up.starts_with("WITH")
-        || up.starts_with("VALUES")
-        || up.starts_with("TABLE")
-}
-
-fn execute_readonly(final_sql: &str, db: Option<&str>) -> Result<Value, String> {
-    let pool = pool_for(db)?;
-    let mut client = pool.get().map_err(|_| pool_error_detail())?;
-    // Session-level defence in depth: timeouts + read-only (the database refuses a write even if the
-    // validator let something through). DISCARD ALL resets pooled session state (Session Pollution).
-    // It MUST be its own statement — a multi-statement batch is an implicit transaction, and
-    client
-        .batch_execute("DISCARD ALL")
-        .map_err(|e| e.to_string())?;
-    // Configurable, because a hardcoded ceiling is either too low for analytics or too high for a
-    // shared database — the most requested setting against the leading alternative.
-    client
-        .batch_execute(&format!(
-            "SET statement_timeout='{}'; SET idle_in_transaction_session_timeout='10s'; \
-             SET default_transaction_read_only=on;{}",
-            statement_timeout(),
-            search_path_stmt()
-        ))
-        .map_err(|e| e.to_string())?;
-    // EXPLICIT READ ONLY TRANSACTION, always finished with ROLLBACK.
-    //
-    // The session flag alone is not enough: in autocommit every statement commits immediately, so
-    // anything that slipped past the validator stays in the database PERMANENTLY. Comparing with the
-    // deprecated `@modelcontextprotocol/server-postgres` was sobering — it wraps each query in
-    // `BEGIN TRANSACTION READ ONLY` and ends with `ROLLBACK`, so `pg_import_system_collations()`
-    // (which writes DESPITE read-only) is undone there, while here it persisted 874 rows.
-    // A third layer of defence, in the one place where we were weaker than what we replace.
-    client
-        .batch_execute("BEGIN TRANSACTION READ ONLY")
-        .map_err(|e| e.to_string())?;
-
-    let mut out: Vec<Value> = if is_row_query(final_sql) {
-        // PostgreSQL serialises EVERY type to jsonb (numeric/enum/array/uuid/timestamptz/jsonb/point…).
-        // Hand-written type mapping in Rust silently lost unhandled types to null — a bug found
-        // na pagila (SUM(amount)→null, enum/array→null). to_jsonb(t) = jedna kolumna jsonb na wiersz.
-        // STREAMING (query_raw) + an early bail on the byte budget. client.query() buffered the WHOLE
-        // result in RAM BEFORE the cap could act — query_raw pulls rows in batches through a portal, so
-        // nothing is materialised at once and we stop before it grows.
-        use postgres::fallible_iterator::FallibleIterator;
-        // A per-row SIZE cap computed IN POSTGRES: if a row exceeds the limit, PG returns a marker instead
-        // of the value — our process NEVER receives a giant cell (streaming bounds many rows, but one huge
-        // row would still materialise here).
-        // The trailing `::text` MATTERS: we take ready JSON TEXT from the database and parse it ourselves
-        // instead of letting the driver deserialise jsonb its own way — that path lost digits from
-        // `numeric` (avg(amount) 4.2006673312979002 → 4.2006673312979). Parsing the text with
-        // `arbitrary_precision` preserves exactly what PostgreSQL computed.
-        let wrapped = format!(
-            "SELECT (CASE WHEN octet_length(_r::text) > {cap} \
-             THEN to_jsonb('[row omitted: exceeds {cap}-byte limit]'::text) ELSE _r END)::text \
-             FROM (SELECT to_jsonb(t) AS _r FROM ({sql}) t) _s",
-            cap = MAX_RESULT_BYTES,
-            sql = final_sql
-        );
-        // The iterator borrows `client`, so ROLLBACK cannot be issued inside the loop — we collect the
-        // result or error into a variable and close the transaction once the borrow ends, on one path.
-        let streamed: Result<Vec<Value>, String> = (|| {
-            let mut it = client
-                .query_raw(&wrapped, std::iter::empty::<&(dyn ToSql + Sync)>())
-                .map_err(|e| friendly_pg_error(&e))?;
-            let mut acc: Vec<Value> = Vec::new();
-            let mut bytes = 0usize;
-            while let Some(row) = it.next().map_err(|e| friendly_pg_error(&e))? {
-                // A jsonb deserialisation error is PROPAGATED (a silent null means lost data and a misled agent).
-                let txt: Option<String> = row
-                    .try_get::<_, Option<String>>(0)
-                    .map_err(|_| "result serialization error".to_string())?;
-                let txt = txt.unwrap_or_else(|| "null".to_string());
-                bytes = bytes.saturating_add(txt.len());
-                let v: Value = serde_json::from_str(&txt)
-                    .map_err(|_| "result serialization error".to_string())?;
-                if bytes > MAX_RESULT_BYTES {
-                    return Err(format!(
-                        "result too large (>{} MB) — add a tighter filter or smaller LIMIT",
-                        MAX_RESULT_BYTES / 1_048_576
-                    ));
-                }
-                acc.push(v);
-            }
-            Ok(acc)
-        })();
-        match streamed {
-            Ok(a) => a,
-            Err(e) => {
-                let _ = client.batch_execute("ROLLBACK");
-                return Err(e);
-            }
-        }
-    } else {
-        // EXPLAIN / SHOW — cannot be wrapped in a subquery; text columns, col_to_json is enough.
-        // This branch has NO cost guard (you cannot EXPLAIN an EXPLAIN), so the byte cap is the only
-        // defence here — `EXPLAIN VERBOSE` of a long UNION can return hundreds of KB of plan.
-        let rows = client
-            .query(final_sql, &[])
-            .map_err(|e| friendly_pg_error(&e))?;
-        let mut acc: Vec<Value> = Vec::new();
-        let mut bytes = 0usize;
-        for row in rows.iter() {
-            let mut mp = Map::new();
-            for (i, col) in row.columns().iter().enumerate() {
-                mp.insert(col.name().to_owned(), col_to_json(row, i));
-            }
-            let v = Value::Object(mp);
-            bytes = bytes.saturating_add(serde_json::to_string(&v).map(|s| s.len()).unwrap_or(0));
-            if bytes > MAX_RESULT_BYTES {
-                let _ = client.batch_execute("ROLLBACK");
-                return Err(format!(
-                    "result too large (>{} MB) — narrow the query",
-                    MAX_RESULT_BYTES / 1_048_576
-                ));
-            }
-            acc.push(v);
-        }
-        acc
-    };
-    // Redact configured columns before the data can reach the model. Defence in depth, not a
-    // replacement for database permissions: it hides values an agent should never see even when
-    // somebody writes `SELECT *`. Applied to query results only — column names are not secrets.
-    redact_rows(&mut out);
-    // ROLLBACK on EVERY exit path — including success (we never commit anything).
-    let _ = client.batch_execute("ROLLBACK");
-    Ok(json!({ "rowCount": out.len(), "rows": out }))
-}
-
-use postgres::types::ToSql;
-
-fn query_catalog(
-    sql: &str,
-    params: &[&(dyn ToSql + Sync)],
-    db: Option<&str>,
-) -> Result<Value, String> {
-    let pool = pool_for(db)?;
-    let mut client = pool.get().map_err(|_| pool_error_detail())?;
-    client
-        .batch_execute("DISCARD ALL")
-        .map_err(|e| e.to_string())?;
-    client
-        .batch_execute(&format!(
-            "SET statement_timeout='{}'; SET default_transaction_read_only=on;{}",
-            statement_timeout(),
-            search_path_stmt()
-        ))
-        .map_err(|e| e.to_string())?;
-    client
-        .batch_execute("BEGIN TRANSACTION READ ONLY")
-        .map_err(|e| e.to_string())?;
-    // Let PostgreSQL serialise the row, exactly as the query path does. Reading catalog values
-    // through the driver's per-type mapping silently lost anything it did not know — a `numeric`
-    // came back as null while psql showed 100.00. Wrapping is skipped for EXPLAIN, which cannot
-    // live inside a subquery and already returns json.
-    let wrapped;
-    let (sql, wrapped_mode) = if sql.trim_start().to_ascii_uppercase().starts_with("SELECT") {
-        wrapped = format!("SELECT to_jsonb(t)::text AS _r FROM ({}) t", sql);
-        (wrapped.as_str(), true)
-    } else {
-        (sql, false)
-    };
-    let rows = match client.query(sql, params) {
-        Ok(r) => r,
-        Err(e) => {
-            let _ = client.batch_execute("ROLLBACK");
-            return Err(friendly_pg_error(&e));
-        }
-    };
-    let mut out = Vec::with_capacity(rows.len());
-    for row in rows {
-        if wrapped_mode {
-            let txt: Option<String> = row
-                .try_get::<_, Option<String>>(0)
-                .map_err(|_| "result serialization error".to_string())?;
-            let v: Value = serde_json::from_str(&txt.unwrap_or_else(|| "null".into()))
-                .map_err(|_| "result serialization error".to_string())?;
-            out.push(v);
-            continue;
-        }
-        let mut obj = serde_json::Map::new();
-        for i in 0..row.columns().len() {
-            let col_name = row.columns()[i].name().to_string();
-            obj.insert(col_name, col_to_json(&row, i));
-        }
-        out.push(Value::Object(obj));
-    }
-    let _ = client.batch_execute("ROLLBACK");
-    Ok(json!({ "rowCount": out.len(), "rows": out }))
-}
-
-fn ok_content(data: &Value) -> Value {
-    wrap_untrusted(data, "catalog")
-}
-
-fn err_content(code: i32, msg: String) -> Value {
-    json!({ "error": { "code": code, "message": msg } })
-}
-
-fn handle_list_schemas(args: &Value) -> Value {
-    let db = args.get("database").and_then(|v| v.as_str());
-    match query_catalog(
-        "SELECT schema_name FROM information_schema.schemata WHERE schema_name NOT IN ('pg_catalog','information_schema') AND schema_name NOT LIKE 'pg_%' ORDER BY 1",
-        &[],
-        db,
-    ) {
-        Ok(v) => { audit("list_schemas", "allowed", None); ok_content(&v) }
-        Err(e) => { audit("list_schemas", "error", None); err_content(-32000, e) }
-    }
-}
-
-fn handle_list_tables(args: &Value) -> Value {
-    let schema = args
-        .get("schema")
-        .and_then(|v| v.as_str())
-        .unwrap_or("public");
-    let db = args.get("database").and_then(|v| v.as_str());
-    // Built on pg_class rather than information_schema, which does not list MATERIALIZED VIEWS at
-    // all — a database keeping its aggregates in matviews would look half empty through this tool.
-    const SQL: &str = concat!(
-        "SELECT c.relname AS table_name, ",
-        "       CASE c.relkind WHEN 'r' THEN 'BASE TABLE' WHEN 'p' THEN 'PARTITIONED TABLE' ",
-        "                      WHEN 'v' THEN 'VIEW' WHEN 'm' THEN 'MATERIALIZED VIEW' ",
-        "                      WHEN 'f' THEN 'FOREIGN TABLE' ELSE c.relkind::text END AS table_type, ",
-        "       obj_description(c.oid) AS description ",
-        "FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace ",
-        "WHERE n.nspname = $1 AND c.relkind IN ('r','p','v','m','f') ",
-        "  AND has_table_privilege(c.oid, 'SELECT') AND (NOT c.relispartition OR $2) ",
-        "ORDER BY c.relname"
-    );
-    let show_parts = show_partitions();
-    match query_catalog(SQL, &[&schema, &show_parts], db) {
-        Ok(v) => {
-            audit("list_tables", "allowed", None);
-            ok_content(&v)
-        }
-        Err(e) => {
-            audit("list_tables", "error", None);
-            err_content(-32000, e)
-        }
-    }
-}
-
-/// The resource list = one entry per table/view in user schemas (the system catalog is excluded).
-/// Query time limit. `MCP_STATEMENT_TIMEOUT` (a PostgreSQL interval such as `30s`, `2min`).
-/// Validated at startup, so a typo cannot silently turn the limit off.
-fn statement_timeout() -> String {
-    std::env::var("MCP_STATEMENT_TIMEOUT")
-        .ok()
-        .filter(|v| !v.trim().is_empty())
-        .unwrap_or_else(|| "30s".to_string())
-}
-
-/// Optional `search_path`, so a database whose tables live in a custom schema works without
-/// qualifying every name — a reported failure mode of at least one alternative.
-fn search_path_stmt() -> String {
-    match std::env::var("MCP_SEARCH_PATH") {
-        // Each schema is quoted separately: `SET search_path='a,b'` would name ONE schema called
-        // "a,b" and silently find nothing.
-        Ok(p) if !p.trim().is_empty() => {
-            let list = p
-                .split(',')
-                .map(|s| format!("\"{}\"", s.trim().replace('"', "")))
-                .collect::<Vec<_>>()
-                .join(", ");
-            format!(" SET search_path TO {};", list)
-        }
-        _ => String::new(),
-    }
-}
-
-/// Whether partition children are listed (off by default — see the query comment).
-fn show_partitions() -> bool {
-    std::env::var("MCP_SHOW_PARTITIONS")
-        .map(|v| v == "1" || v == "true")
-        .unwrap_or(false)
-}
-
-/// Server name shown to the client, optionally suffixed with `MCP_SERVER_LABEL`.
-fn server_label() -> String {
-    match std::env::var("MCP_SERVER_LABEL") {
-        Ok(l) if !l.trim().is_empty() => format!("postgres-mcp-hardened ({})", l.trim()),
-        _ => "postgres-mcp-hardened".to_string(),
-    }
-}
-
-fn handle_resources_list() -> Value {
-    // With several databases configured, the list spans all of them; the URI carries the database
-    // name, so entries from different connections never collide.
-    let names = database_names();
-    if names.len() > 1 {
-        let mut all: Vec<Value> = Vec::new();
-        for n in &names {
-            if let Some(Value::Array(items)) = resources_of(Some(n))
-                .get("result")
-                .and_then(|r| r.get("resources"))
-                .cloned()
-            {
-                all.extend(items);
-            }
-        }
-        audit("resources/list", "allowed", None);
-        return json!({ "result": { "resources": all } });
-    }
-    resources_of(None)
-}
-
-fn resources_of(db: Option<&str>) -> Value {
-    const SQL: &str = concat!(
-        "SELECT n.nspname AS table_schema, c.relname AS table_name, ",
-        "       CASE c.relkind WHEN 'r' THEN 'table' WHEN 'p' THEN 'partitioned table' ",
-        "                      WHEN 'v' THEN 'view' WHEN 'm' THEN 'materialized view' ",
-        "                      WHEN 'f' THEN 'foreign table' ELSE c.relkind::text END AS table_type, ",
-        "       obj_description(c.oid) AS description ",
-        "FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace ",
-        "WHERE n.nspname NOT IN ('pg_catalog', 'information_schema') ",
-        "  AND n.nspname NOT LIKE 'pg_toast%' AND n.nspname NOT LIKE 'pg_temp%' ",
-        "  AND c.relkind IN ('r','p','v','m','f') AND has_table_privilege(c.oid, 'SELECT') ",
-        // Partition CHILDREN are an implementation detail: a table split by month adds dozens of
-        // near-identical entries and drowns the real schema. The parent is listed; set
-        // MCP_SHOW_PARTITIONS=1 to see the children too.
-        "  AND (NOT c.relispartition OR $1) ",
-        "ORDER BY n.nspname, c.relname LIMIT 1000"
-    );
-    let db = db
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| database_names().first().cloned().unwrap_or_default());
-    let show_parts = show_partitions();
-    match query_catalog(SQL, &[&show_parts], db.as_str().into()) {
-        Ok(v) => {
-            let rows = v
-                .get("rows")
-                .and_then(|r| r.as_array())
-                .cloned()
-                .unwrap_or_default();
-            let list: Vec<Value> = rows
-                .iter()
-                .map(|r| {
-                    let s = r
-                        .get("table_schema")
-                        .and_then(|x| x.as_str())
-                        .unwrap_or("public");
-                    let t = r.get("table_name").and_then(|x| x.as_str()).unwrap_or("");
-                    let kind = r
-                        .get("table_type")
-                        .and_then(|x| x.as_str())
-                        .unwrap_or("BASE TABLE");
-                    let desc = r
-                        .get("description")
-                        .and_then(|x| x.as_str())
-                        .map(|d| d.to_string())
-                        .unwrap_or_else(|| format!("{} {}.{}", kind.to_lowercase(), s, t));
-                    json!({
-                        // The database name is part of the URI so two instances (production and
-                        // development, say) never produce colliding resource identifiers — the most
-                        // upvoted complaint about the deprecated server was exactly this ambiguity.
-                        "uri": format!("postgres:///{}/{}/{}/schema", db, s, t),
-                        "name": format!("{}.{}", s, t),
-                        "description": desc,
-                        "mimeType": "application/json"
-                    })
-                })
-                .collect();
-            audit("resources/list", "allowed", None);
-            json!({ "result": { "resources": list } })
-        }
-        Err(e) => {
-            audit("resources/list", "error", None);
-            json!({ "error": { "code": -32000, "message": e } })
-        }
-    }
-}
-
-/// Odczyt zasobu: `postgres:///<schemat>/<tabela>/schema` → ten sam opis kolumn co `describe_table`.
-fn handle_resources_read(params: &Value) -> Value {
-    let uri = params.get("uri").and_then(|v| v.as_str()).unwrap_or("");
-    let rest = uri.strip_prefix("postgres:///").unwrap_or("");
-    let parts: Vec<&str> = rest.split('/').collect();
-    // Accept both `<db>/<schema>/<table>/schema` and the shorter `<schema>/<table>/schema`.
-    let (db, schema, table) = match parts.as_slice() {
-        [d, s, t, "schema"] => (Some(*d), *s, *t),
-        [s, t, "schema"] => (None, *s, *t),
-        _ => {
-            return json!({ "error": { "code": -32602, "message":
-                "unknown resource — expected postgres:///<database>/<schema>/<table>/schema" } })
-        }
-    };
-    if schema.is_empty() || table.is_empty() {
-        return json!({ "error": { "code": -32602, "message": "unknown resource — empty schema or table" } });
-    }
-    let mut a = json!({ "schema": schema, "table": table });
-    if let Some(d) = db {
-        a["database"] = Value::String(d.to_string());
-    }
-    let desc = handle_describe_table(&a);
-    // `describe_table` returns a ready `content` block; a resource needs the `contents` shape.
-    match desc
-        .get("result")
-        .and_then(|r| r.get("content"))
-        .and_then(|c| c.get(0))
-        .and_then(|c| c.get("text"))
-    {
-        Some(Value::String(text)) => json!({ "result": { "contents": [{
-            "uri": uri, "mimeType": "application/json", "text": text
-        }]}}),
-        _ => desc,
-    }
-}
-
-fn handle_describe_table(args: &Value) -> Value {
-    let schema = args
-        .get("schema")
-        .and_then(|v| v.as_str())
-        .unwrap_or("public");
-    let db = args.get("database").and_then(|v| v.as_str());
-    let table = match args.get("table").and_then(|v| v.as_str()) {
-        Some(t) => t,
-        None => return err_content(-32602, "missing 'table'".into()),
-    };
-    // Comments from `pg_description` + primary key + default. An agent that sees ONLY a name and a type
-    // guesses what the column means (`status`, `amount`, `rental_duration`) and builds queries on that
-    // guess. A schema comment is the cheapest available truth about meaning, and the primary key says
-    // what to join on instead of inferring it from the name.
-    const SQL: &str = concat!(
-        // Built on pg_attribute/pg_class, not information_schema: the latter reports every enum,
-        // domain and composite type as the useless string "USER-DEFINED", and omits materialized
-        // views entirely. `format_type` gives the real name (`mood`, `addr`, `numeric(30,10)`).
-        "SELECT a.attname AS column_name, ",
-        "       format_type(a.atttypid, a.atttypmod) AS data_type, ",
-        "       CASE WHEN a.attnotnull THEN 'NO' ELSE 'YES' END AS is_nullable, ",
-        "       pg_get_expr(ad.adbin, ad.adrelid) AS column_default, ",
-        "       col_description(rel.oid, a.attnum) AS description, ",
-        "       COALESCE(i.indisprimary, false) AS is_primary_key, ",
-        // FOREIGN KEY: without it the agent guesses what to join on — and guessing from column names
-        // is the most common source of quiet, convincing-looking nonsense in results.
-        "       (SELECT cl2.relname || '.' || a2.attname ",
-        "        FROM pg_constraint con ",
-        "        JOIN pg_class cl2 ON cl2.oid = con.confrelid ",
-        "        JOIN pg_attribute a2 ON a2.attrelid = con.confrelid ",
-        "             AND a2.attnum = con.confkey[array_position(con.conkey, a.attnum)] ",
-        "        WHERE con.contype = 'f' AND con.conrelid = rel.oid AND a.attnum = ANY (con.conkey) ",
-        "        LIMIT 1) AS references_column, ",
-        "       obj_description(rel.oid) AS table_description ",
-        "FROM pg_class rel ",
-        "JOIN pg_namespace ns ON ns.oid = rel.relnamespace ",
-        "JOIN pg_attribute a ON a.attrelid = rel.oid AND a.attnum > 0 AND NOT a.attisdropped ",
-        "LEFT JOIN pg_attrdef ad ON ad.adrelid = rel.oid AND ad.adnum = a.attnum ",
-        "LEFT JOIN pg_index i ON i.indrelid = rel.oid AND i.indisprimary AND a.attnum = ANY (i.indkey) ",
-        "WHERE ns.nspname = $1 AND rel.relname = $2 AND rel.relkind IN ('r','p','v','m','f') ",
-        "  AND has_table_privilege(rel.oid, 'SELECT') ",
-        "ORDER BY a.attnum"
-    );
-    match query_catalog(SQL, &[&schema, &table], db) {
-        Ok(v) => {
-            // Pusty wynik = tabela nie istnieje albo rola jej nie widzi. Bez tego agent dostaje
-            // `rowCount: 0` and reads it as "a table with no columns" — a hallucination instead of an error.
-            if v.get("rowCount").and_then(|n| n.as_u64()) == Some(0) {
-                audit("describe_table", "error", None);
-                return err_content(
-                    -32000,
-                    format!(
-                        "table {}.{} not found or not visible to this role",
-                        schema, table
-                    ),
-                );
-            }
-            audit("describe_table", "allowed", None);
-            ok_content(&v)
-        }
-        Err(e) => {
-            audit("describe_table", "error", None);
-            err_content(-32000, e)
-        }
-    }
-}
-
-/// Cost-guard verdict — separates a genuine cost rejection from an error in the query itself
-/// (a missing column, say), so the audit never confuses "denied_cost" with a SQL error.
-enum CostErr {
-    TooExpensive(String),
-    QueryError(String),
-}
-
-fn cost_guard(sql: &str, max_cost: f64, db: Option<&str>) -> Result<(), CostErr> {
-    let pool = pool_for(db).map_err(CostErr::QueryError)?;
-    let mut client = pool
-        .get()
-        .map_err(|_| CostErr::QueryError(pool_error_detail()))?;
-    client
-        .batch_execute("DISCARD ALL")
-        .map_err(|e| CostErr::QueryError(e.to_string()))?;
-    client
-        .batch_execute(&format!(
-            "SET statement_timeout='5s'; SET default_transaction_read_only=on;{}",
-            search_path_stmt()
-        ))
-        .map_err(|e| CostErr::QueryError(e.to_string()))?;
-    let row = client
-        .query_one(&format!("EXPLAIN (FORMAT JSON) {}", sql), &[])
-        .map_err(|e| CostErr::QueryError(friendly_pg_error(&e)))?;
-    let plan: Value = row.get(0); // kolumna json: [{"Plan":{"Total Cost":..}}]
-    let total = plan
-        .get(0)
-        .and_then(|v| v.get("Plan"))
-        .and_then(|v| v.get("Total Cost"))
-        .and_then(|v| v.as_f64())
-        .unwrap_or(0.0);
-    if total > max_cost {
-        Err(CostErr::TooExpensive(format!(
-            "query too expensive: estimated cost {:.0} exceeds limit {:.0}",
-            total, max_cost
-        )))
-    } else {
-        Ok(())
-    }
-}
-
-fn friendly_pg_error(e: &postgres::Error) -> String {
-    if let Some(db) = e.as_db_error() {
-        let code = db.code().code();
-        let msg = match code {
-            "42501" => "permission denied for this object — the role lacks access",
-            "42P01" => "relation does not exist — verify the table name via list_tables",
-            "42703" => "column does not exist — verify columns via describe_table",
-            "42601" => "SQL syntax error",
-            "57014" => "statement timeout exceeded — add a LIMIT or narrow the query",
-            "25006" => "read-only transaction: writes are not permitted",
-            "53300" => "too many connections — try again shortly",
-            _ => "database error",
-        };
-        format!("{} [SQLSTATE {}]", msg, code)
-    } else {
-        "database connection/protocol error".to_string()
-    }
-}
-
-/// Usuwa niewidzialne/bidi znaki (zero-width, bidi override/isolate „Trojan Source", word-joiner, BOM),
-/// which would SURVIVE JSON encoding and could smuggle instructions or reorder text for an LLM.
-/// Control characters below 0x20 are already escaped by serde, so only the "invisible format" class remains.
-fn strip_invisible(s: &str) -> String {
-    s.chars()
-        .filter(|&c| {
-            !matches!(c,
-                // NOTE: U+200C (ZWNJ) and U+200D (ZWJ) are deliberately excluded — they carry meaning in
-                // composed emoji (👨‍👩‍👧) and in Persian/Hindi orthography. Stripping them silently
-                // altered user data. Smuggling goes through the Tags block below.
-                '\u{200B}' | '\u{200E}'..='\u{200F}' | '\u{202A}'..='\u{202E}' |
-                '\u{2060}'..='\u{2064}' | '\u{2066}'..='\u{2069}' | '\u{FEFF}' |
-                '\u{E0000}'..='\u{E007F}') // the Unicode Tags block — the canonical ASCII-smuggling channel
-        })
-        .collect()
-}
-
-/// Prevents text from "escaping" the `<mcp:tool-output>` block: every `<` becomes `\u003c`.
-///
-/// In JSON, `<` appears ONLY inside string literals (it is not a structural character), and
-/// `\u003c` is a valid escape decoding back to `<` — so the parsed data is IDENTICAL, while the
-/// raw text can never spell `</mcp:tool-output>`.
-/// An earlier version inserted a bare `\` before the token name: it broke JSON (`\m` is not a legal
-/// escape) and silently altered any cell containing the phrase "mcp:tool-output".
-fn escape_block_breakout(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for ch in s.chars() {
-        if ch == '<' {
-            out.push_str("\\u003c");
-        } else {
-            out.push(ch);
-        }
-    }
-    out
-}
-
-fn wrap_untrusted(data: &Value, tool: &str) -> Value {
-    // Escape the delimiter so database content cannot "escape" the block or forge trusted="true".
-    // Everything inside is DATA, not instructions. Plus stripping of invisible/bidi characters.
-    let text = escape_block_breakout(&strip_invisible(
-        &serde_json::to_string(data).unwrap_or_default(),
-    ));
-    let wrapped = format!(
-        "<mcp:tool-output tool=\"{}\" trusted=\"false\">{}</mcp:tool-output>",
-        tool, text
-    );
-    json!({ "result": { "content": [{ "type": "text", "text": wrapped, "annotations": { "untrustedContent": true } }] } })
-}
-
-use sha2::{Digest, Sha256};
-use std::sync::Mutex;
-use std::time::{SystemTime, UNIX_EPOCH};
-
-// --- Global hash chain state ---
-static AUDIT_PREV: Lazy<Mutex<String>> = Lazy::new(|| {
-    // Chain continuity across restarts: read the last hash from the audit file (MCP_AUDIT_LOG) so
-    // tamper evidence survives a restart (resetting to GENESIS would break the chain).
-    let start = std::env::var("MCP_AUDIT_LOG")
-        .ok()
-        .and_then(|p| std::fs::read_to_string(p).ok())
-        .and_then(|c| {
-            c.lines()
-                .rev()
-                .find(|l| !l.trim().is_empty())
-                .map(String::from)
-        })
-        .and_then(|last| serde_json::from_str::<Value>(&last).ok())
-        .and_then(|v| v.get("hash").and_then(|h| h.as_str()).map(String::from))
-        .unwrap_or_else(|| "GENESIS".into());
-    Mutex::new(start)
-});
-
-/// Sequence number of the last entry — a gap reveals a deleted entry, and knowing the last number
-/// makes TAIL TRUNCATION detectable (recomputing the chain alone cannot see it, because a truncated
-/// log is internally consistent).
-static AUDIT_SEQ: Lazy<std::sync::atomic::AtomicU64> = Lazy::new(|| {
-    let last = std::env::var("MCP_AUDIT_LOG")
-        .ok()
-        .and_then(|p| std::fs::read_to_string(p).ok())
-        .and_then(|c| {
-            c.lines()
-                .rev()
-                .find(|l| !l.trim().is_empty())
-                .map(String::from)
-        })
-        .and_then(|l| serde_json::from_str::<Value>(&l).ok())
-        .and_then(|v| v.get("seq").and_then(|s| s.as_u64()))
-        .unwrap_or(0);
-    std::sync::atomic::AtomicU64::new(last)
-});
-
-// --- SQL fingerprint (first 16 hex characters of SHA-256) ---
-fn sql_fingerprint(sql: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(sql.as_bytes());
-    let result = hasher.finalize();
-    // Manual hex formatting; we keep the first 16 characters (8 bytes)
-    format!("{:x}", result).chars().take(16).collect()
-}
-
-// --- Main audit function ---
-fn audit(tool: &str, decision: &str, sql: Option<&str>) {
-    // 1. Timestamp (sekundy od epoki)
-    let ts = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-
-    // 2. Odcisk SQL (lub pusty string)
-    let sqlh = sql.map(sql_fingerprint).unwrap_or_default();
-
-    // 3. Build the entry (without the chain fields). `caller` = `sub` from the token: without it the
-    //    audit says WHAT happened but not WHO did it — with multiple tenants that is half of the
-    //    accountability OWASP MCP08 asks for.
-    let seq = AUDIT_SEQ.fetch_add(1, Ordering::Relaxed) + 1;
-    let key = audit_key();
-    let mut entry = json!({
-        "seq": seq,
-        "ts": ts,
-        "tool": tool,
-        "decision": decision,
-        "sql_fp": sqlh,
-        "caller": current_caller().unwrap_or_else(|| "-".to_string())
-    });
-    // The key FINGERPRINT (never the key): lets the verifier pick the right key after a rotation.
-    // Without it a legitimate rotation produced a message indistinguishable from sabotage, and the
-    // operator would learn to ignore "CORRUPTED" — masking a real tamper.
-    if let Some((_, fp)) = &key {
-        entry["key_fp"] = Value::String(fp.clone());
-    }
-
-    // 4. Chain: HMAC-SHA256(key, prev || entry) when a key is set, otherwise plain SHA-256.
-    //    THE DIFFERENCE MATTERS: plain SHA-256 detects accidental corruption and an attacker WITHOUT
-    //    file access, but anyone who can write the file may delete entries and RECOMPUTE the chain from
-    //    GENESIS — the result verifies as consistent. With the key held OFF the host (from a vault/KMS)
-    //    that recomputation is impossible.
-    let mut prev_guard = AUDIT_PREV.lock().unwrap();
-    let prev_hash = prev_guard.clone();
-    let entry_str = serde_json::to_string(&entry).expect("serializacja entry");
-    let payload = format!("{}{}", prev_hash, entry_str);
-    let current_hash = match &key {
-        Some((k, _)) => hmac_sha256_hex(k.clone(), payload.as_bytes()),
-        None => {
-            let mut hasher = Sha256::new();
-            hasher.update(payload.as_bytes());
-            format!("{:x}", hasher.finalize())
-        }
-    };
-
-    // 5. Extend the entry with the chain fields
-    let mut full_entry = entry;
-    full_entry["prev"] = Value::String(prev_hash);
-    full_entry["hash"] = Value::String(current_hash.clone());
-
-    // 6. Aktualizacja stanu globalnego
-    *prev_guard = current_hash;
-
-    // 7. Output: stderr (stream) + the durable file (MCP_AUDIT_LOG) for tamper evidence across restarts.
-    let line = serde_json::to_string(&full_entry).expect("serializacja full_entry");
-    eprintln!("AUDIT {}", line);
-    if let Ok(path) = std::env::var("MCP_AUDIT_LOG") {
-        use std::io::Write;
-        // A failed write MUST be visible. Previously `if let Ok(...)` swallowed the error silently:
-        // a typo in the path or an unmounted volume meant the audit was dead from the first second,
-        // while the server answered normally and no counter moved.
-        let res = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
-            .and_then(|mut f| writeln!(f, "{}", line));
-        if let Err(e) = res {
-            METRICS.audit_write_failed.fetch_add(1, Ordering::Relaxed);
-            eprintln!("AUDIT WRITE FAILED ({}): {}", path, e);
-        }
-    }
-}
-
-/// Walks the audit file and checks that every entry has a correct `prev` and `hash`. Returns the
-/// entry count, or a description of the first mismatch (the line number is where the log was touched).
-/// It uses EXACTLY the same hash function as the writer, so the verdict never depends on interpretation.
-fn verify_audit_file(path: &str, expect_last: Option<&str>) -> Result<String, String> {
-    let content =
-        std::fs::read_to_string(path).map_err(|e| format!("cannot read {}: {}", path, e))?;
-
-    // Key set: the current one plus (optionally) previous ones, comma-separated. A log that survived a
-    // ROTATION must verify end to end — otherwise every rotation looks like sabotage.
-    let mut keys: Vec<(Vec<u8>, String)> = Vec::new();
-    if let Some(k) = audit_key() {
-        keys.push(k);
-    }
-    if let Ok(olds) = std::env::var("MCP_AUDIT_HMAC_KEYS_OLD") {
-        for k in olds.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
-            let b = k.as_bytes().to_vec();
-            let fp = key_fingerprint(&b);
-            keys.push((b, fp));
-        }
-    }
-
-    let mut prev = "GENESIS".to_string();
-    let mut prev_seq: Option<u64> = None;
-    let mut n = 0usize;
-    let mut rotations = 0usize;
-    let mut last_fp: Option<String> = None;
-
-    for (i, line) in content.lines().enumerate() {
-        if line.trim().is_empty() {
-            continue;
-        }
-        let ln = i + 1;
-        let v: Value =
-            serde_json::from_str(line).map_err(|e| format!("line {}: invalid JSON: {}", ln, e))?;
-        let obj = v
-            .as_object()
-            .ok_or_else(|| format!("line {}: not an object", ln))?;
-        let got_prev = obj.get("prev").and_then(|x| x.as_str()).unwrap_or("");
-        let got_hash = obj.get("hash").and_then(|x| x.as_str()).unwrap_or("");
-        if got_prev != prev {
-            return Err(format!(
-                "line {}: chain broken — entry points at a different predecessor",
-                ln
-            ));
-        }
-        // A gap in the sequence = someone cut an entry out of the MIDDLE and recomputed the rest.
-        if let Some(seq) = obj.get("seq").and_then(|s| s.as_u64()) {
-            if let Some(p) = prev_seq {
-                if seq != p + 1 {
-                    return Err(format!(
-                        "line {}: sequence gap — expected {}, found {} (entries were removed)",
-                        ln,
-                        p + 1,
-                        seq
-                    ));
-                }
-            }
-            prev_seq = Some(seq);
-        }
-
-        let mut entry = obj.clone();
-        entry.remove("prev");
-        entry.remove("hash");
-        let entry_str = serde_json::to_string(&Value::Object(entry))
-            .map_err(|e| format!("line {}: {}", ln, e))?;
-        let payload = format!("{}{}", prev, entry_str);
-
-        let entry_fp = obj.get("key_fp").and_then(|x| x.as_str());
-        let expect = match entry_fp {
-            Some(fp) => {
-                if last_fp.as_deref().is_some_and(|l| l != fp) {
-                    rotations += 1;
-                }
-                last_fp = Some(fp.to_string());
-                let (k, _) = keys
-                    .iter()
-                    .find(|(_, kfp)| kfp == fp)
-                    .ok_or_else(|| format!(
-                        "line {}: entry was signed with key {} which was not provided — pass it in MCP_AUDIT_HMAC_KEY or MCP_AUDIT_HMAC_KEYS_OLD",
-                        ln, fp
-                    ))?;
-                hmac_sha256_hex(k.clone(), payload.as_bytes())
-            }
-            None => {
-                let mut h = Sha256::new();
-                h.update(payload.as_bytes());
-                format!("{:x}", h.finalize())
-            }
-        };
-        if got_hash != expect {
-            return Err(format!(
-                "line {}: hash mismatch — this entry was modified",
-                ln
-            ));
-        }
-        prev = got_hash.to_string();
-        n += 1;
-    }
-
-    // TAIL TRUNCATION is invisible from the inside: the shortened log is self-consistent and cutting it
-    // needs no key. The only defence is an anchor kept ELSEWHERE — so we return the last hash (to be
-    // stored off this host) and check it whenever the operator supplies the expected value.
-    if let Some(want) = expect_last {
-        if want != prev {
-            return Err(format!(
-                "tail truncated or rewritten — last hash is {} but {} was expected (entries after that point are gone)",
-                prev, want
-            ));
-        }
-    }
-    let seq_info = prev_seq
-        .map(|s| format!(", ostatni seq {}", s))
-        .unwrap_or_default();
-    let rot_info = if rotations > 0 {
-        format!(", rotacji klucza: {}", rotations)
-    } else {
-        String::new()
-    };
-    Ok(format!("{} entries{}{}\n  last hash: {}\n  STORE this hash off-host — without an external anchor, truncating the tail of the log is undetectable", n, seq_info, rot_info, prev))
-}
-
-/// HMAC key for the audit chain. `MCP_AUDIT_HMAC_KEY` (the value) or `MCP_AUDIT_HMAC_KEY_FILE`
-/// (a path — more convenient for secrets mounted by an orchestrator).
-fn audit_key() -> Option<(Vec<u8>, String)> {
-    static KEY: Lazy<Option<(Vec<u8>, String)>> = Lazy::new(|| {
-        let raw: Option<Vec<u8>> = if let Ok(k) = std::env::var("MCP_AUDIT_HMAC_KEY") {
-            (!k.is_empty()).then(|| k.into_bytes())
-        } else if let Ok(p) = std::env::var("MCP_AUDIT_HMAC_KEY_FILE") {
-            match std::fs::read(&p) {
-                // TRIM a trailing newline: `echo key > file`, editors and secret managers append `\n`, so
-                // "the same" secret recreated another way produced a different HMAC.
-                Ok(b) => {
-                    let mut b = b;
-                    while matches!(b.last(), Some(b'\n') | Some(b'\r')) {
-                        b.pop();
-                    }
-                    (!b.is_empty()).then_some(b)
-                }
-                Err(e) => {
-                    eprintln!("AUDIT: cannot read MCP_AUDIT_HMAC_KEY_FILE {}: {}", p, e);
-                    None
-                }
-            }
-        } else {
-            None
-        };
-        raw.map(|k| {
-            let fp = key_fingerprint(&k);
-            (k, fp)
-        })
-    });
-    KEY.clone()
-}
-
-/// A short, public key identifier (8 hex characters of SHA-256). It reveals no secret — it only
-/// matches the right key when verifying a log that survived a rotation.
-fn key_fingerprint(k: &[u8]) -> String {
-    let mut h = Sha256::new();
-    h.update(k);
-    format!("{:x}", h.finalize()).chars().take(8).collect()
-}
-
-/// HMAC-SHA256 per RFC 2104 — the standard construction, written out to keep the crate set minimal.
-fn hmac_sha256_hex(key: Vec<u8>, msg: &[u8]) -> String {
-    const BLOCK: usize = 64;
-    let mut k = if key.len() > BLOCK {
-        let mut h = Sha256::new();
-        h.update(&key);
-        h.finalize().to_vec()
-    } else {
-        key
-    };
-    k.resize(BLOCK, 0);
-    let ipad: Vec<u8> = k.iter().map(|b| b ^ 0x36).collect();
-    let opad: Vec<u8> = k.iter().map(|b| b ^ 0x5c).collect();
-    let mut inner = Sha256::new();
-    inner.update(&ipad);
-    inner.update(msg);
-    let inner = inner.finalize();
-    let mut outer = Sha256::new();
-    outer.update(&opad);
-    outer.update(inner);
-    format!("{:x}", outer.finalize())
-}
-
-// --- caller identity, available to the audit without threading a parameter through six signatures ---
-thread_local! {
-    static CALLER: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
-}
-
-/// Sets the identity for one request and clears it when the scope ends (including on error or
-/// panic), so it cannot leak into the next request handled by the same pool thread.
-pub struct CallerScope;
-impl Drop for CallerScope {
-    fn drop(&mut self) {
-        CALLER.with(|c| *c.borrow_mut() = None);
-    }
-}
-fn set_caller(id: Option<String>) -> CallerScope {
-    CALLER.with(|c| *c.borrow_mut() = id);
-    CallerScope
-}
-fn current_caller() -> Option<String> {
-    CALLER.with(|c| c.borrow().clone())
-}
-
 pub struct AuthConfig {
     pub pubkey: Vec<u8>,
     pub aud: String,
     pub iss: String,
 }
 
-static AUTH_CONFIG: Lazy<Option<AuthConfig>> = Lazy::new(|| {
+pub(crate) static AUTH_CONFIG: Lazy<Option<AuthConfig>> = Lazy::new(|| {
     let pem = std::env::var("JWT_PUBKEY_PEM").ok()?;
     Some(AuthConfig {
         pubkey: pem.into_bytes(),
@@ -1913,7 +587,7 @@ static AUTH_CONFIG: Lazy<Option<AuthConfig>> = Lazy::new(|| {
     })
 });
 
-fn enforce_auth(
+pub(crate) fn enforce_auth(
     headers: &HeaderMap,
     req: &Value,
 ) -> Result<Option<String>, (u16, String, Option<String>)> {
@@ -2007,178 +681,7 @@ fn enforce_auth(
 }
 
 use axum::http::header::CONTENT_TYPE;
-use axum::routing::get;
-use std::sync::atomic::{AtomicU64, Ordering};
-
-#[derive(Default)]
-struct Metrics {
-    requests: AtomicU64,
-    query_allowed: AtomicU64,
-    denied_validation: AtomicU64,
-    denied_cost: AtomicU64,
-    denied_auth: AtomicU64,
-    denied_rate: AtomicU64,
-    audit_write_failed: AtomicU64,
-    errors: AtomicU64,
-}
-
-static METRICS: Lazy<Metrics> = Lazy::new(Metrics::default);
-
-fn render_metrics() -> String {
-    let mut buf = String::new();
-    macro_rules! push_metric {
-        ($name:expr, $val:expr) => {
-            buf.push_str("# HELP ");
-            buf.push_str($name);
-            buf.push_str(" Total count\n# TYPE ");
-            buf.push_str($name);
-            buf.push_str(" counter\n");
-            buf.push_str($name);
-            buf.push(' ');
-            buf.push_str(&$val.to_string());
-            buf.push('\n');
-        };
-    }
-
-    push_metric!(
-        "mcp_requests_total",
-        METRICS.requests.load(Ordering::Relaxed)
-    );
-    push_metric!(
-        "mcp_query_allowed_total",
-        METRICS.query_allowed.load(Ordering::Relaxed)
-    );
-    push_metric!(
-        "mcp_denied_validation_total",
-        METRICS.denied_validation.load(Ordering::Relaxed)
-    );
-    push_metric!(
-        "mcp_denied_cost_total",
-        METRICS.denied_cost.load(Ordering::Relaxed)
-    );
-    push_metric!(
-        "mcp_denied_auth_total",
-        METRICS.denied_auth.load(Ordering::Relaxed)
-    );
-    push_metric!(
-        "mcp_denied_rate_total",
-        METRICS.denied_rate.load(Ordering::Relaxed)
-    );
-    push_metric!(
-        "mcp_audit_write_failed_total",
-        METRICS.audit_write_failed.load(Ordering::Relaxed)
-    );
-    push_metric!("mcp_errors_total", METRICS.errors.load(Ordering::Relaxed));
-
-    buf
-}
-
-async fn metrics_handler(headers: HeaderMap) -> impl IntoResponse {
-    // Open by default (scraped from a private network). When `MCP_METRICS_TOKEN` is set we require it —
-    // otherwise a public deployment lets anyone watch traffic and how well auth denials are working.
-    if let Ok(expected) = std::env::var("MCP_METRICS_TOKEN") {
-        if !expected.is_empty() {
-            let given = headers
-                .get("authorization")
-                .and_then(|v| v.to_str().ok())
-                .and_then(|s| s.strip_prefix("Bearer "))
-                .unwrap_or("");
-            // constant-time comparison — the token must not leak through response timing
-            let eq = given.len() == expected.len()
-                && given
-                    .as_bytes()
-                    .iter()
-                    .zip(expected.as_bytes())
-                    .fold(0u8, |acc, (a, b)| acc | (a ^ b))
-                    == 0;
-            if !eq {
-                return (
-                    StatusCode::UNAUTHORIZED,
-                    [(CONTENT_TYPE, "text/plain")],
-                    "unauthorized\n".to_string(),
-                );
-            }
-        }
-    }
-    (
-        StatusCode::OK,
-        [(CONTENT_TYPE, "text/plain; version=0.0.4")],
-        render_metrics(),
-    )
-}
-
-async fn health_handler() -> impl axum::response::IntoResponse {
-    (axum::http::StatusCode::OK, "ok")
-}
-
-async fn ready_handler() -> impl axum::response::IntoResponse {
-    // pool.get() is blocking (r2d2/postgres block_on) and panics from an async handler
-    // ("runtime within runtime"), so the DB check goes through spawn_blocking.
-    let res = tokio::task::spawn_blocking(|| match pool_for(None) {
-        // get_timeout, not get(): with a busy pool the probe must answer "not ready" within a second
-        // rather than hang until connection_timeout — otherwise the orchestrator restarts the container
-        // mid-attack and deepens the outage.
-        Ok(pool) => pool
-            .get_timeout(std::time::Duration::from_secs(1))
-            .map(|_| ())
-            .map_err(|e| e.to_string()),
-        Err(e) => Err(e.clone()),
-    })
-    .await;
-    match res {
-        Ok(Ok(())) => (axum::http::StatusCode::OK, "ready"),
-        Ok(Err(_)) => (
-            axum::http::StatusCode::SERVICE_UNAVAILABLE,
-            "db unavailable",
-        ),
-        Err(_) => (
-            axum::http::StatusCode::SERVICE_UNAVAILABLE,
-            "internal error",
-        ),
-    }
-}
-
-/// RFC 9728 Protected Resource Metadata — pairs with the `WWW-Authenticate` header on a 401.
-/// It lets a client (and registry scanners) discover the authorization server and start OAuth discovery.
-async fn oauth_protected_resource_handler() -> impl axum::response::IntoResponse {
-    let base = std::env::var("MCP_PUBLIC_URL").unwrap_or_default();
-    let auth_servers: Vec<String> = std::env::var("MCP_AUTH_SERVERS")
-        .unwrap_or_default()
-        .split(',')
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .collect();
-    Json(json!({
-        "resource": base.trim_end_matches('/'),
-        "authorization_servers": auth_servers,
-        "scopes_supported": ["mcp:query"],
-        "bearer_methods_supported": ["header"]
-    }))
-}
-
-/// Server card — server metadata for MCP registries (name, version, transport, auth, tools).
-async fn server_card_handler() -> impl axum::response::IntoResponse {
-    let base = std::env::var("MCP_PUBLIC_URL").unwrap_or_default();
-    let base = base.trim_end_matches('/');
-    let auth_required = std::env::var("JWT_PUBKEY_PEM").is_ok();
-    let tools = handle_tools_list()["result"]["tools"].clone();
-    Json(json!({
-        "name": "postgres-mcp-hardened",
-        "version": env!("CARGO_PKG_VERSION"),
-        "description": "Read-only PostgreSQL MCP server in Rust: AST-enforced read-only queries plus database-level read-only transaction, per-session statement_timeout, schema inspection.",
-        "protocolVersion": "2025-06-18",
-        "transport": ["streamable-http", "stdio"],
-        "endpoint": if base.is_empty() { "/mcp".to_string() } else { format!("{}/mcp", base) },
-        "authentication": {
-            "required": auth_required,
-            "type": if auth_required { "oauth2.1" } else { "none" },
-            "protectedResourceMetadata": "/.well-known/oauth-protected-resource"
-        },
-        "tools": tools
-    }))
-}
-
-fn handle_request(req: &Value) -> Value {
+pub(crate) fn handle_request(req: &Value) -> Value {
     // Walidacja wersji JSON-RPC
     if req.get("jsonrpc") != Some(&json!("2.0")) {
         return json!({ "error": { "code": -32600, "message": "Invalid Request: jsonrpc must be 2.0" } });
@@ -2211,7 +714,7 @@ fn handle_request(req: &Value) -> Value {
     }
 }
 
-fn handle_initialize() -> Value {
+pub(crate) fn handle_initialize() -> Value {
     json!({
         "result": {
             "protocolVersion": "2025-06-18",
@@ -2223,7 +726,7 @@ fn handle_initialize() -> Value {
     })
 }
 
-fn handle_tools_list() -> Value {
+pub(crate) fn handle_tools_list() -> Value {
     let tools = vec![
         tool_def(
             "query",
@@ -2287,7 +790,7 @@ fn handle_tools_list() -> Value {
 /// Why an agent needs this: without a plan it guesses why a query is slow, and its guesses are
 /// confident and usually wrong. `analyze` actually executes the statement — safe here because the
 /// statement is validated read-only first and runs inside the transaction we always roll back.
-fn handle_explain_query(args: &Value) -> Value {
+pub(crate) fn handle_explain_query(args: &Value) -> Value {
     let db = args.get("database").and_then(|v| v.as_str());
     let sql = match args.get("sql").and_then(|v| v.as_str()) {
         Some(s) => s,
@@ -2321,7 +824,7 @@ fn handle_explain_query(args: &Value) -> Value {
 
 /// A health snapshot an operator would otherwise assemble by hand from half a dozen catalog views.
 /// Every check degrades gracefully: a role that cannot read a view yields a note, not a failure.
-fn handle_database_health(args: &Value) -> Value {
+pub(crate) fn handle_database_health(args: &Value) -> Value {
     let db = args.get("database").and_then(|v| v.as_str());
     const CHECKS: &[(&str, &str)] = &[
         (
@@ -2374,7 +877,7 @@ fn handle_database_health(args: &Value) -> Value {
 
 /// The heaviest statements, from pg_stat_statements. When the extension is absent we say so and
 /// how to enable it — a missing extension is a setup fact, not an error the agent should retry.
-fn handle_top_queries(args: &Value) -> Value {
+pub(crate) fn handle_top_queries(args: &Value) -> Value {
     let db = args.get("database").and_then(|v| v.as_str());
     let limit = args
         .get("limit")
@@ -2407,7 +910,7 @@ fn handle_top_queries(args: &Value) -> Value {
 
 /// Index findings that are cheap to compute and expensive to notice by hand: indexes nobody uses,
 /// duplicates, and tables scanned sequentially often enough that an index would likely pay off.
-fn handle_analyze_indexes(args: &Value) -> Value {
+pub(crate) fn handle_analyze_indexes(args: &Value) -> Value {
     let db = args.get("database").and_then(|v| v.as_str());
     let schema = args
         .get("schema")
@@ -2449,7 +952,7 @@ fn handle_analyze_indexes(args: &Value) -> Value {
     ok_content(&Value::Object(out))
 }
 
-fn tool_def(name: &str, desc: &str, input_schema: Value) -> Value {
+pub(crate) fn tool_def(name: &str, desc: &str, input_schema: Value) -> Value {
     json!({
         "name": name,
         "description": desc,
@@ -2458,7 +961,7 @@ fn tool_def(name: &str, desc: &str, input_schema: Value) -> Value {
     })
 }
 
-fn handle_tools_call(params: &Value) -> Value {
+pub(crate) fn handle_tools_call(params: &Value) -> Value {
     let name = match params.get("name").and_then(|v| v.as_str()) {
         Some(n) => n,
         None => return json!({ "error": { "code": -32602, "message": "Missing tool name" } }),
@@ -2479,7 +982,7 @@ fn handle_tools_call(params: &Value) -> Value {
     }
 }
 
-fn handle_query_tool(args: &Value) -> Value {
+pub(crate) fn handle_query_tool(args: &Value) -> Value {
     let db = args.get("database").and_then(|v| v.as_str());
     let sql = match args.get("sql").and_then(|v| v.as_str()) {
         Some(s) => s,
@@ -2548,7 +1051,7 @@ fn handle_query_tool(args: &Value) -> Value {
 /// The query went to the database with `LIMIT limit+1`; an extra row means there is more data. An
 /// AI agent draws conclusions from what it received — "1000 rows" without a note that this is the
 /// first thousand of sixteen is a quiet untruth, even when every value in it is correct.
-fn mark_truncation(data: &mut Value, limit: u64) {
+pub(crate) fn mark_truncation(data: &mut Value, limit: u64) {
     let n = data
         .get("rows")
         .and_then(|r| r.as_array())
