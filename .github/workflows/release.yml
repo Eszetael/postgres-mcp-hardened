@@ -85,6 +85,10 @@ jobs:
       - name: Upload to release
         uses: softprops/action-gh-release@v2
         with:
+          # A `-rc` tag is a rehearsal of this workflow, not a release: it stays a draft so the
+          # artefacts can be inspected before anything is visible to anyone.
+          draft: ${{ contains(github.ref, '-rc') }}
+          prerelease: ${{ contains(github.ref, '-rc') }}
           files: postgres-mcp-hardened-${{ matrix.target }}.*
 
       # Also as a workflow artefact, because the signing job runs on a different machine and cannot
@@ -132,6 +136,8 @@ jobs:
           subject-path: 'dist/*'
       - uses: softprops/action-gh-release@v2
         with:
+          draft: ${{ contains(github.ref, '-rc') }}
+          prerelease: ${{ contains(github.ref, '-rc') }}
           files: |
             dist/*.sig
             dist/*.pem
@@ -148,6 +154,8 @@ jobs:
       - name: Attach the SBOM to the release
         uses: softprops/action-gh-release@v2
         with:
+          draft: ${{ contains(github.ref, '-rc') }}
+          prerelease: ${{ contains(github.ref, '-rc') }}
           files: "**/*.cdx.json"
 
   container:
