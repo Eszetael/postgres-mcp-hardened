@@ -515,6 +515,51 @@ case "$r" in *'"grade":"F"'*) no "a read-only role still grades F" "$r";; *) ok 
 echo "$r" | grep -q 'cannot write to any of' && ok "and the report says so in words" || no "no positive finding" "$r"
 stop
 
+section "The surface allowlist reads the plan, not the SQL"
+docker exec -i acc_pg psql -U postgres -q -v ON_ERROR_STOP=1 <<'SQL' >/dev/null || { echo "fixture failed: surface"; exit 1; }
+CREATE TABLE salaries (person text, amount numeric);
+INSERT INTO salaries VALUES ('ada', 100);
+CREATE VIEW customer_view AS SELECT id FROM customers;
+CREATE VIEW salary_view AS SELECT person FROM salaries;
+SQL
+start DATABASE_URL="$URL" MCP_ALLOW_TABLES="public.customers,public.events"
+r=$(tool query '{"sql":"SELECT id FROM customers LIMIT 1"}' | body)
+case "$r" in ERROR:*) no "an allowed table was refused" "$r";; *) ok "a table on the list is reachable";; esac
+r=$(tool query '{"sql":"SELECT * FROM salaries"}' | body)
+case "$r" in *"outside the configured surface"*) ok "a table off the list is refused, by name";; *) no "unlisted table reachable" "$r";; esac
+# The shape that defeats reasoning about syntax: a CTE named after a table. The planner knows the
+# difference, so this must run WITHOUT touching the table it is named after.
+r=$(tool query '{"sql":"WITH salaries AS (SELECT 1 AS x) SELECT * FROM salaries"}' | body)
+case "$r" in ERROR:*) no "a CTE was mistaken for the table it shadows" "$r";; *) ok "a CTE named after a table is not that table";; esac
+r=$(tool query '{"sql":"WITH x AS (SELECT * FROM salaries) SELECT * FROM x"}' | body)
+case "$r" in *"outside the configured surface"*) ok "and hiding the table inside a CTE does not help";; *) no "CTE hid an unlisted table" "$r";; esac
+r=$(tool query '{"sql":"SELECT c.id FROM customers c JOIN salaries s ON true"}' | body)
+case "$r" in *"outside the configured surface"*) ok "a join that reaches off the list is refused";; *) no "join reached an unlisted table" "$r";; esac
+# The plan names base tables, so a view over an unlisted table is refused — documented, and asserted
+# here so the documentation cannot drift away from it again.
+r=$(tool query '{"sql":"SELECT person FROM salary_view"}' | body)
+case "$r" in *"outside the configured surface"*) ok "a view over an unlisted table is refused";; *) no "view bypassed the allowlist" "$r";; esac
+r=$(tool query '{"sql":"SELECT id FROM customer_view"}' | body)
+case "$r" in ERROR:*) no "a view over a listed table was refused" "$r";; *) ok "a view over a listed table works";; esac
+# A partition rides on its parent: the caller named the parent, PostgreSQL chose the children.
+r=$(tool query '{"sql":"SELECT * FROM events"}' | body)
+case "$r" in ERROR:*) no "a partitioned table was refused" "$r";; *) ok "a partition is covered by its parent";; esac
+r=$(tool query '{"sql":"SELECT * FROM pg_stat_activity"}' | body)
+case "$r" in *"outside the configured surface"*) ok "the catalog is outside the surface by default";; *) no "pg_catalog reachable under an allowlist" "$r";; esac
+# Schema tools run fixed queries, not caller SQL, so they keep working.
+r=$(tool list_tables '{"schema":"public"}' | body)
+case "$r" in ERROR:*) no "schema introspection broke under the allowlist" "$r";; *) ok "schema introspection is unaffected";; esac
+stop
+start DATABASE_URL="$URL" MCP_ALLOW_TABLES="public.customers" MCP_ALLOW_CATALOG=1
+r=$(tool query '{"sql":"SELECT count(*) FROM pg_class"}' | body)
+case "$r" in ERROR:*) no "MCP_ALLOW_CATALOG did not open the catalog" "$r";; *) ok "the catalog opens when the operator asks for it";; esac
+stop
+# Nothing configured: the server behaves exactly as before.
+start DATABASE_URL="$URL"
+r=$(tool query '{"sql":"SELECT * FROM salaries"}' | body)
+case "$r" in ERROR:*) no "an unconfigured allowlist blocked a query" "$r";; *) ok "with no allowlist configured nothing changes";; esac
+stop
+
 section "Deployment shapes"
 start MCP_DATABASE_URLS="a=$URL;b=$URL"
 r=$(tool query '{"sql":"SELECT 1 AS x","database":"b"}' | body); echo "$r" | grep -q '"x":1' && ok "several databases from one server" || no "multi-database" "$r"

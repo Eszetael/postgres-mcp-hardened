@@ -282,6 +282,31 @@ to stay hidden gets handed back.
 The output ends with checks that return no rows when it worked, and a reminder that the server itself
 will tell you what the role can do the moment you point it at the database.
 
+## Limiting what the server can reach
+
+`MCP_ALLOW_SCHEMAS` and `MCP_ALLOW_TABLES` restrict which relations a query may touch. Either one
+turns the allowlist on; `schema.*` and `schema.table` both work.
+
+```bash
+MCP_ALLOW_TABLES='public.customers,public.orders,analytics.*'
+```
+
+The check reads the **query plan**, not the SQL. That is the whole design: the planner has already
+applied `search_path`, resolved every alias, expanded views to base tables, and knows that a CTE
+named `customers` is not the table `customers` — so `WITH customers AS (SELECT 1) SELECT * FROM
+customers` runs and touches nothing, while `WITH x AS (SELECT * FROM salaries) SELECT * FROM x`
+is refused. Reading the statement instead is what lost three rounds of adversarial review.
+
+Two consequences worth knowing before you turn it on:
+
+- **A partition rides on its parent.** You allow `events`; PostgreSQL decides which children to read.
+- **A view needs its base tables allowed too**, because the plan names those. Allow both, and let the
+  database privileges keep the base table unreachable directly — that is the boundary in any case.
+
+`pg_catalog` and `information_schema` are outside the surface unless `MCP_ALLOW_CATALOG=1`: an agent
+that can still read the catalog can enumerate exactly what the allowlist was meant to hide. The
+schema tools keep working, because they run fixed queries rather than caller SQL.
+
 ## The corpus of things that got through
 
 Every shape that defeated a control during review lives in `tests/adversarial/`, with the round in
@@ -408,6 +433,9 @@ left resident memory flat and file descriptors unchanged.
 | `MCP_RESERVED_AUTH_SLOTS` | database slots kept for authenticated traffic so an anonymous flood cannot take the pool (default: a quarter) |
 | `MCP_PUBLIC_URL` | this server's public base URL, used in the OAuth discovery metadata |
 | `MCP_AUTH_SERVERS` | authorization server URLs advertised in that metadata |
+| `MCP_ALLOW_SCHEMAS` | schemas a query may reach, e.g. `public,analytics`; setting either this or the next turns the allowlist on |
+| `MCP_ALLOW_TABLES` | relations a query may reach, e.g. `public.orders,analytics.*` |
+| `MCP_ALLOW_CATALOG` | `1` to keep `pg_catalog` reachable while an allowlist is active |
 | `MCP_ALLOW_PLAINTEXT_DB` | set to `i-accept-the-risk` to allow `sslmode=disable` to a database that is not on this machine |
 | `MCP_ALLOW_EXCESSIVE_ROLE` | set to `i-accept-the-risk` to serve a network listener with a role that can write |
 | `MCP_ALLOW_ANONYMOUS_NETWORK` | set to `i-accept-the-risk` to serve a network listener with no authentication |

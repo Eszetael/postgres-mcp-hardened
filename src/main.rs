@@ -28,6 +28,7 @@ mod pipeline;
 mod protocol;
 mod posture;
 mod setup_sql;
+mod surface;
 mod ratelimit;
 mod validate;
 
@@ -298,7 +299,10 @@ pub(crate) const KNOWN_VARS: &[&str] = &[
     "MCP_ALLOW_ANONYMOUS_NETWORK",
     "MCP_ALLOW_EXCESSIVE_ROLE",
     "MCP_ALLOW_FUNCTIONS",
+    "MCP_ALLOW_CATALOG",
     "MCP_ALLOW_PLAINTEXT_DB",
+    "MCP_ALLOW_SCHEMAS",
+    "MCP_ALLOW_TABLES",
     "MCP_AUDIT_HMAC_KEY",
     "MCP_AUDIT_HMAC_KEYS_OLD",
     "MCP_AUDIT_HMAC_KEY_FILE",
@@ -1418,6 +1422,11 @@ pub(crate) fn handle_explain_query(args: &Value) -> Value {
                     METRICS.denied_cost.fetch_add(1, Ordering::Relaxed);
                     return err_content(-32001, e);
                 }
+                Err(CostErr::OutsideSurface(e)) => {
+                    audit("explain_query", "denied_surface", Some(sql));
+                    METRICS.denied_validation.fetch_add(1, Ordering::Relaxed);
+                    return err_content(-32602, e);
+                }
                 Err(CostErr::QueryError(e)) => {
                     audit("explain_query", "error", Some(sql));
                     METRICS.errors.fetch_add(1, Ordering::Relaxed);
@@ -1920,6 +1929,14 @@ pub(crate) fn handle_query_tool(args: &Value) -> Value {
                 audit("query", "denied_cost", Some(sql));
                 METRICS.denied_cost.fetch_add(1, Ordering::Relaxed);
                 return json!({ "error": { "code": -32001, "message": e } });
+            }
+            Err(CostErr::OutsideSurface(e)) => {
+                // Its own decision in the log: "reached somewhere it should not" is a different
+                // event from "asked for too much", and an operator reviewing the chain wants to
+                // tell them apart.
+                audit("query", "denied_surface", Some(sql));
+                METRICS.denied_validation.fetch_add(1, Ordering::Relaxed);
+                return json!({ "error": { "code": -32602, "message": e } });
             }
             Err(CostErr::QueryError(e)) => {
                 // an error in the query itself (a missing column) — NOT denied_cost; an ordinary error. Audited.

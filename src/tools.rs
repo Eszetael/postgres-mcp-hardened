@@ -361,6 +361,8 @@ pub(crate) fn handle_describe_table(args: &Value) -> Value {
 /// (a missing column, say), so the audit never confuses "denied_cost" with a SQL error.
 pub(crate) enum CostErr {
     TooExpensive(String),
+    /// The plan reaches a relation outside the configured surface.
+    OutsideSurface(String),
     QueryError(String),
 }
 
@@ -378,8 +380,10 @@ pub(crate) fn cost_guard(sql: &str, max_cost: f64, db: Option<&str>) -> Result<(
             search_path_stmt()
         ))
         .map_err(|e| CostErr::QueryError(e.to_string()))?;
+    // VERBOSE so the plan labels each scan with its schema and relation. One EXPLAIN answers both
+    // questions — how expensive, and what it reaches — instead of paying for the round trip twice.
     let row = client
-        .query_one(&format!("EXPLAIN (FORMAT JSON) {}", sql), &[])
+        .query_one(&format!("EXPLAIN (FORMAT JSON, VERBOSE) {}", sql), &[])
         .map_err(|e| CostErr::QueryError(friendly_pg_error_for(&e, Some(sql))))?;
     let plan: Value = row.get(0); // kolumna json: [{"Plan":{"Total Cost":..}}]
     let total = plan
@@ -388,6 +392,36 @@ pub(crate) fn cost_guard(sql: &str, max_cost: f64, db: Option<&str>) -> Result<(
         .and_then(|v| v.get("Total Cost"))
         .and_then(|v| v.as_f64())
         .unwrap_or(0.0);
+    // The surface check belongs here, on the plan, for the reason the module explains: the planner
+    // has already resolved aliases, applied search_path, expanded views and distinguished a CTE from
+    // the table it shadows. Reading the statement instead is what lost three rounds.
+    if surface::active() {
+        let found = surface::relations_in_plan(&plan);
+        let parents = |s: &str, r: &str| -> Option<(String, String)> {
+            let v = query_catalog(
+                "SELECT pn.nspname AS schema, pc.relname AS rel \
+                 FROM pg_inherits i \
+                 JOIN pg_class c ON c.oid = i.inhrelid \
+                 JOIN pg_namespace n ON n.oid = c.relnamespace \
+                 JOIN pg_class pc ON pc.oid = i.inhparent \
+                 JOIN pg_namespace pn ON pn.oid = pc.relnamespace \
+                 WHERE n.nspname = $1 AND c.relname = $2",
+                &[&s, &r],
+                db,
+            )
+            .ok()?;
+            let row = v.get("rows")?.as_array()?.first()?;
+            Some((
+                row.get("schema")?.as_str()?.to_string(),
+                row.get("rel")?.as_str()?.to_string(),
+            ))
+        };
+        let refused = surface::refused(&found, &parents);
+        if !refused.is_empty() {
+            return Err(CostErr::OutsideSurface(surface::refusal_message(&refused)));
+        }
+    }
+
     if total > max_cost {
         Err(CostErr::TooExpensive(format!(
             "query too expensive: estimated cost {:.0} exceeds limit {:.0}",

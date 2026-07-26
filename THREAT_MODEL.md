@@ -105,8 +105,10 @@ server checks each one rather than assuming it.
   everything the role can see, including `pg_catalog`.
 - **Expensive but legitimate queries.** The cost guard uses estimates; a bad estimate is exactly
   when it fails, and bad estimates are common on databases nobody has analysed.
-- **Views widen the surface.** Allowing a view allows what the view reads. Stated wherever the
-  allowlist is described, because operators reasonably expect the opposite.
+- **Views need their base tables allowed too.** The plan names base tables, not the view, so allowing
+  only the view refuses the query. Allow both — and let the database privileges keep the base table
+  unreachable directly, which is the boundary anyway. Verified by running it, after this document
+  claimed the opposite.
 
 ## What would change our mind
 
