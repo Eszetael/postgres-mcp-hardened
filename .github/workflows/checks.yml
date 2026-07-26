@@ -66,7 +66,7 @@ jobs:
           MCP_ADDR=127.0.0.1:8080 ./target/release/postgres-mcp-hardened &
           sleep 3
           curl -sf -H content-type:application/json http://127.0.0.1:8080/mcp \
-            -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"query","arguments":{"sql":"SELECT 1 AS ok"}}}' | grep -q '"ok"'
+            -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"query","arguments":{"sql":"SELECT 1 AS ok"}}}' | grep -q 'returnedRows'
           curl -s -H content-type:application/json http://127.0.0.1:8080/mcp \
             -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"query","arguments":{"sql":"CREATE TABLE t(x int)"}}}' | grep -q 'non-read-only'
 

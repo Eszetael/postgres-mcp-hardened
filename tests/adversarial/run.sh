@@ -36,8 +36,10 @@ MCP_PID=$!
 
 # Ensure the server is killed when this script exits
 cleanup() {
-  kill "$MCP_PID" 2>/dev/null
-  wait "$MCP_PID" 2>/dev/null
+  # `|| true` on both: `wait` on a process we just killed returns 143, and under `set -e` the EXIT
+  # trap's last status becomes the script's. The corpus passed 82 of 82 and the job still went red.
+  kill "$MCP_PID" 2>/dev/null || true
+  wait "$MCP_PID" 2>/dev/null || true
 }
 trap cleanup EXIT
 

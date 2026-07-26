@@ -41,7 +41,11 @@ sign wrong  not-this-host.example
 chmod 755 "$DIR"
 chmod 644 "$DIR"/*.crt
 chmod 600 "$DIR"/*.key
-chown 999:999 "$DIR"/*.key 2>/dev/null || true
+# The ownership change needs root, which a CI runner is not — so borrow it from a container that is.
+# Without this the key stays owned by the calling user, PostgreSQL cannot read it, and the whole
+# suite reports "would not start with TLS", which looks like a TLS problem and is a permissions one.
+docker run --rm -v "$DIR":/certs postgres:16 \
+  sh -c 'chown 999:999 /certs/*.key && chmod 600 /certs/*.key' >/dev/null 2>&1 || true
 
 start_pg(){ # start_pg <cert-basename>
   docker rm -f tls_pg >/dev/null 2>&1
