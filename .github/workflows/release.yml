@@ -87,10 +87,55 @@ jobs:
         with:
           files: postgres-mcp-hardened-${{ matrix.target }}.*
 
+      # Also as a workflow artefact, because the signing job runs on a different machine and cannot
+      # sign files it has never seen. Without this the signing job would download nothing and
+      # succeed at signing zero files — a green build producing an unsigned release.
+      - name: Hand the artefacts to the signing job
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.target }}
+          path: postgres-mcp-hardened-${{ matrix.target }}.*
+          if-no-files-found: error
+
   # The most common complaint against the leading alternative is that its published image lags the
   # code by months. Publishing from the same tag that builds the binaries makes that impossible.
   # A software bill of materials belongs with the artifact, not in a promise: reviewers in regulated
   # environments ask for it first.
+  sign:
+    # Keyless Sigstore: no key to store, no key to leak, and the identity in the certificate is this
+    # workflow in this repository. `id-token: write` is requested HERE and nowhere else, because it
+    # is the permission that lets a job speak for the repository.
+    needs: [checks, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { path: dist, merge-multiple: true }
+      - uses: sigstore/cosign-installer@v3
+      - name: Sign every artefact and its checksum file
+        run: |
+          shopt -s nullglob
+          n=0
+          for f in dist/*; do
+            [ -f "$f" ] || continue
+            cosign sign-blob --yes --output-signature "$f.sig" --output-certificate "$f.pem" "$f"
+            n=$((n+1))
+          done
+          # Signing nothing must not pass for signing everything.
+          [ "$n" -gt 0 ] || { echo "no artefacts to sign"; exit 1; }
+          echo "signed $n artefacts"
+      - uses: actions/attest-build-provenance@v1
+        with:
+          subject-path: 'dist/*'
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.sig
+            dist/*.pem
+
   sbom:
     needs: [checks]
     runs-on: ubuntu-latest
