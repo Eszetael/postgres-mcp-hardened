@@ -25,6 +25,7 @@ pub(crate) use db::*;
 pub(crate) use http::*;
 pub(crate) use tools::*;
 mod pipeline;
+mod protocol;
 mod posture;
 mod setup_sql;
 mod ratelimit;
@@ -857,10 +858,22 @@ pub(crate) async fn mcp_handler(
     };
 
     let req_logic = req.clone();
+    // The negotiated revision has to be read on the thread that runs the logic: `spawn_blocking`
+    // moves the work to another thread and thread-local state does not follow it.
+    // Always Some: an HTTP request must not inherit the revision another client negotiated. A
+    // client that sends no header is, in practice, an older client.
+    let wire_rev = Some(
+        headers
+            .get("mcp-protocol-version")
+            .and_then(|v| v.to_str().ok())
+            .and_then(protocol::Rev::parse)
+            .unwrap_or(protocol::Rev::V20250618),
+    );
     let mut resp = tokio::task::spawn_blocking(move || {
         let _permit = permit; // released when the WORK ends, not when the client disconnects
         let _slot = slot;
         let _who = set_caller(caller); // identity visible to the audit on this thread
+        let _rev = protocol::set_request_rev(wire_rev);
         handle_request(&req_logic)
     })
     .await
@@ -1083,9 +1096,13 @@ pub(crate) fn handle_request(req: &Value) -> Value {
     let params = req.get("params").cloned().unwrap_or(json!({}));
 
     match method {
-        "initialize" => handle_initialize(),
+        "initialize" => handle_initialize(&params),
         "tools/list" => handle_tools_list(),
-        "tools/call" => handle_tools_call(&params),
+        // SEP-1303: from 2025-11-25 a tool's refusal belongs in the result, so the model reads the
+        // reason and rewrites the query, instead of the client seeing a broken call. The audit
+        // record was already written by the code that refused — reshaping happens after, never
+        // instead.
+        "tools/call" => protocol::shape_tool_result(handle_tools_call(&params), protocol::current()),
         // `ping` is part of MCP utilities — clients use it as a keepalive. The answer is an empty object;
         // not handling it made us look like a server that does not know the protocol.
         "ping" => json!({ "result": {} }),
@@ -1100,10 +1117,14 @@ pub(crate) fn handle_request(req: &Value) -> Value {
     }
 }
 
-pub(crate) fn handle_initialize() -> Value {
+pub(crate) fn handle_initialize(params: &Value) -> Value {
+    // Answer with a revision we can actually speak: the client's if we implement it, ours otherwise.
+    // The version used to be a constant, which meant we announced 2025-06-18 to a client that had
+    // asked for something newer and could have had the better error contract.
+    let rev = protocol::negotiate_initialize(params);
     json!({
         "result": {
-            "protocolVersion": "2025-06-18",
+            "protocolVersion": rev.as_str(),
             // MCP_SERVER_LABEL lets an operator running several instances tell them apart in the
             // client UI ("postgres-mcp-hardened (production)") instead of seeing identical entries.
             "serverInfo": { "name": server_label(), "version": "0.1.0" },
@@ -1917,7 +1938,12 @@ mod tests {
         let resp = handle_request(&req);
         assert!(resp.get("result").is_some());
         let result = resp["result"].as_object().unwrap();
-        assert_eq!(result["protocolVersion"], "2025-06-18");
+        // A client that names no revision gets the newest we implement; one that names an older
+        // revision we support gets that one back, unchanged.
+        assert_eq!(result["protocolVersion"], protocol::Rev::LATEST.as_str());
+        let older = handle_request(&json!({"jsonrpc":"2.0","id":1,"method":"initialize",
+            "params":{"protocolVersion":"2025-06-18"}}));
+        assert_eq!(older["result"]["protocolVersion"], "2025-06-18");
         assert_eq!(result["serverInfo"]["name"], "postgres-mcp-hardened");
         assert!(result["capabilities"]["tools"].is_object());
     }
@@ -1933,13 +1959,24 @@ mod tests {
                 "arguments": { "sql": "INSERT INTO users (name) VALUES ('hacker')" }
             }
         });
+        // The same refusal, in whichever shape the negotiated revision calls for.
+        let old = protocol::set_request_rev(Some(protocol::Rev::V20250618));
         let resp = handle_request(&req);
-        assert!(resp.get("error").is_some());
-        let err = &resp["error"];
-        assert_eq!(err["code"], -32602); // Invalid params (validation error)
+        assert_eq!(resp["error"]["code"], -32602);
         assert!(
-            err["message"].as_str().unwrap().contains("read-only")
-                | err["message"].as_str().unwrap().contains("Read-only")
+            resp["error"]["message"].as_str().unwrap().contains("read-only"),
+            "the reason belongs in the message: {resp}"
         );
+        drop(old);
+        // From 2025-11-25 it reaches the model as a tool execution error, so it can try again
+        // (SEP-1303) — the audit entry is written either way, by the code that refused.
+        let new = protocol::set_request_rev(Some(protocol::Rev::V20251125));
+        let resp = handle_request(&req);
+        assert_eq!(resp["result"]["isError"], json!(true));
+        assert!(resp["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("read-only"));
+        drop(new);
     }
 }

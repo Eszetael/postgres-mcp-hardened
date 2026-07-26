@@ -433,6 +433,35 @@ echo '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"query","ar
 grep -q '"caller":"stdio:uid=' "$SAUD" && ok "an unnamed stdio client still gets an identity" || no "fallback identity missing" "$(cat "$SAUD")"
 rm -f "$SIN" "$SAUD"
 
+section "A refusal reaches the model, and the log, in every revision"
+PAUD=/tmp/acc_proto_$$.log; rm -f "$PAUD"
+start DATABASE_URL="$URL" MCP_AUDIT_LOG="$PAUD"
+W='{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"query","arguments":{"sql":"DELETE FROM orders"}}}'
+r=$(curl -s -m 20 -H content-type:application/json -H 'mcp-protocol-version: 2025-06-18' "http://127.0.0.1:$PORT/mcp" -d "$W")
+echo "$r" | grep -q '"error"' && ok "a client on 2025-06-18 gets the error shape it expects" || no "old contract changed" "$r"
+r=$(curl -s -m 20 -H content-type:application/json -H 'mcp-protocol-version: 2025-11-25' "http://127.0.0.1:$PORT/mcp" -d "$W")
+echo "$r" | grep -q '"isError":true' && ok "a client on 2025-11-25 gets a tool execution error (SEP-1303)" || no "new contract missing" "$r"
+echo "$r" | grep -q 'non-read-only' && ok "and the reason is in it, where the model can read it" || no "reason lost" "$r"
+# The point of the whole exercise, stated as a test: friendlier errors must not mean a quieter log.
+[ "$(grep -c '"decision":"denied_validation"' "$PAUD")" -ge 2 ] \
+  && ok "both refusals are in the audit chain, whatever the wire shape" \
+  || no "a refusal went unaudited" "$(grep -c denied_validation "$PAUD") entries"
+# Auth and protocol failures stay protocol failures: a client cannot fix them by rewriting SQL.
+r=$(curl -s -m 15 -H content-type:application/json -H 'mcp-protocol-version: 2025-11-25' "http://127.0.0.1:$PORT/mcp" \
+     -d '{"jsonrpc":"2.0","id":1,"method":"no/such/method"}')
+echo "$r" | grep -q '"error"' && ok "an unknown method stays a protocol error" || no "protocol error reshaped" "$r"
+for v in 2025-06-18 2025-11-25 2099-01-01; do
+  got=$(curl -s -m 15 -H content-type:application/json "http://127.0.0.1:$PORT/mcp" \
+        -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"$v\"}}" \
+        | python3 -c 'import sys,json;print(json.load(sys.stdin)["result"]["protocolVersion"])')
+  case "$v:$got" in
+    2025-06-18:2025-06-18|2025-11-25:2025-11-25|2099-01-01:2025-11-25) ok "initialize negotiates $v to $got";;
+    *) no "bad negotiation for $v" "$got";;
+  esac
+done
+stop
+rm -f "$PAUD"
+
 section "Deployment shapes"
 start MCP_DATABASE_URLS="a=$URL;b=$URL"
 r=$(tool query '{"sql":"SELECT 1 AS x","database":"b"}' | body); echo "$r" | grep -q '"x":1' && ok "several databases from one server" || no "multi-database" "$r"

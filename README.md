@@ -2,7 +2,7 @@
 
 **The official Postgres MCP server was deprecated in 2024 and still gets ~440k downloads a month. Its entire defence is one database-level read-only transaction — and that alone does not stop every write. This is a maintained Rust replacement with defence in depth.**
 
-A drop-in [Model Context Protocol](https://modelcontextprotocol.io) server that lets an AI agent query PostgreSQL — **read-only, enforced at the database level**, with real SQL validation, timeouts, cost limits, OAuth 2.1, and an audit trail. Speaks **Streamable HTTP** (2026 transport) and stdio.
+A drop-in [Model Context Protocol](https://modelcontextprotocol.io) server that lets an AI agent query PostgreSQL — **read-only, enforced at the database level**, with real SQL validation, timeouts, cost limits, OAuth 2.1, and an audit trail. Speaks **Streamable HTTP** and stdio, and negotiates the MCP revision: `2025-11-25` (current) and `2025-06-18` (what shipping clients speak today).
 
 ## Why
 
@@ -241,6 +241,23 @@ offered, plus column comments, primary keys and **foreign keys** in the payload.
   (`COMMENT ON TABLE/COLUMN`), primary keys, **foreign keys** and defaults, so the agent reads what a
   column *means* and what it points at instead of guessing from its name — and a missing table is an
   error, not an empty column list.
+
+## Protocol revisions
+
+The server answers `initialize` with the revision the client asked for when it implements it, and
+with its newest otherwise. Over HTTP the revision comes from the `MCP-Protocol-Version` header, per
+request — one client's negotiation cannot change the contract another client is served under.
+
+The difference that matters is where a refusal goes. Under `2025-06-18` "this statement is not
+read-only" was a JSON-RPC error: the client saw a broken call and the model often never saw the
+reason. From `2025-11-25` (SEP-1303) it arrives as a tool execution error — `isError: true` with the
+reason in the content — so the model rewrites the query instead of handing the user a failure. What
+does not change is the audit: the refusal is recorded by the code that refuses, and the acceptance
+suite asserts both halves together, so friendlier errors can never quietly mean a quieter log.
+
+Protocol failures stay protocol failures. A malformed envelope, an unknown method or a missing token
+is not something a model can fix by rewriting SQL, and a client's error handling expects those where
+they have always been.
 
 ## Setting up the role
 
