@@ -156,7 +156,12 @@ pub(crate) fn audit_extra(
 /// Walks the audit file and checks that every entry has a correct `prev` and `hash`. Returns the
 /// entry count, or a description of the first mismatch (the line number is where the log was touched).
 /// It uses EXACTLY the same hash function as the writer, so the verdict never depends on interpretation.
-pub(crate) fn verify_audit_file(path: &str, expect_last: Option<&str>) -> Result<String, String> {
+/// Returns `(human summary, last hash)`. The hash is separate because the anchor is meant to be
+/// stored and compared by a script, and a caller should not have to parse prose to get it.
+pub(crate) fn verify_audit_file(
+    path: &str,
+    expect_last: Option<&str>,
+) -> Result<(String, String), String> {
     let content =
         std::fs::read_to_string(path).map_err(|e| format!("cannot read {}: {}", path, e))?;
 
@@ -264,14 +269,21 @@ pub(crate) fn verify_audit_file(path: &str, expect_last: Option<&str>) -> Result
         }
     }
     let seq_info = prev_seq
-        .map(|s| format!(", ostatni seq {}", s))
+        .map(|s| format!(", last seq {}", s))
         .unwrap_or_default();
     let rot_info = if rotations > 0 {
-        format!(", rotacji klucza: {}", rotations)
+        format!(", key rotations: {}", rotations)
     } else {
         String::new()
     };
-    Ok(format!("{} entries{}{}\n  last hash: {}\n  STORE this hash off-host — without an external anchor, truncating the tail of the log is undetectable", n, seq_info, rot_info, prev))
+    Ok((
+        format!(
+            "{} entries{}{}\n  last hash: {}\n  STORE this hash off-host — without an external \
+             anchor, truncating the tail of the log is undetectable",
+            n, seq_info, rot_info, prev
+        ),
+        prev,
+    ))
 }
 
 /// HMAC key for the audit chain. `MCP_AUDIT_HMAC_KEY` (the value) or `MCP_AUDIT_HMAC_KEY_FILE`
@@ -357,4 +369,158 @@ pub(crate) fn set_caller(id: Option<String>) -> CallerScope {
 }
 pub(crate) fn current_caller() -> Option<String> {
     CALLER.with(|c| c.borrow().clone())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    /// Builds a well-formed chain, using the same hashing the writer uses, so a test cannot pass by
+    /// agreeing with itself about a format the writer does not produce.
+    fn chain(entries: &[Value]) -> String {
+        let key = audit_key();
+        let mut prev = "GENESIS".to_string();
+        let mut out = String::new();
+        for e in entries {
+            let mut entry = e.clone();
+            if let (Some(obj), Some((_, fp))) = (entry.as_object_mut(), &key) {
+                obj.insert("key_fp".into(), Value::String(fp.clone()));
+            }
+            let body = serde_json::to_string(&entry).unwrap();
+            let payload = format!("{}{}", prev, body);
+            let hash = match &key {
+                Some((k, _)) => hmac_sha256_hex(k.clone(), payload.as_bytes()),
+                None => {
+                    let mut h = Sha256::new();
+                    h.update(payload.as_bytes());
+                    format!("{:x}", h.finalize())
+                }
+            };
+            let mut full = entry.as_object().unwrap().clone();
+            full.insert("prev".into(), Value::String(prev.clone()));
+            full.insert("hash".into(), Value::String(hash.clone()));
+            out.push_str(&serde_json::to_string(&Value::Object(full)).unwrap());
+            out.push('\n');
+            prev = hash;
+        }
+        out
+    }
+
+    fn entry(seq: u64, tool: &str) -> Value {
+        json!({"seq": seq, "ts": 1_700_000_000 + seq, "tool": tool,
+               "decision": "allowed", "sql_fp": "abcdef0123456789", "caller": "-"})
+    }
+
+    fn write(name: &str, content: &str) -> String {
+        let p = std::env::temp_dir().join(format!("audit_test_{}_{}.log", name, std::process::id()));
+        std::fs::write(&p, content).unwrap();
+        p.to_string_lossy().into_owned()
+    }
+
+    #[test]
+    fn a_well_formed_chain_verifies_and_returns_its_last_hash() {
+        let c = chain(&[entry(1, "query"), entry(2, "list_tables"), entry(3, "query")]);
+        let p = write("ok", &c);
+        let (summary, last) = verify_audit_file(&p, None).expect("chain should verify");
+        assert!(c.contains(&last), "the reported last hash must be the one in the file");
+        assert!(summary.contains("3 entries"), "{summary}");
+        std::fs::remove_file(p).ok();
+    }
+
+    /// The point of hashing each entry: changing one has to be visible, and the message has to say
+    /// WHICH one, or an operator with a large log learns nothing actionable.
+    #[test]
+    fn a_modified_entry_is_caught_and_located() {
+        let c = chain(&[entry(1, "query"), entry(2, "query"), entry(3, "query")]);
+        let tampered = c.replacen("\"decision\":\"allowed\"", "\"decision\":\"denied_rate\"", 1);
+        let p = write("modified", &tampered);
+        let err = verify_audit_file(&p, None).expect_err("a modified entry must not verify");
+        assert!(err.contains("line 1"), "the failure must name the line: {err}");
+        std::fs::remove_file(p).ok();
+    }
+
+    #[test]
+    fn a_removed_entry_is_caught() {
+        let c = chain(&[entry(1, "query"), entry(2, "query"), entry(3, "query")]);
+        let lines: Vec<&str> = c.lines().collect();
+        let p = write("removed", &format!("{}\n{}\n", lines[0], lines[2]));
+        let err = verify_audit_file(&p, None).expect_err("a gap must not verify");
+        assert!(!err.is_empty());
+        std::fs::remove_file(p).ok();
+    }
+
+    /// The limit SECURITY.md states, asserted rather than described. Cutting the tail leaves a log
+    /// that is internally consistent, so only an anchor kept elsewhere can catch it. A test that
+    /// pretended otherwise would be worse than no test.
+    #[test]
+    fn a_truncated_tail_is_invisible_without_an_anchor_and_caught_with_one() {
+        let c = chain(&[entry(1, "query"), entry(2, "query"), entry(3, "query")]);
+        let (_, real_last) = verify_audit_file(&write("full", &c), None).unwrap();
+        let lines: Vec<&str> = c.lines().collect();
+        let cut = format!("{}\n{}\n", lines[0], lines[1]);
+        let p = write("truncated", &cut);
+        verify_audit_file(&p, None).expect("a truncated log still verifies — this is the known limit");
+        let err = verify_audit_file(&p, Some(&real_last))
+            .expect_err("with an external anchor, truncation must be caught");
+        assert!(err.to_lowercase().contains("last") || err.contains(&real_last[..8]), "{err}");
+        std::fs::remove_file(p).ok();
+    }
+
+    /// Adding fields to a record must not invalidate the chain: the startup and posture entries carry
+    /// extra keys, and `serde_json` here builds a BTreeMap, so serialisation is key-sorted and stable.
+    /// If a dependency ever switched on `preserve_order`, every chain would break silently — this is
+    /// the test that would say so.
+    #[test]
+    fn extra_fields_do_not_break_the_chain() {
+        let mut rich = entry(1, "server");
+        rich["config_fp"] = json!("deadbeef");
+        rich["version"] = json!("0.1.0");
+        rich["transport"] = json!("stdio");
+        let c = chain(&[rich, entry(2, "query")]);
+        let p = write("extra", &c);
+        verify_audit_file(&p, None).expect("records with additional fields must still verify");
+        std::fs::remove_file(p).ok();
+    }
+
+    /// A rotated key must not look like sabotage: entries written under a previous key still verify
+    /// when that key is offered in MCP_AUDIT_HMAC_KEYS_OLD.
+    #[test]
+    fn a_rotated_key_still_verifies() {
+        let old_key = b"previous-audit-key".to_vec();
+        let fp = key_fingerprint(&old_key);
+        let mut prev = "GENESIS".to_string();
+        let mut out = String::new();
+        for seq in 1..=2u64 {
+            let mut e = entry(seq, "query");
+            e["key_fp"] = json!(fp);
+            let body = serde_json::to_string(&e).unwrap();
+            let hash = hmac_sha256_hex(old_key.clone(), format!("{}{}", prev, body).as_bytes());
+            let mut full = e.as_object().unwrap().clone();
+            full.insert("prev".into(), json!(prev));
+            full.insert("hash".into(), json!(hash));
+            out.push_str(&serde_json::to_string(&Value::Object(full)).unwrap());
+            out.push('\n');
+            prev = hash;
+        }
+        let p = write("rotated", &out);
+        std::env::set_var("MCP_AUDIT_HMAC_KEYS_OLD", "previous-audit-key");
+        let r = verify_audit_file(&p, None);
+        std::env::remove_var("MCP_AUDIT_HMAC_KEYS_OLD");
+        r.expect("a log written under a rotated-out key must still verify");
+        std::fs::remove_file(p).ok();
+    }
+
+    /// The log records a fingerprint, not the statement. README says so; this is what makes it true.
+    #[test]
+    fn the_log_keeps_a_fingerprint_not_the_statement() {
+        let secret = "SELECT card_number FROM payments WHERE customer='ada'";
+        let fp = sql_fingerprint(secret);
+        assert_eq!(fp.len(), 16);
+        for window in secret.as_bytes().windows(8) {
+            let piece = String::from_utf8_lossy(window);
+            assert!(!fp.contains(piece.as_ref()), "the fingerprint leaked {piece:?}");
+        }
+        assert_ne!(fp, sql_fingerprint("SELECT 1"));
+    }
 }

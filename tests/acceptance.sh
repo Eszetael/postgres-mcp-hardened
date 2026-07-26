@@ -560,6 +560,30 @@ r=$(tool query '{"sql":"SELECT * FROM salaries"}' | body)
 case "$r" in ERROR:*) no "an unconfigured allowlist blocked a query" "$r";; *) ok "with no allowlist configured nothing changes";; esac
 stop
 
+section "The audit chain, exercised through the command people would use"
+AL=/tmp/acc_chain_$$.log; rm -f "$AL"
+start DATABASE_URL="$URL" MCP_AUDIT_LOG="$AL"
+tool query '{"sql":"SELECT 1"}' >/dev/null
+stop
+out=$("$BIN" --verify-audit "$AL")
+case "$out" in OK*) ok "a freshly written chain verifies";; *) no "chain did not verify" "$out";; esac
+ANCHOR=$(printf '%s' "$out" | grep -oE 'last hash: [0-9a-f]+' | cut -d' ' -f3)
+[ -n "$ANCHOR" ] && ok "and it prints the anchor to keep off the host" || no "no anchor printed" "$out"
+# Change one field of one entry: the whole point of hashing each one.
+python3 - "$AL" <<'PY2'
+import json, sys
+lines = open(sys.argv[1]).read().splitlines()
+d = json.loads(lines[-1]); d["tool"] = "something_else"
+lines[-1] = json.dumps(d)
+open(sys.argv[1], "w").write("\n".join(lines) + "\n")
+PY2
+"$BIN" --verify-audit "$AL" >/dev/null 2>&1 && no "A MODIFIED ENTRY VERIFIED" "" || ok "a modified entry is refused, and the exit code says so"
+# Truncation is the documented limit: invisible from inside, caught by the anchor.
+head -n -1 "$AL" > "$AL.cut"
+"$BIN" --verify-audit "$AL.cut" >/dev/null 2>&1 && ok "a truncated log still verifies (the documented limit)" || no "truncation unexpectedly detected" ""
+"$BIN" --verify-audit "$AL.cut" --expect-last "$ANCHOR" >/dev/null 2>&1 && no "TRUNCATION MISSED WITH AN ANCHOR" "" || ok "with the anchor, truncation is caught"
+rm -f "$AL" "$AL.cut"
+
 section "Deployment shapes"
 start MCP_DATABASE_URLS="a=$URL;b=$URL"
 r=$(tool query '{"sql":"SELECT 1 AS x","database":"b"}' | body); echo "$r" | grep -q '"x":1' && ok "several databases from one server" || no "multi-database" "$r"

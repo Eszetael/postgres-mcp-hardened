@@ -136,19 +136,19 @@ pub(crate) async fn main() {
             .and_then(|p| args.get(p + 1))
             .map(|s| s.as_str());
         match verify_audit_file(path, expect) {
-            Ok(info) => {
+            Ok((summary, _last)) => {
                 println!(
                     "OK ({}): {}",
                     if audit_key().is_some() {
-                        "HMAC"
+                        "HMAC-SHA256"
                     } else {
-                        "SHA-256, bez klucza"
+                        "SHA-256, unkeyed"
                     },
-                    info
+                    summary
                 );
             }
             Err(e) => {
-                println!("USZKODZONY: {}", e);
+                println!("TAMPERED: {}", e);
                 std::process::exit(1);
             }
         }
