@@ -125,6 +125,48 @@ n=$(docker exec -i acc_pg psql -U postgres -tAc "SELECT count(*) FROM pg_stat_ac
 [ "${n:-99}" -le 3 ] && ok "aborted requests do not orphan database work (active=$n)" || no "orphaned work" "active=$n"
 stop  # note: never a bare `wait` here — it would also wait on the server process
 
+section "Sensitive data never reaches the model"
+docker exec -i acc_pg psql -U postgres -q -c "CREATE TABLE people(id int, name text, ssn text); INSERT INTO people VALUES (1,'Ada','123-45-6789');" 2>/dev/null
+start DATABASE_URL="$URL" MCP_REDACT_COLUMNS=ssn
+r=$(tool query '{"sql":"SELECT * FROM people"}' | body)
+echo "$r" | grep -q '123-45-6789' && no "redacted value leaked through SELECT *" "$r" || ok "value masked in SELECT *"
+r=$(tool query '{"sql":"SELECT ssn AS s FROM people"}' | body)
+case "$r" in ERROR:*redacted*) ok "renaming a redacted column is refused";; *) no "alias bypassed redaction" "$r";; esac
+r=$(tool query '{"sql":"SELECT md5(ssn) FROM people"}' | body)
+case "$r" in ERROR:*redacted*) ok "wrapping a redacted column is refused";; *) no "function bypassed redaction" "$r";; esac
+r=$(tool query '{"sql":"SELECT name FROM people"}' | body)
+echo "$r" | grep -q 'Ada' && ok "ordinary columns unaffected" || no "over-blocking" "$r"
+stop
+
+section "Simple bearer token"
+start DATABASE_URL="$URL" MCP_BEARER_TOKEN=t0ken
+code=$(curl -s -o /dev/null -w '%{http_code}' -m 10 -H content-type:application/json "http://127.0.0.1:$PORT/mcp" -d '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}')
+[ "$code" = 401 ] && ok "request without a token is refused" || no "token not enforced" "got $code"
+code=$(curl -s -o /dev/null -w '%{http_code}' -m 10 -H content-type:application/json -H 'authorization: Bearer t0ken' "http://127.0.0.1:$PORT/mcp" -d '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}')
+[ "$code" = 200 ] && ok "request with the token is served" || no "valid token rejected" "got $code"
+stop
+
+section "Connection pooling"
+start DATABASE_URL="$URL"
+for _ in $(seq 1 20); do call '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' >/dev/null; tool query '{"sql":"SELECT 1"}' >/dev/null; done
+n=$(docker exec -i acc_pg psql -U postgres -tAc "SELECT count(*) FROM pg_stat_activity WHERE datname='postgres' AND application_name <> 'psql'" | tr -d ' ')
+[ "${n:-99}" -le 16 ] && ok "20 client sessions share one pool (connections=$n)" || no "pool per client" "connections=$n"
+stop
+
+section "DBA tools"
+start DATABASE_URL="$URL"
+r=$(tool explain_query '{"sql":"SELECT count(*) FROM orders"}' | body)
+echo "$r" | grep -q 'Node Type' && ok "explain_query returns a plan" || no "explain_query" "$r"
+r=$(tool explain_query '{"sql":"SELECT count(*) FROM orders","analyze":true}' | body)
+echo "$r" | grep -q 'Actual Total Time' && ok "explain_query analyze reports real timings" || no "explain analyze" "$r"
+r=$(tool explain_query '{"sql":"DROP TABLE orders"}' | body)
+case "$r" in ERROR:*) ok "explain_query refuses a write";; *) no "explain_query accepted a write" "$r";; esac
+r=$(tool database_health '{}' | body)
+echo "$r" | grep -q 'cache_hit_ratio' && ok "database_health reports" || no "database_health" "$r"
+r=$(tool analyze_indexes '{"schema":"public"}' | body)
+echo "$r" | grep -q 'unused_indexes' && ok "analyze_indexes reports" || no "analyze_indexes" "$r"
+stop
+
 section "Deployment shapes"
 start MCP_DATABASE_URLS="a=$URL;b=$URL"
 r=$(tool query '{"sql":"SELECT 1 AS x","database":"b"}' | body); echo "$r" | grep -q '"x":1' && ok "several databases from one server" || no "multi-database" "$r"

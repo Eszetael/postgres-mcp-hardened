@@ -906,6 +906,40 @@ fn pool_error_detail() -> String {
     }
 }
 
+/// Column patterns whose values never leave the database: `MCP_REDACT_COLUMNS="password,ssn,card_number"`.
+/// Matching is on the column name, case-insensitively; a `table.column` pattern also matches the
+/// bare column, because a query may alias or join its way past the table name.
+fn redact_patterns() -> &'static [String] {
+    static P: Lazy<Vec<String>> = Lazy::new(|| {
+        std::env::var("MCP_REDACT_COLUMNS")
+            .map(|v| {
+                v.split(',')
+                    .map(|s| s.trim().to_lowercase())
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.rsplit('.').next().unwrap_or(&s).to_string())
+                    .collect()
+            })
+            .unwrap_or_default()
+    });
+    &P
+}
+
+fn redact_rows(rows: &mut [Value]) {
+    let pats = redact_patterns();
+    if pats.is_empty() {
+        return;
+    }
+    for row in rows.iter_mut() {
+        if let Some(obj) = row.as_object_mut() {
+            for (k, v) in obj.iter_mut() {
+                if pats.iter().any(|p| p == &k.to_lowercase()) {
+                    *v = Value::String("[redacted]".into());
+                }
+            }
+        }
+    }
+}
+
 fn col_to_json(row: &Row, i: usize) -> Value {
     if let Ok(v) = row.try_get::<_, Option<String>>(i) {
         return v.map(Value::String).unwrap_or(Value::Null);
@@ -982,7 +1016,7 @@ fn execute_readonly(final_sql: &str, db: Option<&str>) -> Result<Value, String> 
         .batch_execute("BEGIN TRANSACTION READ ONLY")
         .map_err(|e| e.to_string())?;
 
-    let out: Vec<Value> = if is_row_query(final_sql) {
+    let mut out: Vec<Value> = if is_row_query(final_sql) {
         // PostgreSQL serialises EVERY type to jsonb (numeric/enum/array/uuid/timestamptz/jsonb/point…).
         // Hand-written type mapping in Rust silently lost unhandled types to null — a bug found
         // na pagila (SUM(amount)→null, enum/array→null). to_jsonb(t) = jedna kolumna jsonb na wiersz.
@@ -1065,6 +1099,10 @@ fn execute_readonly(final_sql: &str, db: Option<&str>) -> Result<Value, String> 
         }
         acc
     };
+    // Redact configured columns before the data can reach the model. Defence in depth, not a
+    // replacement for database permissions: it hides values an agent should never see even when
+    // somebody writes `SELECT *`. Applied to query results only — column names are not secrets.
+    redact_rows(&mut out);
     // ROLLBACK on EVERY exit path — including success (we never commit anything).
     let _ = client.batch_execute("ROLLBACK");
     Ok(json!({ "rowCount": out.len(), "rows": out }))
@@ -1879,6 +1917,32 @@ fn enforce_auth(
     headers: &HeaderMap,
     req: &Value,
 ) -> Result<Option<String>, (u16, String, Option<String>)> {
+    // A shared bearer token: the simplest possible protection for people who do not run an identity
+    // provider. Both alternatives have an open request for exactly this. Checked before OAuth so a
+    // deployment can use either, and compared in constant time.
+    if let Some(expected) = std::env::var("MCP_BEARER_TOKEN")
+        .ok()
+        .filter(|t| !t.is_empty())
+    {
+        let given = headers
+            .get("authorization")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.strip_prefix("Bearer "))
+            .unwrap_or("");
+        let equal = given.len() == expected.len()
+            && given
+                .as_bytes()
+                .iter()
+                .zip(expected.as_bytes())
+                .fold(0u8, |acc, (a, b)| acc | (a ^ b))
+                == 0;
+        if !equal {
+            return Err((401, "invalid or missing bearer token".into(), None));
+        }
+        if AUTH_CONFIG.is_none() {
+            return Ok(None);
+        }
+    }
     let cfg = match &*AUTH_CONFIG {
         Some(c) => c,
         None => return Ok(None),

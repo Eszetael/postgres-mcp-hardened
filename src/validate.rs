@@ -21,6 +21,8 @@ pub enum ValidationError {
     NotParseable(String),
     MultiStatement,
     NotReadOnly(String),
+    /// A column the operator declared sensitive was referenced.
+    Redacted(String),
 }
 
 impl fmt::Display for ValidationError {
@@ -29,6 +31,11 @@ impl fmt::Display for ValidationError {
             Self::NotParseable(e) => write!(f, "SQL parse error: {}", e),
             Self::MultiStatement => write!(f, "multiple statements are forbidden"),
             Self::NotReadOnly(s) => write!(f, "non-read-only statement: {}", s),
+            Self::Redacted(c) => write!(
+                f,
+                "column {} is redacted by configuration and cannot be referenced",
+                c
+            ),
         }
     }
 }
@@ -86,8 +93,14 @@ pub fn validate_readonly(sql: &str) -> Result<(), ValidationError> {
     //    node in the tree (derived tables, subqueries in WHERE, CTEs inside subqueries). Checking only
     //    the top level let `SELECT * FROM (SELECT ... FOR UPDATE) t` and writable CTEs hidden one level
     //    down slip through.
-    let mut scanner = SecurityScanner { hit: None };
+    let mut scanner = SecurityScanner {
+        hit: None,
+        redacted: None,
+    };
     let _ = ast[0].visit(&mut scanner);
+    if let Some(c) = scanner.redacted {
+        return Err(ValidationError::Redacted(c));
+    }
     if let Some(f) = scanner.hit {
         return Err(ValidationError::NotReadOnly(f));
     }
@@ -179,6 +192,7 @@ pub fn is_query_stmt(sql: &str) -> bool {
 /// and checks the read-only shape of EVERY Query node, not just the top level.
 struct SecurityScanner {
     hit: Option<String>,
+    redacted: Option<String>,
 }
 impl Visitor for SecurityScanner {
     type Break = ();
@@ -195,6 +209,27 @@ impl Visitor for SecurityScanner {
         ControlFlow::Continue(())
     }
     fn pre_visit_expr(&mut self, expr: &Expr) -> ControlFlow<()> {
+        // A redacted column may not even be NAMED. Filtering it out of the result would be a
+        // false comfort: `SELECT password AS pw` renames it, `SELECT md5(password)` leaks it a
+        // character at a time. Refusing the reference closes both, and masking the value in the
+        // output still covers `SELECT *`, where the column is never named.
+        match expr {
+            Expr::Identifier(id) => {
+                if is_redacted(&id.value.to_lowercase()) {
+                    self.redacted = Some(id.value.clone());
+                    return ControlFlow::Break(());
+                }
+            }
+            Expr::CompoundIdentifier(parts) => {
+                if let Some(last) = parts.last() {
+                    if is_redacted(&last.value.to_lowercase()) {
+                        self.redacted = Some(last.value.clone());
+                        return ControlFlow::Break(());
+                    }
+                }
+            }
+            _ => {}
+        }
         if let Expr::Function(f) = expr {
             if let Some(last) = f.name.0.last() {
                 let name = last.value.to_lowercase();
@@ -421,6 +456,23 @@ fn is_known_read(name: &str) -> bool {
     SAFE_PREFIXES.iter().any(|p| name.starts_with(p))
         || name.contains("_is_visible")
         || SAFE_EXACT.contains(&name)
+}
+
+/// Columns the operator declared sensitive (`MCP_REDACT_COLUMNS`). Values are masked in results,
+/// and — because renaming would defeat masking — the column may not be referenced at all.
+fn is_redacted(name: &str) -> bool {
+    static R: Lazy<Vec<String>> = Lazy::new(|| {
+        std::env::var("MCP_REDACT_COLUMNS")
+            .map(|v| {
+                v.split(',')
+                    .map(|s| s.trim().to_lowercase())
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.rsplit('.').next().unwrap_or(&s).to_string())
+                    .collect()
+            })
+            .unwrap_or_default()
+    });
+    R.iter().any(|p| p == name)
 }
 
 /// Operator escape hatch: `MCP_ALLOW_FUNCTIONS=name1,name2`. A deliberate human decision that a given

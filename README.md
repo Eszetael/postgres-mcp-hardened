@@ -178,6 +178,14 @@ offered, plus column comments, primary keys and **foreign keys** in the payload.
 
 ## Tools
 
+- **`explain_query`** — the execution plan; with `analyze` it runs the statement and reports real
+  timings and buffer usage, which is safe here because the statement is validated read-only and
+  runs inside a transaction that is always rolled back.
+- **`database_health`** — cache hit ratio, connection use, longest running statement and
+  transaction, vacuum backlog, invalid indexes, sequences near their limit, replication lag.
+- **`analyze_indexes`** — unused indexes, duplicates, and tables scanned sequentially often enough
+  that an index would pay off.
+- **`top_queries`** — the heaviest statements, from `pg_stat_statements`.
 - **`query`** — run a read-only SQL query (validated, auto-`LIMIT`, cost-guarded).
 - **`list_schemas`**, **`list_tables`**, **`describe_table`** — progressive schema discovery
   (parameterized, injection-safe). `describe_table` returns the **schema comments**
@@ -191,6 +199,10 @@ offered, plus column comments, primary keys and **foreign keys** in the payload.
   verification always on, private CAs via `MCP_SSLROOTCERT`.
 - **Read-only, two ways:** every statement is parsed with `sqlparser` and rejected unless it's a `SELECT`/`WITH`/`EXPLAIN`/`SHOW`; the DB session is additionally set `default_transaction_read_only = on`.
 - **Anti-DoS:** enforced `statement_timeout`, auto-injected `LIMIT`, and an `EXPLAIN`-based cost guard that rejects expensive plans before they run.
+- **Sensitive columns never leave the database:** list them in `MCP_REDACT_COLUMNS` and their
+  values are masked in results *and* the column may not be referenced at all — renaming it
+  (`SELECT password AS pw`) or wrapping it (`SELECT md5(password)`) is refused, because a filter
+  that a model can rename its way past is worse than none.
 - **Prompt-injection aware:** row data is returned inside a `trusted="false"` provenance block with delimiters escaped, so a malicious cell can't hijack the agent.
 - **No schema leaks:** database errors are mapped to structured, actionable messages that never echo table/column names.
 - **OAuth 2.1:** optional RS256 bearer-token validation (signature, `exp`, `aud`, `iss`) with scope enforcement; disabled when unconfigured for local/self-host use.
@@ -208,6 +220,8 @@ offered, plus column comments, primary keys and **foreign keys** in the payload.
 | `MCP_AUDIT_LOG` | path to the append-only audit log (hash-chained); verify with `--verify-audit <file> [--expect-last <hash>]` |
 | `MCP_AUDIT_HMAC_KEY` / `MCP_AUDIT_HMAC_KEY_FILE` | key that turns the audit chain into HMAC-SHA256 — keep it off the host so the log cannot be rewritten (a trailing newline in the file is ignored) |
 | `MCP_AUDIT_HMAC_KEYS_OLD` | comma-separated previous keys, so a log that survived a key rotation still verifies |
+| `MCP_REDACT_COLUMNS` | columns whose values must never reach the model, e.g. `password, ssn, card_number` — masked in results and refused if referenced |
+| `MCP_BEARER_TOKEN` | shared token required on every request, for deployments without an identity provider |
 | `MCP_STATEMENT_TIMEOUT` | query time limit (PostgreSQL interval, default `30s`) |
 | `MCP_SEARCH_PATH` | schemas to search when a table name is unqualified, e.g. `analytics, public` |
 | `MCP_PASSWORD_FILE` | read the database password from a file instead of putting it in the connection string |

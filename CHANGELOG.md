@@ -43,6 +43,13 @@ alternative to the deprecated `@modelcontextprotocol/server-postgres`.
 - **Tamper-evident audit log** (hash-chained), **Prometheus `/metrics`**,
   **`/health` + `/ready`** probes.
 - **Transports:** Streamable HTTP + stdio. Ships as a distroless, non-root container.
+- **Sensitive-column redaction** (`MCP_REDACT_COLUMNS`): values masked in results and the column
+  refused if referenced under any alias or expression.
+- **Shared bearer token** (`MCP_BEARER_TOKEN`) for deployments without an identity provider.
+- **Operational tools**: `explain_query` (optionally with real timings), `database_health`,
+  `analyze_indexes`, `top_queries`.
+- **Configurable** query timeout, `search_path`, and a password read from a file rather than the
+  connection string.
 - **Several databases from one server** (`MCP_DATABASE_URLS`) — every tool takes an optional
   `database`, resources span all connections and their URIs carry the database name, so a
   production and a development connection can never be confused.
