@@ -2,7 +2,7 @@
 
 **The official Postgres MCP server was deprecated in 2024 and still gets ~440k downloads a month. Its entire defence is one database-level read-only transaction — and that alone does not stop every write. This is a maintained Rust replacement with defence in depth.**
 
-A drop-in [Model Context Protocol](https://modelcontextprotocol.io) server that lets an AI agent query PostgreSQL — **read-only, enforced at the database level**, with real SQL validation, timeouts, cost limits, OAuth 2.1, and an audit trail. Speaks **Streamable HTTP** and stdio, and negotiates the MCP revision: `2025-11-25` (current) and `2025-06-18` (what shipping clients speak today).
+A drop-in [Model Context Protocol](https://modelcontextprotocol.io) server that lets an AI agent query PostgreSQL — **read-only, enforced at the database level**, with real SQL validation, timeouts, cost limits, OAuth 2.1, and an audit trail. Speaks **Streamable HTTP** and stdio, and negotiates the MCP revision: `2025-11-25` (current), `2025-06-18` (what shipping clients speak today), and `2026-07-28` behind a switch while it is still a draft.
 
 ## Why
 
@@ -48,6 +48,26 @@ the original never had.
 ```bash
 cargo install postgres-mcp-hardened   # (name pending final publish)
 ```
+
+### Checking what you downloaded
+
+Every released binary is signed with [Sigstore](https://www.sigstore.dev/) keyless signing — there
+is no private key for us to lose, and the certificate names the workflow, repository and tag that
+produced the file. Each artefact ships with a `.sig` and a `.pem` beside it:
+
+```bash
+cosign verify-blob postgres-mcp-hardened-x86_64-unknown-linux-gnu.tar.gz \
+  --signature  postgres-mcp-hardened-x86_64-unknown-linux-gnu.tar.gz.sig \
+  --certificate postgres-mcp-hardened-x86_64-unknown-linux-gnu.tar.gz.pem \
+  --certificate-identity-regexp '^https://github.com/Eszetael/postgres-mcp-hardened/' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com
+```
+
+Pin the identity, not just the signature. Without `--certificate-identity-regexp` and
+`--certificate-oidc-issuer` the check answers "somebody signed this", which is not the question.
+
+Public releases additionally carry SLSA build provenance, verifiable with
+`gh attestation verify <file> --repo Eszetael/postgres-mcp-hardened`.
 
 ### Use it in Claude Desktop / Cursor (stdio)
 
@@ -265,6 +285,27 @@ Protocol failures stay protocol failures. A malformed envelope, an unknown metho
 is not something a model can fix by rewriting SQL, and a client's error handling expects those where
 they have always been.
 
+### The next revision, before it lands
+
+`2026-07-28` is the largest break MCP has had: no `initialize`, no session header, no `ping`. Every
+request carries its own protocol version in `_meta`, and a new `server/discover` replaces the
+handshake. We implement it behind `MCP_PROTOCOL_PREVIEW=1`, and it is off by default for a reason —
+a draft still moves, and a server that advertises support for a moving target will be wrong in
+public. With the switch off, nothing a current client sees changes.
+
+`server/discover` answers under **every** revision, switch or no switch, because the specification
+expects clients to use it as a backwards-compatibility probe — which only works if older servers
+answer it. Ours answers with the revisions we speak and, in `_meta`, the full security posture. That
+is deliberate: a client can learn it is talking to a server connected as a superuser *before* it
+sends a query, as structured data rather than prose a model has to notice.
+
+Two of the draft's rules are security controls here, not formalities. `Mcp-Method` and `Mcp-Name`
+must agree with the request body, and we refuse the mismatch (`-32020`) — the headers exist so a
+gateway can route and authorise without parsing the body, and if header and body may disagree, then
+the thing that authorised and the thing that executes saw two different requests. And a client
+stating a version we do not implement is told so (`-32022`) rather than quietly served under a
+contract it never agreed to.
+
 ## Setting up the role
 
 ```bash
@@ -433,6 +474,7 @@ left resident memory flat and file descriptors unchanged.
 | `MCP_RESERVED_AUTH_SLOTS` | database slots kept for authenticated traffic so an anonymous flood cannot take the pool (default: a quarter) |
 | `MCP_PUBLIC_URL` | this server's public base URL, used in the OAuth discovery metadata |
 | `MCP_AUTH_SERVERS` | authorization server URLs advertised in that metadata |
+| `MCP_PROTOCOL_PREVIEW` | `1` to also speak the next MCP revision (`2026-07-28`) while it is still a draft upstream; off by default, and off changes nothing about what current clients see |
 | `MCP_ALLOW_SCHEMAS` | schemas a query may reach, e.g. `public,analytics`; setting either this or the next turns the allowlist on |
 | `MCP_ALLOW_TABLES` | relations a query may reach, e.g. `public.orders,analytics.*` |
 | `MCP_ALLOW_CATALOG` | `1` to keep `pg_catalog` reachable while an allowlist is active |

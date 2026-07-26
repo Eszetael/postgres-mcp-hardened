@@ -134,9 +134,19 @@ jobs:
           # Signing nothing must not pass for signing everything.
           [ "$n" -gt 0 ] || { echo "no artefacts to sign"; exit 1; }
           echo "signed $n artefacts"
-      - uses: actions/attest-build-provenance@v1
+      # Provenance is persisted by GitHub, and GitHub accepts it only for public repositories. A
+      # private rehearsal therefore cannot produce it. That is a platform limit, not a choice — but
+      # it must be said out loud in the log, because a signing job that quietly stops attesting is
+      # exactly the failure nobody notices until someone checks a release that has no provenance.
+      - name: Build provenance (public repositories only)
+        if: ${{ !github.event.repository.private }}
+        uses: actions/attest-build-provenance@v2
         with:
           subject-path: 'dist/*'
+      - name: Say plainly when provenance was not produced
+        if: ${{ github.event.repository.private }}
+        run: |
+          echo "::warning title=No provenance::This repository is private, so GitHub will not persist           a build attestation. The artefacts ARE signed (cosign keyless, see the .sig/.pem files);           only the SLSA provenance is missing, and it will be produced once the repository is public."
       - uses: softprops/action-gh-release@v2
         with:
           draft: ${{ contains(github.ref, '-rc') }}

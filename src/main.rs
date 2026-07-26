@@ -305,6 +305,7 @@ pub(crate) const KNOWN_VARS: &[&str] = &[
     "MCP_ALLOW_CATALOG",
     "MCP_ALLOW_PLAINTEXT_DB",
     "MCP_ALLOW_SCHEMAS",
+    "MCP_PROTOCOL_PREVIEW",
     "MCP_ALLOW_TABLES",
     "MCP_AUDIT_HMAC_KEY",
     "MCP_AUDIT_HMAC_KEYS_OLD",
@@ -1021,13 +1022,42 @@ pub(crate) async fn mcp_handler(
     // moves the work to another thread and thread-local state does not follow it.
     // Always Some: an HTTP request must not inherit the revision another client negotiated. A
     // client that sends no header is, in practice, an older client.
-    let wire_rev = Some(
+    // The draft carries the version in the body's `_meta`; earlier revisions use the header. Read
+    // both here, because the header agreement check below needs to know which contract applies
+    // before the request reaches the thread that runs it.
+    let body_params = req.get("params").cloned().unwrap_or_else(|| json!({}));
+    let wire_rev = Some(protocol::rev_from_meta(&body_params).unwrap_or_else(|| {
         headers
             .get("mcp-protocol-version")
             .and_then(|v| v.to_str().ok())
             .and_then(protocol::Rev::parse)
-            .unwrap_or(protocol::Rev::V20250618),
-    );
+            .unwrap_or(protocol::Rev::V20250618)
+    }));
+
+    // `Mcp-Method`/`Mcp-Name` must agree with the body from 2026-07-28. A proxy that routed or
+    // authorised on the header while we executed the body would be deciding about a different
+    // request than the one that runs — refusing the mismatch is what makes the header safe to
+    // trust. The refusal is audited: it is a security event, not a parse hiccup.
+    let body_method = req.get("method").and_then(|v| v.as_str()).unwrap_or("");
+    if let Err((code, msg)) = protocol::check_header_agreement(
+        wire_rev.unwrap(),
+        body_method,
+        protocol::body_target_name(body_method, &body_params).as_deref(),
+        headers.get("mcp-method").and_then(|v| v.to_str().ok()),
+        headers.get("mcp-name").and_then(|v| v.to_str().ok()),
+    ) {
+        let _who = set_caller(caller);
+        audit("http/header_mismatch", "refused", Some(&msg));
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "jsonrpc": "2.0",
+                "id": req.get("id").cloned().unwrap_or(Value::Null),
+                "error": { "code": code, "message": msg }
+            })),
+        )
+            .into_response();
+    }
     let mut resp = tokio::task::spawn_blocking(move || {
         let _permit = permit; // released when the WORK ends, not when the client disconnects
         let _slot = slot;
@@ -1251,6 +1281,9 @@ pub(crate) fn enforce_auth(
 }
 
 use axum::http::header::CONTENT_TYPE;
+/// Reverse-DNS namespace for `_meta` keys that are ours rather than the specification's.
+pub(crate) const PRIVATE_NS: &str = "io.github.eszetael.postgres-mcp-hardened";
+
 pub(crate) fn handle_request(req: &Value) -> Value {
     // Walidacja wersji JSON-RPC
     if req.get("jsonrpc") != Some(&json!("2.0")) {
@@ -1266,8 +1299,19 @@ pub(crate) fn handle_request(req: &Value) -> Value {
 
     let params = req.get("params").cloned().unwrap_or(json!({}));
 
-    match method {
+    // From 2026-07-28 the version is not agreed once at the start — it rides on every request, so
+    // it has to be read here, before anything decides what shape the answer takes.
+    if let Some(err) = protocol::unsupported_version_error(&params) {
+        return err;
+    }
+    let _meta_rev = protocol::rev_from_meta(&params).map(|r| protocol::set_request_rev(Some(r)));
+    let rev = protocol::current();
+
+    let resp = match method {
         "initialize" => handle_initialize(&params),
+        // Required from 2026-07-28, and answered under every revision: a client may call it as a
+        // backwards-compatibility probe, which only works if old servers answer it too.
+        "server/discover" => handle_server_discover(),
         "tools/list" => handle_tools_list(),
         // SEP-1303: from 2025-11-25 a tool's refusal belongs in the result, so the model reads the
         // reason and rewrites the query, instead of the client seeing a broken call. The audit
@@ -1287,7 +1331,35 @@ pub(crate) fn handle_request(req: &Value) -> Value {
         _ => {
             json!({ "error": { "code": -32601, "message": format!("Method not found: {}", method) } })
         }
-    }
+    };
+    // Applied once, at the edge, so no handler has to know which revision it is answering.
+    protocol::decorate_result(resp, rev, method, &server_label())
+}
+
+/// What we are, which revisions we speak, and how safely we are connected.
+///
+/// The draft made this the first thing a client may ask, replacing the handshake. That makes it the
+/// right place for the posture: a client can learn that this server is connected as a superuser
+/// before it sends a single query — and, because it arrives as protocol data rather than prose, it
+/// can act on it instead of hoping a model read the instructions.
+pub(crate) fn handle_server_discover() -> Value {
+    json!({
+        "result": {
+            "protocolVersions": protocol::Rev::supported(),
+            "serverInfo": {
+                "name": server_label(),
+                "version": "0.1.0",
+                "description": "Read-only PostgreSQL for AI agents, with the read-only part enforced before the database sees the statement."
+            },
+            "capabilities": { "tools": {}, "resources": {} },
+            "instructions": posture::instructions(),
+            "_meta": {
+                // Namespaced under our own reverse-DNS: the specification reserves the
+                // io.modelcontextprotocol/* space for itself.
+                format!("{}/securityPosture", PRIVATE_NS): posture::report(None)
+            }
+        }
+    })
 }
 
 pub(crate) fn handle_initialize(params: &Value) -> Value {
@@ -2209,7 +2281,7 @@ mod tests {
         let result = resp["result"].as_object().unwrap();
         // A client that names no revision gets the newest we implement; one that names an older
         // revision we support gets that one back, unchanged.
-        assert_eq!(result["protocolVersion"], protocol::Rev::LATEST.as_str());
+        assert_eq!(result["protocolVersion"], protocol::Rev::latest().as_str());
         let older = handle_request(&json!({"jsonrpc":"2.0","id":1,"method":"initialize",
             "params":{"protocolVersion":"2025-06-18"}}));
         assert_eq!(older["result"]["protocolVersion"], "2025-06-18");

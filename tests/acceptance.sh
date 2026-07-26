@@ -495,6 +495,43 @@ done
 stop
 rm -f "$PAUD"
 
+section "The next revision, behind the switch it ships behind"
+# The draft removes the handshake, so discovery has to work with the switch OFF too: a client
+# probing an older server is exactly how the specification says backwards compatibility is found.
+start DATABASE_URL="$URL"
+d=$(call '{"jsonrpc":"2.0","id":1,"method":"server/discover"}')
+echo "$d" | grep -q '2025-11-25' && ok "server/discover answers even with the preview off" || no "no discovery" "$d"
+echo "$d" | grep -q '2026-07-28' && no "the draft is advertised without being asked for" "$d" || ok "and does not advertise the draft nobody enabled"
+echo "$d" | grep -q 'securityPosture' && ok "discovery carries the posture as data, not prose" || no "no posture in discovery" "$d"
+# With the preview off the header requirement must not exist, or every current client breaks.
+c=$(curl -s -o /dev/null -w '%{http_code}' -m 15 -H content-type:application/json \
+     "http://127.0.0.1:$PORT/mcp" -d '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}')
+[ "$c" = 200 ] && ok "today's clients are untouched by the draft's header rules" || no "preview leaked into the default path" "$c"
+stop
+
+start DATABASE_URL="$URL" MCP_PROTOCOL_PREVIEW=1
+d=$(call '{"jsonrpc":"2.0","id":1,"method":"server/discover"}')
+echo "$d" | grep -q '2026-07-28' && ok "with the switch on, the draft is offered" || no "preview not offered" "$d"
+# The header agreement check: a proxy authorising on Mcp-Name must not be able to disagree with us.
+mism=$(curl -s -m 15 -H content-type:application/json -H 'mcp-method: tools/call' -H 'mcp-name: describe_table' \
+   "http://127.0.0.1:$PORT/mcp" \
+   -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"query","arguments":{"sql":"SELECT 1"},"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28"}}}')
+echo "$mism" | grep -q -- '-32020' && ok "a header naming another tool than the body is refused" || no "header mismatch accepted" "$mism"
+agree=$(curl -s -m 15 -H content-type:application/json -H 'mcp-method: tools/call' -H 'mcp-name: query' \
+   "http://127.0.0.1:$PORT/mcp" \
+   -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"query","arguments":{"sql":"SELECT 1"},"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28"}}}')
+echo "$agree" | grep -q '"resultType":"complete"' && ok "an agreeing request runs and carries resultType" || no "draft result shape missing" "$agree"
+lst=$(curl -s -m 15 -H content-type:application/json -H 'mcp-method: tools/list' \
+   "http://127.0.0.1:$PORT/mcp" \
+   -d '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28"}}}')
+echo "$lst" | grep -q '"ttlMs"' && ok "list results carry the cache hint that saves the agent tokens" || no "no ttlMs" "$lst"
+echo "$lst" | grep -q '"cacheScope":"private"' && ok "and never invite a shared proxy to cache them" || no "cacheScope wrong" "$lst"
+# A version we do not implement is refused out loud rather than served under a contract nobody asked for.
+bad=$(curl -s -m 15 -H content-type:application/json -H 'mcp-method: tools/list' "http://127.0.0.1:$PORT/mcp" \
+   -d '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2099-01-01"}}}')
+echo "$bad" | grep -q -- '-32022' && ok "an unknown version is refused, not silently downgraded" || no "silent downgrade" "$bad"
+stop
+
 section "The server tells the agent what it is sitting on"
 docker exec -i acc_pg psql -U postgres -q -v ON_ERROR_STOP=1 <<'SQL' >/dev/null || { echo "fixture failed: posture role"; exit 1; }
 CREATE ROLE acc_posture LOGIN PASSWORD 'p' NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS NOREPLICATION;
