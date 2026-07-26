@@ -37,7 +37,11 @@ docker rm -f acc_pg >/dev/null 2>&1
 # eventually taken by an unrelated outgoing connection, and the suite then fails as "fixture failed"
 # with nothing to do with the code under test. Seen once; it costs an afternoon to diagnose twice.
 PGPORT_ACC=${PGPORT_ACC:-15500}
-if ! docker run -d --name acc_pg -e POSTGRES_PASSWORD=$PGPW -p 127.0.0.1:$PGPORT_ACC:5432 postgres:16 >/dev/null; then
+# PG_IMAGE lets CI run the whole suite across PostgreSQL versions: the function deny-list is
+# version-dependent (pg_backup_start replaced pg_start_backup in 15, pg_read_all_data arrived in 14,
+# pg_maintain in 17), so testing one version tells us about one version.
+PG_IMAGE=${PG_IMAGE:-postgres:16}
+if ! docker run -d --name acc_pg -e POSTGRES_PASSWORD=$PGPW -p 127.0.0.1:$PGPORT_ACC:5432 "$PG_IMAGE" >/dev/null; then
   echo "fixture failed: could not start the PostgreSQL container (is port $PGPORT_ACC free? set PGPORT_ACC to change)"
   exit 1
 fi

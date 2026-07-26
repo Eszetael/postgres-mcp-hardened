@@ -1,9 +1,13 @@
 # ── builder ──
-FROM rust:1-slim AS builder
+# Pinned, not floating: `rust:1-slim` moves, so the image could be built from a different compiler
+# and different dependencies than the binaries CI tested.
+FROM rust:1.83-slim AS builder
 WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
-RUN cargo build --release
+# --locked: the image must resolve the same dependency versions the tests ran against. Without it
+# the container is built from a lockfile-free resolution nobody verified.
+RUN cargo build --locked --release
 
 # ── runtime: distroless, non-root, minimalna powierzchnia ──
 FROM gcr.io/distroless/cc-debian12:nonroot

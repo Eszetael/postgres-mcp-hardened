@@ -11,7 +11,13 @@ permissions:
   contents: write
 
 jobs:
+  # Nothing is published that these gates have not approved. Before this, pushing a tag built
+  # and released binaries and a container image without a single test having run.
+  checks:
+    uses: ./.github/workflows/checks.yml
+
   build:
+    needs: [checks]
     name: Build ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
     strategy:
@@ -86,6 +92,7 @@ jobs:
   # A software bill of materials belongs with the artifact, not in a promise: reviewers in regulated
   # environments ask for it first.
   sbom:
+    needs: [checks]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -98,6 +105,7 @@ jobs:
           files: "**/*.cdx.json"
 
   container:
+    needs: [checks]
     runs-on: ubuntu-latest
     permissions:
       contents: read

@@ -1,0 +1,135 @@
+name: Checks
+
+# Every gate this project has, in one reusable workflow.
+#
+# It exists as `workflow_call` for one reason: a release must not be able to publish anything these
+# jobs have not approved. Before this, `release.yml` ran `build`, `sbom` and `container` with no
+# `needs:` at all — pushing a tag published binaries and a container image without a single test
+# having run. Duplicating the jobs into the release workflow would have meant two copies drifting
+# apart, which is the same failure a year later.
+on:
+  workflow_call:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    # The validator's deny-list is version-dependent — `pg_backup_start` (15+) replaced
+    # `pg_start_backup` (<=14), `pg_read_all_data` arrived in 14, `pg_maintain` in 17 — so testing a
+    # single version tells us about a single version.
+    strategy:
+      fail-fast: false
+      matrix:
+        pg: ["13", "14", "15", "16", "17"]
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:${{ matrix.pg }}
+        env:
+          POSTGRES_PASSWORD: ci  # pragma: allowlist secret - throwaway CI database, dies with the runner
+        options: >-
+          --health-cmd pg_isready --health-interval 5s --health-timeout 5s --health-retries 10
+        ports: ["5432:5432"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.83.0
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        if: matrix.pg == '16'
+        run: cargo fmt --check
+
+      - name: Clippy (warnings are errors)
+        if: matrix.pg == '16'
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      - name: Unit and adversarial tests
+        run: cargo test --locked --release
+
+      - name: Validator fuzz (3 seeds x 200k mutants)
+        if: matrix.pg == '16'
+        run: |
+          cargo build --locked --release
+          for seed in 1 42 20260726; do
+            ./target/release/postgres-mcp-hardened --fuzz 200000 "$seed"
+          done
+
+      - name: Smoke test against a live database (reads work, writes rejected)
+        env:
+          DATABASE_URL: postgres://postgres:ci@127.0.0.1:5432/postgres  # pragma: allowlist secret
+        run: |
+          cargo build --locked --release
+          ./target/release/postgres-mcp-hardened --validate "SELECT 1" | grep -q ALLOW
+          ./target/release/postgres-mcp-hardened --validate "DROP TABLE x" | grep -q REJECT
+          MCP_ADDR=127.0.0.1:8080 ./target/release/postgres-mcp-hardened &
+          sleep 3
+          curl -sf -H content-type:application/json http://127.0.0.1:8080/mcp \
+            -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"query","arguments":{"sql":"SELECT 1 AS ok"}}}' | grep -q '"ok"'
+          curl -s -H content-type:application/json http://127.0.0.1:8080/mcp \
+            -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"query","arguments":{"sql":"CREATE TABLE t(x int)"}}}' | grep -q 'non-read-only'
+
+  acceptance:
+    # The end-to-end suite: every scenario reported against the deprecated server, plus the
+    # deployment shapes people actually run. It starts its own PostgreSQL through docker.
+    strategy:
+      fail-fast: false
+      matrix:
+        pg: ["13", "17"]  # the extremes; 16 is covered by the unit matrix above
+    runs-on: ubuntu-latest
+    env:
+      PG_IMAGE: postgres:${{ matrix.pg }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.83.0
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --locked --release
+      - run: ./tests/acceptance.sh
+
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.83.0
+      - name: cargo-audit (dependency vulnerabilities)
+        run: |
+          cargo install cargo-audit --locked
+          cargo audit
+      - name: cargo-deny (licences, duplicate and unknown sources)
+        run: |
+          cargo install cargo-deny --locked
+          cargo deny check
+
+  container:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Image builds, runs as nonroot, and actually serves
+        run: |
+          docker build -t mcp-pg:ci .
+          test "$(docker inspect mcp-pg:ci -f '{{.Config.User}}')" = "nonroot"
+          # Building an image proves it compiles, not that it works. Start a database, point the
+          # image at it, and require a real answer over HTTP before calling the image good.
+          docker network create mcpci
+          docker run -d --name pgci --network mcpci \
+            -e POSTGRES_PASSWORD=ci \
+            postgres:16  # pragma: allowlist secret
+          for _ in $(seq 1 40); do docker exec pgci pg_isready -U postgres >/dev/null 2>&1 && break; sleep 1; done
+          docker exec -i pgci psql -U postgres -q -v ON_ERROR_STOP=1 <<'SQL'
+          CREATE ROLE reader LOGIN PASSWORD 'reader_pw';
+          GRANT CONNECT ON DATABASE postgres TO reader;
+          GRANT USAGE ON SCHEMA public TO reader;
+          CREATE TABLE demo(id int);
+          INSERT INTO demo VALUES (1);
+          GRANT SELECT ON demo TO reader;
+          SQL
+          docker run -d --name mcpci --network mcpci -p 127.0.0.1:8099:8080 \
+            -e DATABASE_URL="postgres://reader:reader_pw@pgci:5432/postgres" \
+            mcp-pg:ci
+          for _ in $(seq 1 30); do curl -sf http://127.0.0.1:8099/health >/dev/null && break; sleep 1; done
+          curl -sf -H content-type:application/json http://127.0.0.1:8099/mcp \
+            -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"query","arguments":{"sql":"SELECT id FROM demo"}}}' \
+            | grep -q '"id":1'
+          docker rm -f mcpci pgci; docker network rm mcpci

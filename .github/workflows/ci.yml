@@ -1,92 +1,13 @@
 name: CI
 
-# Tests, lint and fuzz on EVERY change. Without this, 25 tests and a fuzz harness are decoration:
-# nobody runs them and a regression lands quietly. For a security server that is unacceptable.
+# Tests, lint and fuzz on EVERY change. Without this, the unit tests and the fuzz harness are
+# decoration: nobody runs them and a regression lands quietly. For a security server that is
+# unacceptable. The gates themselves live in checks.yml so that a release runs the same ones.
 on:
   push:
     branches: [main]
   pull_request:
 
-env:
-  CARGO_TERM_COLOR: always
-
 jobs:
-  test:
-    runs-on: ubuntu-latest
-    services:
-      postgres:
-        image: postgres:16
-        env:
-          POSTGRES_PASSWORD: ci  # pragma: allowlist secret - throwaway CI database, dies with the runner
-        options: >-
-          --health-cmd pg_isready --health-interval 5s --health-timeout 5s --health-retries 10
-        ports: ["5432:5432"]
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.83.0
-        with:
-          components: clippy, rustfmt
-      - uses: Swatinem/rust-cache@v2
-
-      - name: Format
-        run: cargo fmt --check
-
-      - name: Clippy (warnings are errors)
-        run: cargo clippy --locked --all-targets -- -D warnings
-
-      - name: Unit and adversarial tests
-        run: cargo test --locked --release
-
-      - name: Validator fuzz (3 seeds x 200k mutants)
-        run: |
-          cargo build --locked --release
-          for seed in 1 42 20260726; do
-            ./target/release/postgres-mcp-hardened --fuzz 200000 "$seed"
-          done
-
-      - name: Smoke test against a live database (reads work, writes rejected)
-        env:
-          DATABASE_URL: postgres://postgres:ci@127.0.0.1:5432/postgres  # pragma: allowlist secret
-        run: |
-          ./target/release/postgres-mcp-hardened --validate "SELECT 1" | grep -q ALLOW
-          ./target/release/postgres-mcp-hardened --validate "DROP TABLE x" | grep -q REJECT
-          MCP_ADDR=127.0.0.1:8080 ./target/release/postgres-mcp-hardened &
-          sleep 3
-          curl -sf -H content-type:application/json http://127.0.0.1:8080/mcp \
-            -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"query","arguments":{"sql":"SELECT 1 AS ok"}}}' | grep -q '"ok"'
-          curl -s -H content-type:application/json http://127.0.0.1:8080/mcp \
-            -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"query","arguments":{"sql":"CREATE TABLE t(x int)"}}}' | grep -q 'non-read-only'
-
-  acceptance:
-    # The end-to-end suite: every scenario reported against the deprecated server, plus the
-    # deployment shapes people actually run. It starts its own PostgreSQL through docker.
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.83.0
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo build --locked --release
-      - run: ./tests/acceptance.sh
-
-  audit:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.83.0
-      - name: cargo-audit (dependency vulnerabilities)
-        run: |
-          cargo install cargo-audit --locked
-          cargo audit
-      - name: cargo-deny (licences, duplicate and unknown sources)
-        run: |
-          cargo install cargo-deny --locked
-          cargo deny check
-
-  container:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Image builds and runs as nonroot
-        run: |
-          docker build -t mcp-pg:ci .
-          test "$(docker inspect mcp-pg:ci -f '{{.Config.User}}')" = "nonroot"
+  checks:
+    uses: ./.github/workflows/checks.yml
