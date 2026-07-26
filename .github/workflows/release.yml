@@ -39,11 +39,14 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install Rust toolchain
-        # a pinned version, not a moving "stable" - otherwise "reproducibly built" is just a slogan
-        uses: dtolnay/rust-toolchain@master
-        with:
-          targets: ${{ matrix.target }}
+      # The toolchain comes from rust-toolchain.toml — one file, read by rustup, so the version
+      # cannot differ between a laptop, the test matrix and the artefacts people download. The
+      # cross-compilation target is added on top of it.
+      - name: Install Rust toolchain and target
+        shell: bash
+        run: |
+          rustup show
+          rustup target add "${{ matrix.target }}"
 
       # aarch64-linux does not build natively on an x86 runner - use cross (Docker).
       - name: Install cross
