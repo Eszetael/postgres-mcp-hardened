@@ -102,7 +102,7 @@ jobs:
       # sign files it has never seen. Without this the signing job would download nothing and
       # succeed at signing zero files — a green build producing an unsigned release.
       - name: Hand the artefacts to the signing job
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: dist-${{ matrix.target }}
           path: postgres-mcp-hardened-${{ matrix.target }}.*
