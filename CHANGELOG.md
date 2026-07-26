@@ -19,6 +19,11 @@ alternative to the deprecated `@modelcontextprotocol/server-postgres`.
 - **Signed releases:** every artefact is signed with Sigstore keyless signing, verifiable with
   `cosign verify-blob` against the workflow identity; public releases additionally carry SLSA
   build provenance. Release actions are pinned to commit hashes, not moving tags.
+- **One authorisation policy, not one per mechanism:** the same methods require credentials whether
+  the deployment uses a shared token or OAuth. `resources/read` and `resources/list` need a read
+  scope, because table and column names are data. The single exception is `server/discover`, which
+  the specification expects clients to probe before they know whether a token is wanted — and which
+  therefore never carries the security posture when authentication is configured.
 - **Nothing hidden in a statement:** characters that are invisible, or that look like a space
   without being one, are refused outside string literals — `setval\u{2060}(...)` reads as `setval(`
   to a person and parses as something else, which is how a write function walks past a rule that

@@ -502,6 +502,66 @@ done
 stop
 rm -f "$PAUD"
 
+section "Auth, end to end — the wiring, not the theory"
+# `validate_token` has good unit tests: forged signatures, alg confusion, `alg: none`, wrong issuer
+# and audience are all covered there. What was never tested is whether that function actually stands
+# between a request and the database on EVERY path. That is where tonight's EXPLAIN bug lived — the
+# rule was right, a route went around it — so it is the half worth exercising.
+JWTDIR=$(mktemp -d)
+openssl genrsa -out "$JWTDIR/priv.pem" 2048 2>/dev/null
+openssl rsa -in "$JWTDIR/priv.pem" -pubout -out "$JWTDIR/pub.pem" 2>/dev/null
+openssl genrsa -out "$JWTDIR/other.pem" 2048 2>/dev/null
+# Minted with openssl alone: a CI runner is not guaranteed to have a JWT library, and a test that
+# skips itself when a dependency is missing is a test that quietly stops running.
+mint(){ # mint <scope> <aud> <iss> <exp_offset_s> [key] [alg]
+  local scope="$1" aud="$2" iss="$3" off="$4" key="${5:-$JWTDIR/priv.pem}" alg="${6:-RS256}"
+  local hdr pay signing sig
+  hdr=$(printf '{"alg":"%s","typ":"JWT"}' "$alg" | python3 -c "import sys,base64;print(base64.urlsafe_b64encode(sys.stdin.buffer.read()).decode().rstrip('='))")
+  pay=$(python3 -c "
+import sys,base64,json,time
+print(base64.urlsafe_b64encode(json.dumps({'sub':'acc','exp':int(time.time())+int(sys.argv[1]),'aud':sys.argv[2],'iss':sys.argv[3],'scope':sys.argv[4]}).encode()).decode().rstrip('='))" "$off" "$aud" "$iss" "$scope")
+  signing="$hdr.$pay"
+  sig=$(printf '%s' "$signing" | openssl dgst -sha256 -sign "$key" -binary | python3 -c "import sys,base64;print(base64.urlsafe_b64encode(sys.stdin.buffer.read()).decode().rstrip('='))")
+  printf '%s.%s' "$signing" "$sig"
+}
+jcall(){ curl -s -o /dev/null -w '%{http_code}' -m 15 -H content-type:application/json \
+   ${1:+-H "authorization: Bearer $1"} "http://127.0.0.1:$PORT/mcp" -d "$2"; }
+TOOLS='{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}'
+QUERY='{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"query","arguments":{"sql":"SELECT 1"}}}'
+RES='{"jsonrpc":"2.0","id":1,"method":"resources/read","params":{"uri":"postgres:///public/orders/schema"}}'
+
+start DATABASE_URL="$URL" JWT_PUBKEY_PEM="$JWTDIR/pub.pem" JWT_AUD=mcp.pg JWT_ISS=https://idp
+GOOD=$(mint "mcp:query mcp:read" mcp.pg https://idp 300)
+[ "$(jcall "$GOOD" "$QUERY")" = 200 ] && ok "a correctly scoped token reaches the database" || no "valid token refused" "$(jcall "$GOOD" "$QUERY")"
+[ "$(jcall "" "$TOOLS")" = 401 ] && ok "no token is 401" || no "missing token accepted" "$(jcall "" "$TOOLS")"
+# Every one of these has a unit test. What is being tested here is that the HTTP path calls it.
+for bad in "wrong-issuer:$(mint 'mcp:query' mcp.pg https://evil 300)" \
+           "wrong-audience:$(mint 'mcp:query' other.aud https://idp 300)" \
+           "expired:$(mint 'mcp:query' mcp.pg https://idp -600)" \
+           "signed-by-another-key:$(mint 'mcp:query' mcp.pg https://idp 300 "$JWTDIR/other.pem")"; do
+  n="${bad%%:*}"; t="${bad#*:}"
+  [ "$(jcall "$t" "$QUERY")" = 401 ] && ok "$n is refused by the server, not only by the unit test" || no "$n accepted over HTTP" "$(jcall "$t" "$QUERY")"
+done
+# A token with a valid signature but no scope at all.
+NOSCOPE=$(mint "" mcp.pg https://idp 300)
+[ "$(jcall "$NOSCOPE" "$QUERY")" = 403 ] && ok "a token with no scope cannot call a tool" || no "unscoped token called a tool" "$(jcall "$NOSCOPE" "$QUERY")"
+# ... and the question nobody had asked: can it still read the schema? Table and column names are
+# reconnaissance — the threat model says so in as many words.
+c=$(jcall "$NOSCOPE" "$RES")
+[ "$c" = 403 ] && ok "and cannot read the schema either" || no "an unscoped token read the schema" "HTTP $c"
+# The same door has to be shut in both auth modes. It was not: `tools/list` was exempt in the OAuth
+# path only, so moving from a shared token to an identity provider silently made the tool inventory
+# anonymous — and nothing said so.
+[ "$(jcall "" "$TOOLS")" = 401 ] && ok "tools/list is not anonymous just because auth is OAuth" || no "tools/list open under OAuth" "$(jcall "" "$TOOLS")"
+[ "$(jcall "" '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}')" = 401 ] && ok "nor is initialize" || no "initialize open under OAuth" ""
+# One exception, on purpose: the specification tells clients to probe with server/discover before
+# they know whether the server wants a token. It must answer — and must not answer with the posture.
+d=$(curl -s -m 15 -H content-type:application/json "http://127.0.0.1:$PORT/mcp" -d '{"jsonrpc":"2.0","id":1,"method":"server/discover"}')
+echo "$d" | grep -q 'protocolVersions' && ok "server/discover still answers without a token" || no "discovery probe broken" "$d"
+echo "$d" | grep -q 'securityPosture' && no "anonymous discovery leaks the security posture" "$d" || ok "and does not tell an anonymous caller how we are configured"
+stop
+rm -rf "$JWTDIR"
+
 section "What a 401 tells a client that has not authenticated yet"
 # RFC 9728: the 401 must point at the metadata document, or a client cannot discover WHERE to
 # authenticate and the operator is left explaining it by hand.

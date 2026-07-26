@@ -1222,6 +1222,16 @@ pub(crate) fn enforce_auth(
     // the shared secret act with full scope while the audit recorded no identity at all. A caller
     // could opt out of being identified by presenting the shared token instead of their JWT — the
     // exact opposite of what the log exists for. Preflight says so at startup when both are set.
+    // The one method that stays reachable without credentials, in BOTH modes. The specification
+    // tells clients to call `server/discover` as a backwards-compatibility probe before they know
+    // anything about the server — including whether it wants a token. It answers what we are and
+    // which revisions we speak, and nothing about the database. What it must NOT answer to an
+    // anonymous caller is the security posture; `handle_server_discover` decides that separately.
+    let method = req.get("method").and_then(|v| v.as_str()).unwrap_or("");
+    if method == "server/discover" {
+        return Ok(None);
+    }
+
     if AUTH_CONFIG.is_none() {
         if let Some(expected) = std::env::var("MCP_BEARER_TOKEN")
             .ok()
@@ -1250,11 +1260,10 @@ pub(crate) fn enforce_auth(
         None => return Ok(None),
     };
 
-    let method = req.get("method").and_then(|v| v.as_str()).unwrap_or("");
-
-    if method == "initialize" || method == "tools/list" {
-        return Ok(None);
-    }
+    // `initialize` and `tools/list` used to be exempt HERE and nowhere else, so the same door was
+    // shut with a shared token and open with OAuth. An operator moving from one to the other had no
+    // way of seeing that the tool inventory had just become anonymous. Whether those methods are
+    // worth protecting is arguable; a policy that depends on which auth mechanism you picked is not.
 
     // Fail-closed: auth enabled (a pubkey is set) but JWT_AUD/JWT_ISS empty means a broken config.
     // Without this, validate_token skipped the audience check and accepted ANY token signed with the key.
@@ -1281,15 +1290,22 @@ pub(crate) fn enforce_auth(
     let ctx = auth::validate_token(token, &cfg.pubkey, &cfg.aud, &cfg.iss)
         .map_err(|e| (401u16, e, None))?;
 
-    if method == "tools/call" {
-        let name = req
-            .get("params")
-            .and_then(|p| p.get("name"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-
-        let needed = required_scope(name);
-
+    // Scope was checked for `tools/call` only. `resources/read` returns table and column names,
+    // which the threat model calls reconnaissance in as many words — and a token deliberately issued
+    // with no scope at all could read every schema in the database. Both are data; both need a
+    // scope. Methods that reveal nothing about the database (initialize, tools/list, ping) need a
+    // valid token, which they now have, but no particular right.
+    let scoped = match method {
+        "tools/call" => Some(required_scope(
+            req.get("params")
+                .and_then(|p| p.get("name"))
+                .and_then(|v| v.as_str())
+                .unwrap_or(""),
+        )),
+        "resources/read" | "resources/list" | "resources/templates/list" => Some("mcp:read"),
+        _ => None,
+    };
+    if let Some(needed) = scoped {
         if !scope_satisfied(&ctx, needed) {
             // The identity IS known (the token is valid, only the scope is missing) — it must reach the audit,
             // because this is the insider/escalation case, exactly what the log exists to catch.
@@ -1367,6 +1383,20 @@ pub(crate) fn handle_request(req: &Value) -> Value {
 /// before it sends a single query — and, because it arrives as protocol data rather than prose, it
 /// can act on it instead of hoping a model read the instructions.
 pub(crate) fn handle_server_discover() -> Value {
+    // The posture is genuinely useful here — a client can see it is talking to a superuser
+    // connection before it sends a query. But this is the one method that answers without
+    // credentials, so on a server that wants credentials it would be telling anyone who asks how
+    // badly configured we are. When auth is on, the posture is available through the
+    // `security_posture` tool, which requires a token and a scope. When auth is off there is
+    // nobody to hide it from, and the whole point is that the agent tells the operator.
+    let auth_on = AUTH_CONFIG.is_some()
+        || std::env::var("MCP_BEARER_TOKEN").is_ok_and(|t| !t.trim().is_empty());
+    let meta = if auth_on {
+        json!({ format!("{}/postureAvailable", PRIVATE_NS): "call the security_posture tool with a token" })
+    } else {
+        // Namespaced under our own reverse-DNS: the specification reserves io.modelcontextprotocol/*
+        json!({ format!("{}/securityPosture", PRIVATE_NS): posture::report(None) })
+    };
     json!({
         "result": {
             "protocolVersions": protocol::Rev::supported(),
@@ -1377,11 +1407,7 @@ pub(crate) fn handle_server_discover() -> Value {
             },
             "capabilities": { "tools": {}, "resources": {} },
             "instructions": posture::instructions(),
-            "_meta": {
-                // Namespaced under our own reverse-DNS: the specification reserves the
-                // io.modelcontextprotocol/* space for itself.
-                format!("{}/securityPosture", PRIVATE_NS): posture::report(None)
-            }
+            "_meta": meta
         }
     })
 }
