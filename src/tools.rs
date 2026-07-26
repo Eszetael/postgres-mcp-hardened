@@ -237,6 +237,9 @@ pub(crate) fn handle_resources_read(params: &Value) -> Value {
     if let Some(d) = db {
         a["database"] = Value::String(d.to_string());
     }
+    // Audited under its own name: this is a second entry point to the same data, and a log that
+    // records it as `describe_table` cannot answer "how did the caller get here".
+    audit("resources/read", "allowed", None);
     let desc = handle_describe_table(&a);
     // `describe_table` returns a ready `content` block; a resource needs the `contents` shape.
     match desc

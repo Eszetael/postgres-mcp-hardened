@@ -82,6 +82,12 @@ pub(crate) async fn metrics_handler(headers: HeaderMap) -> impl IntoResponse {
         .ok()
         .filter(|t| !t.is_empty())
         .or_else(|| {
+            // Only when the shared token is the server's actual mechanism. With OAuth configured
+            // `enforce_auth` ignores it, and accepting it here made the same variable simultaneously
+            // "ignored" and "sufficient" depending on which endpoint you asked.
+            if AUTH_CONFIG.is_some() {
+                return None;
+            }
             std::env::var("MCP_BEARER_TOKEN")
                 .ok()
                 .filter(|t| !t.is_empty())

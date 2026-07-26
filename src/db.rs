@@ -726,13 +726,24 @@ pub(crate) fn query_catalog(
         }
     };
     let mut out = Vec::with_capacity(rows.len());
+    // The same byte ceiling the query path enforces. This function serves every catalog tool and
+    // `explain_query`, and it buffered the whole result: `EXPLAIN VERBOSE` of a large UNION, or
+    // analyze_indexes on a database with hundreds of thousands of relations, materialised in full
+    // before anyone could object. A cap that applies to one path and not the other is not a cap.
+    let mut bytes = 0usize;
+    let mut capped = false;
     for row in rows {
+        if bytes > MAX_RESULT_BYTES {
+            capped = true;
+            break;
+        }
         if wrapped_mode {
             let txt: Option<String> = row
                 .try_get::<_, Option<String>>(0)
                 .map_err(|_| "result serialization error".to_string())?;
             let v: Value = serde_json::from_str(&txt.unwrap_or_else(|| "null".into()))
                 .map_err(|_| "result serialization error".to_string())?;
+            bytes += serde_json::to_string(&v).map(|s| s.len()).unwrap_or(0);
             out.push(v);
             continue;
         }
@@ -741,10 +752,20 @@ pub(crate) fn query_catalog(
             let col_name = row.columns()[i].name().to_string();
             obj.insert(col_name, col_to_json(&row, i));
         }
-        out.push(Value::Object(obj));
+        let v = Value::Object(obj);
+        bytes += serde_json::to_string(&v).map(|s| s.len()).unwrap_or(0);
+        out.push(v);
     }
     let _ = client.batch_execute("ROLLBACK");
-    Ok(json!({ "returnedRows": out.len(), "rows": out }))
+    let mut res = json!({ "returnedRows": out.len(), "rows": out });
+    if capped {
+        res["truncated"] = json!(true);
+        res["truncationReason"] = json!(format!(
+            "result exceeded the {} MB ceiling and was cut here",
+            MAX_RESULT_BYTES / 1_048_576
+        ));
+    }
+    Ok(res)
 }
 
 #[cfg(test)]

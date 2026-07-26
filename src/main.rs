@@ -780,7 +780,13 @@ pub(crate) fn enforce_auth(
             if !secret_eq(given, &expected) {
                 return Err((401, "invalid or missing bearer token".into(), None));
             }
-            return Ok(None);
+            // An identity, not a dash. A shared token names no person, but it does name a
+            // credential — and when one is rotated or leaks, the log has to be able to say which
+            // requests used it. The fingerprint never reveals the token itself.
+            return Ok(Some(format!(
+                "bearer:{}",
+                &hmac_sha256_hex(b"mcp-bearer-fingerprint".to_vec(), expected.as_bytes())[..8]
+            )));
         }
     }
 
@@ -1018,12 +1024,50 @@ pub(crate) fn handle_explain_query(args: &Value) -> Value {
         .get("analyze")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
+
+    // With `analyze` the statement REALLY RUNS, and this path had none of the protections the query
+    // tool applies: no cost guard, no row limit, no byte ceiling. `EXPLAIN (ANALYZE) SELECT` over a
+    // cross join executed for the whole statement_timeout and returned whatever it produced —
+    // a denial of service and a way round the cost guard, available to any caller. Planning alone
+    // (`analyze: false`) is cheap and needs neither: running the guard there would double the work
+    // for no gain, since the guard is itself an EXPLAIN.
+    let inner = if analyze {
+        let capped = match validate::enforce_limit(sql, MAX_LIMIT) {
+            Ok(s) => s,
+            Err(e) => {
+                audit("explain_query", "denied_validation", Some(sql));
+                return err_content(-32602, e.to_string());
+            }
+        };
+        if is_row_query(&capped) {
+            let max_cost: f64 = std::env::var("MCP_MAX_COST")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(1_000_000.0);
+            match cost_guard(&capped, max_cost, db) {
+                Ok(()) => {}
+                Err(CostErr::TooExpensive(e)) => {
+                    audit("explain_query", "denied_cost", Some(sql));
+                    METRICS.denied_cost.fetch_add(1, Ordering::Relaxed);
+                    return err_content(-32001, e);
+                }
+                Err(CostErr::QueryError(e)) => {
+                    audit("explain_query", "error", Some(sql));
+                    METRICS.errors.fetch_add(1, Ordering::Relaxed);
+                    return err_content(-32000, e);
+                }
+            }
+        }
+        capped
+    } else {
+        sql.to_string()
+    };
     let opts = if analyze {
         "FORMAT JSON, ANALYZE true, BUFFERS true"
     } else {
         "FORMAT JSON"
     };
-    let stmt = format!("EXPLAIN ({}) {}", opts, sql);
+    let stmt = format!("EXPLAIN ({}) {}", opts, inner);
     match query_catalog(&stmt, &[], db) {
         Ok(mut v) => {
             audit("explain_query", "allowed", Some(sql));

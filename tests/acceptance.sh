@@ -281,6 +281,28 @@ echo "$r" | grep -q 'tables_never_analyzed' && ok "never-analysed tables are rep
 echo "$r" | grep -q 'statistics_window' && ok "the window the counters cover is stated" || no "no statistics window" "$r"
 stop
 
+section "Protections apply on every path, not just the obvious one"
+start DATABASE_URL="$URL" MCP_MAX_COST=500 MCP_AUDIT_LOG=/tmp/acc_audit_$$.log
+r=$(tool query '{"sql":"SELECT count(*) FROM orders o1, orders o2, orders o3, orders o4"}' | body)
+case "$r" in *"too expensive"*) ok "the cost guard refuses an expensive query";; *) no "cost guard did not fire" "$r";; esac
+# Same statement through explain_query with analyze: it really runs, so it needs the same guard.
+# It had none — no cost guard, no row limit, no byte ceiling — which made it a way round all three.
+r=$(tool explain_query '{"sql":"SELECT count(*) FROM orders o1, orders o2, orders o3, orders o4","analyze":true}' | body)
+case "$r" in *"too expensive"*) ok "explain_query analyze obeys the same cost guard";; *) no "explain analyze bypassed the cost guard" "$r";; esac
+r=$(tool explain_query '{"sql":"SELECT count(*) FROM orders","analyze":true}' | body)
+echo "$r" | grep -q 'Actual Total Time' && ok "a cheap explain analyze still works" || no "explain analyze broken" "$r"
+r=$(call '{"jsonrpc":"2.0","id":1,"method":"resources/read","params":{"uri":"postgres:///public/orders/schema"}}')
+echo "$r" | grep -q 'column_name' && ok "resources/read still returns a schema" || no "resources/read broken" "$r"
+grep -q '"tool":"resources/read"' /tmp/acc_audit_$$.log && ok "a resource read is audited under its own name" || no "resource read logged as something else" "$(tail -1 /tmp/acc_audit_$$.log)"
+stop
+start DATABASE_URL="$URL" MCP_BEARER_TOKEN=acc_shared MCP_AUDIT_LOG=/tmp/acc_audit2_$$.log
+curl -s -o /dev/null -m 20 -H content-type:application/json -H "authorization: Bearer acc_shared" \
+  "http://127.0.0.1:$((PORT))/mcp" -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"query","arguments":{"sql":"SELECT 1"}}}'
+if grep -q '"caller":"bearer:' /tmp/acc_audit2_$$.log; then ok "a shared token leaves a credential fingerprint in the audit"
+else no "shared token still audits as anonymous" "$(tail -1 /tmp/acc_audit2_$$.log 2>/dev/null)"; fi
+stop
+rm -f /tmp/acc_audit_$$.log /tmp/acc_audit2_$$.log
+
 section "Deployment shapes"
 start MCP_DATABASE_URLS="a=$URL;b=$URL"
 r=$(tool query '{"sql":"SELECT 1 AS x","database":"b"}' | body); echo "$r" | grep -q '"x":1' && ok "several databases from one server" || no "multi-database" "$r"
