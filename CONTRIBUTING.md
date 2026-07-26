@@ -10,6 +10,16 @@ control that a rename walks past — will not be merged, however convenient it i
 
 ## Before opening a pull request
 
+```bash
+git config core.hooksPath .githooks   # once, per clone
+```
+
+That hook runs the fast half of CI before a push and refuses one that would go out red. Worth
+knowing why it checks clippy separately from the tests: `cargo test` passes on code clippy
+rejects, because clippy lints are not compiler errors — "it builds locally" has never been the
+same claim as "CI will be green".
+
+
 - `cargo test` and `cargo clippy --all-targets -- -D warnings` are clean.
 - `cargo fmt` has been run.
 - `./tests/acceptance.sh` passes (it starts its own PostgreSQL through Docker).
