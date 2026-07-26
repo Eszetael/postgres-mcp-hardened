@@ -33,7 +33,14 @@ command -v docker >/dev/null || { echo 'docker required'; exit 1; }
 
 PGPW=acc_$RANDOM
 docker rm -f acc_pg >/dev/null 2>&1
-docker run -d --name acc_pg -e POSTGRES_PASSWORD=$PGPW -p 127.0.0.1:55500:5432 postgres:16 >/dev/null
+# Port 15500, not something in the 32768-60999 range: a fixed port inside the ephemeral range is
+# eventually taken by an unrelated outgoing connection, and the suite then fails as "fixture failed"
+# with nothing to do with the code under test. Seen once; it costs an afternoon to diagnose twice.
+PGPORT_ACC=${PGPORT_ACC:-15500}
+if ! docker run -d --name acc_pg -e POSTGRES_PASSWORD=$PGPW -p 127.0.0.1:$PGPORT_ACC:5432 postgres:16 >/dev/null; then
+  echo "fixture failed: could not start the PostgreSQL container (is port $PGPORT_ACC free? set PGPORT_ACC to change)"
+  exit 1
+fi
 for _ in $(seq 1 40); do docker exec acc_pg pg_isready -U postgres >/dev/null 2>&1 && break; sleep 1; done
 docker exec -i acc_pg psql -U postgres -q -v ON_ERROR_STOP=1 <<'SQL' || { echo "fixture failed"; exit 1; }
 CREATE TABLE customers(id int primary key, name text, email text);
@@ -46,7 +53,7 @@ CREATE TABLE events(id int, at date) PARTITION BY RANGE (at);
 CREATE TABLE events_2026 PARTITION OF events FOR VALUES FROM ('2026-01-01') TO ('2027-01-01');
 CREATE MATERIALIZED VIEW order_totals AS SELECT customer_id, sum(total) t FROM orders GROUP BY 1;
 SQL
-URL="postgres://postgres:$PGPW@127.0.0.1:55500/postgres"
+URL="postgres://postgres:$PGPW@127.0.0.1:$PGPORT_ACC/postgres"
 
 section "Read-only contract (the reason this server exists)"
 start DATABASE_URL="$URL"
@@ -165,6 +172,44 @@ r=$(tool database_health '{}' | body)
 echo "$r" | grep -q 'cache_hit_ratio' && ok "database_health reports" || no "database_health" "$r"
 r=$(tool analyze_indexes '{"schema":"public"}' | body)
 echo "$r" | grep -q 'unused_indexes' && ok "analyze_indexes reports" || no "analyze_indexes" "$r"
+stop
+
+section "DBA tools tell the truth (a wrong answer here costs an index or a constraint)"
+docker exec -i acc_pg psql -U postgres -q -v ON_ERROR_STOP=1 <<'SQL' || { echo "fixture failed: dba objects"; exit 1; }
+CREATE TABLE idx_probe(id int, val int, active bool);
+INSERT INTO idx_probe SELECT g, g, g%2=0 FROM generate_series(1,2000) g;
+CREATE INDEX probe_active_true  ON idx_probe(id) WHERE active = true;
+CREATE INDEX probe_active_false ON idx_probe(id) WHERE active = false;
+CREATE UNIQUE INDEX probe_val_uniq ON idx_probe(val);
+CREATE INDEX probe_val_dup1 ON idx_probe(val);
+CREATE INDEX probe_val_dup2 ON idx_probe(val);
+CREATE TABLE hidden_table(id int);
+CREATE INDEX hidden_idx ON hidden_table(id);
+REVOKE ALL ON hidden_table FROM PUBLIC;
+CREATE SEQUENCE hidden_seq;
+DO $$ BEGIN PERFORM nextval('hidden_seq'); END $$;
+REVOKE ALL ON SEQUENCE hidden_seq FROM PUBLIC;
+CREATE ROLE acc_narrow LOGIN PASSWORD 'narrow';
+GRANT CONNECT ON DATABASE postgres TO acc_narrow;
+GRANT USAGE ON SCHEMA public TO acc_narrow;
+GRANT SELECT ON idx_probe TO acc_narrow;
+SQL
+start DATABASE_URL="$URL"
+r=$(tool analyze_indexes '{"schema":"public"}' | body)
+d=$(echo "$r" | python3 -c "import sys,json;print(json.dumps(json.load(sys.stdin)['duplicate_indexes']))")
+case "$d" in *probe_active_*) no "partial indexes over disjoint rows called duplicates" "$d";; *) ok "partial indexes over disjoint rows are not duplicates";; esac
+case "$d" in *probe_val_uniq*) no "a unique index was clustered with ordinary ones" "$d";; *) ok "a unique index is not offered up as a redundant copy";; esac
+case "$d" in *probe_val_dup1*probe_val_dup2*) ok "genuine duplicates are still reported";; *) no "genuine duplicates missed" "$d";; esac
+r=$(tool database_health '{}' | body)
+echo "$r" | grep -q 'in_use_cluster_wide' && ok "connections separate this database from the cluster" || no "connections scope" "$r"
+echo "$r" | grep -q 'longest_idle_in_transaction_seconds' && ok "an abandoned transaction is named, not disguised as a slow query" || no "idle in transaction" "$r"
+stop
+start DATABASE_URL="postgres://acc_narrow:narrow@127.0.0.1:$PGPORT_ACC/postgres"
+r=$(tool analyze_indexes '{"schema":"public"}' | body)
+case "$r" in *hidden_*) no "index metadata leaked to a role without access to the table" "$r";; *) ok "a narrow role sees no table it cannot read";; esac
+r=$(tool database_health '{}' | body)
+case "$r" in *hidden_idx*) no "invalid_indexes leaked to a narrow role" "$r";; *) ok "health checks respect table privileges";; esac
+echo "$r" | grep -q 'sequences_unreadable' && ok "sequences it cannot read are declared, not silently dropped" || no "unreadable sequences hidden" "$r"
 stop
 
 section "Deployment shapes"

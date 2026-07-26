@@ -191,7 +191,8 @@ pub(crate) fn preflight_config() {
     if std::env::var("JWT_PUBKEY_PEM").map(|v| !v.trim().is_empty()) == Ok(true) {
         match jwt_pubkey_pem() {
             None => fatal.push(
-                "JWT_PUBKEY_PEM is set but is neither PEM text nor a readable file path".to_string(),
+                "JWT_PUBKEY_PEM is set but is neither PEM text nor a readable file path"
+                    .to_string(),
             ),
             Some(pem) => {
                 if jsonwebtoken::DecodingKey::from_rsa_pem(&pem).is_err() {
@@ -870,34 +871,78 @@ pub(crate) fn handle_explain_query(args: &Value) -> Value {
 /// Every check degrades gracefully: a role that cannot read a view yields a note, not a failure.
 pub(crate) fn handle_database_health(args: &Value) -> Value {
     let db = args.get("database").and_then(|v| v.as_str());
+    // Every query here is scoped to the CURRENT DATABASE and filtered by the caller's table
+    // privileges. Both were missing and both produced confident nonsense: `pg_stat_activity` spans
+    // the whole cluster, so a fresh database with two connections reported nineteen; and the catalog
+    // views happily describe tables the role cannot read, so a restricted role could enumerate
+    // index and table names it has no access to.
     const CHECKS: &[(&str, &str)] = &[
         (
             "cache_hit_ratio",
-            "SELECT round(100.0 * sum(heap_blks_hit) / NULLIF(sum(heap_blks_hit) + sum(heap_blks_read), 0), 2) AS pct_from_cache, sum(heap_blks_hit) + sum(heap_blks_read) AS blocks_sampled, CASE WHEN COALESCE(sum(heap_blks_hit) + sum(heap_blks_read), 0) = 0 THEN 'no I/O recorded yet — statistics reset with the server' END AS note FROM pg_statio_user_tables",
+            "SELECT round(100.0 * (t.hit + x.hit) / NULLIF(t.hit + t.read + x.hit + x.read, 0), 2) AS pct_from_cache, \
+                    t.hit + t.read + x.hit + x.read AS blocks_sampled, \
+                    round(100.0 * t.hit / NULLIF(t.hit + t.read, 0), 2) AS pct_tables, \
+                    round(100.0 * x.hit / NULLIF(x.hit + x.read, 0), 2) AS pct_indexes, \
+                    CASE WHEN COALESCE(t.hit + t.read + x.hit + x.read, 0) = 0 \
+                         THEN 'no I/O recorded yet — statistics reset with the server' END AS note \
+             FROM (SELECT COALESCE(sum(heap_blks_hit), 0) AS hit, COALESCE(sum(heap_blks_read), 0) AS read \
+                     FROM pg_statio_user_tables WHERE has_table_privilege(relid, 'SELECT')) t, \
+                  (SELECT COALESCE(sum(idx_blks_hit), 0) AS hit, COALESCE(sum(idx_blks_read), 0) AS read \
+                     FROM pg_statio_user_indexes WHERE has_table_privilege(relid, 'SELECT')) x",
         ),
         (
             "connections",
-            "SELECT count(*) AS in_use,                     (SELECT setting::int FROM pg_settings WHERE name = 'max_connections') AS max_connections,                     count(*) FILTER (WHERE state = 'idle in transaction') AS idle_in_transaction              FROM pg_stat_activity",
+            "SELECT count(*) FILTER (WHERE datname = current_database()) AS in_use, \
+                    count(*) AS in_use_cluster_wide, \
+                    (SELECT setting::int FROM pg_settings WHERE name = 'max_connections') AS max_connections, \
+                    count(*) FILTER (WHERE datname = current_database() AND state = 'idle in transaction') AS idle_in_transaction \
+             FROM pg_stat_activity",
         ),
         (
+            // `longest_query_seconds` used to include sessions that are idle in transaction, where
+            // query_start is when the LAST query ended — a connection abandoned for three hours was
+            // reported as a three-hour running query, hiding the actual diagnosis. Split apart, the
+            // idle-in-transaction figure now names the leak instead of disguising it.
             "longest_running",
-            "SELECT round(EXTRACT(epoch FROM max(now() - query_start))::numeric, 1) AS longest_query_seconds,                     round(EXTRACT(epoch FROM max(now() - xact_start))::numeric, 1) AS longest_transaction_seconds              FROM pg_stat_activity WHERE state <> 'idle'",
+            "SELECT round(EXTRACT(epoch FROM max(now() - query_start) FILTER (WHERE state = 'active'))::numeric, 1) AS longest_active_query_seconds, \
+                    round(EXTRACT(epoch FROM max(now() - xact_start))::numeric, 1) AS longest_transaction_seconds, \
+                    round(EXTRACT(epoch FROM max(now() - state_change) FILTER (WHERE state = 'idle in transaction'))::numeric, 1) AS longest_idle_in_transaction_seconds \
+             FROM pg_stat_activity WHERE datname = current_database()",
         ),
         (
             "vacuum_backlog",
-            "SELECT relname AS table_name, n_dead_tup AS dead_rows, n_live_tup AS live_rows, last_autovacuum              FROM pg_stat_user_tables WHERE n_dead_tup > 1000              ORDER BY n_dead_tup DESC LIMIT 10",
+            "SELECT relname AS table_name, n_dead_tup AS dead_rows, n_live_tup AS live_rows, last_autovacuum \
+             FROM pg_stat_user_tables WHERE n_dead_tup > 1000 AND has_table_privilege(relid, 'SELECT') \
+             ORDER BY n_dead_tup DESC LIMIT 10",
         ),
         (
             "invalid_indexes",
-            "SELECT c.relname AS index_name FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid              WHERE NOT i.indisvalid",
+            "SELECT c.relname AS index_name, t.relname AS table_name \
+             FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid JOIN pg_class t ON t.oid = i.indrelid \
+             WHERE NOT i.indisvalid AND has_table_privilege(i.indrelid, 'SELECT')",
         ),
         (
             "sequences_near_limit",
-            "SELECT schemaname || '.' || sequencename AS sequence, last_value, max_value,                     round(100.0 * last_value / NULLIF(max_value, 0), 2) AS pct_used              FROM pg_sequences WHERE last_value IS NOT NULL                AND 100.0 * last_value / NULLIF(max_value, 0) > 50 ORDER BY 4 DESC LIMIT 10",
+            "SELECT schemaname || '.' || sequencename AS sequence, last_value, max_value, \
+                    round(100.0 * last_value / NULLIF(max_value, 0), 2) AS pct_used \
+             FROM pg_sequences WHERE last_value IS NOT NULL \
+               AND 100.0 * last_value / NULLIF(max_value, 0) > 50 ORDER BY 4 DESC LIMIT 10",
+        ),
+        (
+            // Without this, a sequence at 95% of its ceiling was indistinguishable from no risk at
+            // all: PostgreSQL returns last_value as NULL when the role lacks USAGE/SELECT, the filter
+            // above drops the row, and an empty list reads as "nothing to worry about".
+            "sequences_unreadable",
+            "SELECT count(*) AS count, \
+                    'this role cannot read these sequences (needs USAGE or SELECT); their headroom was NOT checked' AS note \
+             FROM pg_sequences WHERE last_value IS NULL HAVING count(*) > 0",
         ),
         (
             "replication",
-            "SELECT pg_is_in_recovery() AS is_standby,                     CASE WHEN pg_is_in_recovery()                          THEN round(EXTRACT(epoch FROM now() - pg_last_xact_replay_timestamp())::numeric, 1)                          END AS replay_lag_seconds",
+            "SELECT pg_is_in_recovery() AS is_standby, \
+                    CASE WHEN pg_is_in_recovery() \
+                         THEN round(EXTRACT(epoch FROM now() - pg_last_xact_replay_timestamp())::numeric, 1) \
+                         END AS replay_lag_seconds",
         ),
     ];
     let mut out = serde_json::Map::new();
@@ -939,7 +984,15 @@ pub(crate) fn handle_top_queries(args: &Value) -> Value {
         }
         Err(e) => {
             audit("top_queries", "error", None);
-            if e.contains("does not exist") || e.contains("42P01") {
+            // Two different setup states, two different next steps. Conflating them sent people to
+            // run CREATE EXTENSION again when what they actually needed was a server restart.
+            if e.contains("55000") || e.contains("must be loaded") {
+                err_content(
+                    -32000,
+                    "pg_stat_statements is installed but not loaded — add it to shared_preload_libraries and RESTART PostgreSQL (CREATE EXTENSION alone is not enough)"
+                        .into(),
+                )
+            } else if e.contains("does not exist") || e.contains("42P01") {
                 err_content(
                     -32000,
                     "pg_stat_statements is not enabled on this server — add it to shared_preload_libraries and run CREATE EXTENSION pg_stat_statements"
@@ -961,12 +1014,33 @@ pub(crate) fn handle_analyze_indexes(args: &Value) -> Value {
         .and_then(|v| v.as_str())
         .unwrap_or("public");
     const UNUSED: &str =
-        "SELECT s.relname AS table_name, s.indexrelname AS index_name, s.idx_scan AS scans,                 pg_size_pretty(pg_relation_size(s.indexrelid)) AS size          FROM pg_stat_user_indexes s JOIN pg_index i ON i.indexrelid = s.indexrelid          WHERE s.schemaname = $1 AND s.idx_scan = 0 AND NOT i.indisprimary AND NOT i.indisunique          ORDER BY pg_relation_size(s.indexrelid) DESC LIMIT 20";
+        "SELECT s.relname AS table_name, s.indexrelname AS index_name, s.idx_scan AS scans, \
+                pg_size_pretty(pg_relation_size(s.indexrelid)) AS size \
+         FROM pg_stat_user_indexes s JOIN pg_index i ON i.indexrelid = s.indexrelid \
+         WHERE s.schemaname = $1 AND s.idx_scan = 0 AND NOT i.indisprimary AND NOT i.indisunique \
+           AND has_table_privilege(s.relid, 'SELECT') \
+         ORDER BY pg_relation_size(s.indexrelid) DESC LIMIT 20";
+    // Grouping used to collapse on `indpred IS NULL`, which asks whether an index is partial but not
+    // WHICH rows it covers — so `WHERE active` and `WHERE NOT active`, indexing disjoint sets, were
+    // reported as duplicates. It also ignored uniqueness, so a UNIQUE index landed in a cluster with
+    // ordinary ones and "drop the redundant copy" could remove the only thing enforcing uniqueness.
+    // Grouping on the predicate text and on indisunique makes the claim mean what it says.
     const DUPLICATES: &str =
         // array_to_string, not array_agg: an array column comes back as null through the driver.
-        "SELECT t.relname AS table_name, array_to_string(array_agg(c.relname ORDER BY c.relname), ', ') AS duplicate_indexes, pg_size_pretty(sum(pg_relation_size(c.oid))) AS combined_size FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid JOIN pg_class t ON t.oid = i.indrelid JOIN pg_namespace n ON n.oid = t.relnamespace WHERE n.nspname = $1 GROUP BY t.relname, i.indrelid, i.indkey::text, i.indclass::text, (i.indpred IS NULL) HAVING count(*) > 1 ORDER BY sum(pg_relation_size(c.oid)) DESC LIMIT 20";
+        "SELECT t.relname AS table_name, array_to_string(array_agg(c.relname ORDER BY c.relname), ', ') AS duplicate_indexes, \
+                i.indisunique AS unique_index, pg_size_pretty(sum(pg_relation_size(c.oid))) AS combined_size \
+         FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid JOIN pg_class t ON t.oid = i.indrelid \
+              JOIN pg_namespace n ON n.oid = t.relnamespace \
+         WHERE n.nspname = $1 AND has_table_privilege(i.indrelid, 'SELECT') \
+         GROUP BY t.relname, i.indrelid, i.indkey::text, i.indclass::text, i.indisunique, \
+                  COALESCE(pg_get_expr(i.indpred, i.indrelid), '') \
+         HAVING count(*) > 1 ORDER BY sum(pg_relation_size(c.oid)) DESC LIMIT 20";
     const SEQ_SCANS: &str =
-        "SELECT relname AS table_name, seq_scan, idx_scan, n_live_tup AS rows,                 pg_size_pretty(pg_relation_size(relid)) AS size          FROM pg_stat_user_tables WHERE schemaname = $1 AND seq_scan > COALESCE(idx_scan, 0)            AND n_live_tup > 10000 ORDER BY seq_scan DESC LIMIT 10";
+        "SELECT relname AS table_name, seq_scan, idx_scan, n_live_tup AS rows, \
+                pg_size_pretty(pg_relation_size(relid)) AS size \
+         FROM pg_stat_user_tables WHERE schemaname = $1 AND seq_scan > COALESCE(idx_scan, 0) \
+           AND n_live_tup > 10000 AND has_table_privilege(relid, 'SELECT') \
+         ORDER BY seq_scan DESC LIMIT 10";
     let mut out = serde_json::Map::new();
     for (name, sql) in [
         ("unused_indexes", UNUSED),
@@ -988,7 +1062,10 @@ pub(crate) fn handle_analyze_indexes(args: &Value) -> Value {
     out.insert(
         "note".to_string(),
         Value::String(
-            "Counters come from pg_stat_*, which reset with the server and start empty; read them              after a representative period of traffic, not straight after a restart."
+            "Counters come from pg_stat_*, which reset with the server and start empty; read them \
+             after a representative period of traffic, not straight after a restart. \
+             unused_indexes deliberately omits primary-key and unique indexes: they earn their keep by \
+             enforcing a constraint, so a scan count of zero does not make them removable."
                 .into(),
         ),
     );
