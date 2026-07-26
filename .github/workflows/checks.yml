@@ -33,9 +33,8 @@ jobs:
         ports: ["5432:5432"]
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          components: clippy, rustfmt
+      # rustup honours rust-toolchain.toml, so the version stays in exactly one file.
+      - run: rustup show
       - uses: Swatinem/rust-cache@v2
 
       - name: Format
@@ -83,7 +82,8 @@ jobs:
       PG_IMAGE: postgres:${{ matrix.pg }}
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@master
+      # rustup honours rust-toolchain.toml, so the version stays in exactly one file.
+      - run: rustup show
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --locked --release
       - run: ./tests/acceptance.sh
@@ -103,7 +103,8 @@ jobs:
         ports: ["5432:5432"]
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@master
+      # rustup honours rust-toolchain.toml, so the version stays in exactly one file.
+      - run: rustup show
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --locked --release
       - name: Seed a schema for the corpus to run against
@@ -128,7 +129,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@master
+      # rustup honours rust-toolchain.toml, so the version stays in exactly one file.
+      - run: rustup show
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --locked --release
       - run: ./tests/tls.sh
@@ -146,7 +148,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@master
+      # rustup honours rust-toolchain.toml, so the version stays in exactly one file.
+      - run: rustup show
       - name: cargo-audit (dependency vulnerabilities)
         run: |
           cargo install cargo-audit --locked
@@ -179,11 +182,25 @@ jobs:
           INSERT INTO demo VALUES (1);
           GRANT SELECT ON demo TO reader;
           SQL
+          # The image listens on 0.0.0.0, so the start-up gate applies to it — which makes this the
+          # place to prove the gate works in the artefact people actually run, not only in a test
+          # harness. Without a token it must refuse; the first version of this job did not supply one
+          # and was refused, correctly, by the server it was testing.
+          docker run -d --name mcpnoauth --network mcpci \
+            -e DATABASE_URL="postgres://reader:reader_pw@pgci:5432/postgres" mcp-pg:ci
+          sleep 5
+          code=$(docker inspect mcpnoauth -f '{{.State.ExitCode}}')
+          [ "$code" = "3" ] || { echo "expected the gate to refuse an unauthenticated network listener, got exit $code"; docker logs mcpnoauth; exit 1; }
+          docker rm -f mcpnoauth
+
           docker run -d --name mcpci --network mcpci -p 127.0.0.1:8099:8080 \
             -e DATABASE_URL="postgres://reader:reader_pw@pgci:5432/postgres" \
+            -e MCP_BEARER_TOKEN=ci-token \
             mcp-pg:ci
-          for _ in $(seq 1 30); do curl -sf http://127.0.0.1:8099/health >/dev/null && break; sleep 1; done
-          curl -sf -H content-type:application/json http://127.0.0.1:8099/mcp \
+          for _ in $(seq 1 30); do curl -sf -H 'authorization: Bearer ci-token' http://127.0.0.1:8099/health >/dev/null && break; sleep 1; done
+          docker logs mcpci 2>&1 | grep -q "read-only as far as the database is concerned" \
+            || { echo "the image did not report a read-only role"; docker logs mcpci; exit 1; }
+          curl -sf -H content-type:application/json -H 'authorization: Bearer ci-token' http://127.0.0.1:8099/mcp \
             -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"query","arguments":{"sql":"SELECT id FROM demo"}}}' \
             | grep -q '"id":1'
           docker rm -f mcpci pgci; docker network rm mcpci

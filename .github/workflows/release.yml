@@ -141,7 +141,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@master
+      # rustup honours rust-toolchain.toml, so the version stays in exactly one file.
+      - run: rustup show
       - run: cargo install cargo-cyclonedx --locked
       - run: cargo cyclonedx --format json --all
       - name: Attach the SBOM to the release

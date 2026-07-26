@@ -32,6 +32,8 @@ services:
       # Values that must never reach the model, whatever the query asks for:
       MCP_REDACT_COLUMNS: ssn, card_number
       # Uncomment to require a token on every request:
-      # MCP_BEARER_TOKEN: change-me
+      # Required, not optional: the server binds 0.0.0.0 here, and it refuses to serve a network
+      # listener with no authentication. Generate one with `openssl rand -base64 24`.
+      MCP_BEARER_TOKEN: change-me-before-running
     ports:
       - "127.0.0.1:8080:8080"
