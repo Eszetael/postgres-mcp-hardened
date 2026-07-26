@@ -6,7 +6,7 @@ updates:
   - package-ecosystem: cargo
     directory: /
     schedule: { interval: weekly }
-    open-pull-requests-limit: 5
+    open-pull-requests-limit: 3
     groups:
       # One pull request for the routine bumps, so the interesting ones are not buried in noise.
       patch-and-minor:
@@ -17,7 +17,13 @@ updates:
   - package-ecosystem: github-actions
     directory: /
     schedule: { interval: weekly }
-    open-pull-requests-limit: 5
+    open-pull-requests-limit: 2
+    groups:
+      # One pull request for all of them. Ungrouped, the first week produced five separate PRs and
+      # five CI runs for what is one review decision — and a queue of runs is how a release
+      # rehearsal ends up waiting behind housekeeping.
+      actions:
+        patterns: ["*"]
 
   - package-ecosystem: docker
     directory: /
