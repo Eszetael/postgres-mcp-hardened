@@ -265,6 +265,17 @@ fn is_invisible(c: char) -> bool {
         // tokenizer is concerned.
         | '\u{FE00}'..='\u{FE0F}'
         | '\u{E0100}'..='\u{E01EF}'
+        // Characters that render as nothing without being FORMAT characters, so neither the Cf list
+        // above nor `is_whitespace` catches them. An independent review named these; a live
+        // PostgreSQL then showed none of them is an escape route — `setval\u{3164}` is simply a
+        // function that does not exist, and the database says so. They are refused anyway, because
+        // the claim we make is that a statement contains nothing a reader cannot see, and the
+        // reader we care about includes a person looking at the audit log.
+        | '\u{115F}' | '\u{1160}'   // Hangul choseong/jungseong fillers
+        | '\u{3164}'                // Hangul filler
+        | '\u{FFA0}'                // halfwidth Hangul filler
+        | '\u{2800}'                // braille pattern blank
+        | '\u{17B4}' | '\u{17B5}'   // Khmer inherent vowels, invisible in most fonts
     )
 }
 
@@ -1403,6 +1414,30 @@ mod tests {
                 "a hidden character disguised a write function: {sql:?}"
             );
         }
+    }
+
+    // From an independent review. None of these is an escape route — a live PostgreSQL refuses
+    // every one of them as an unknown function, because it resolves identifiers rather than
+    // appearances. They are refused here because our claim is about what a reader can see, and a
+    // character that renders as nothing defeats a person reading the audit log even when it defeats
+    // nobody else.
+    #[test]
+    fn characters_that_render_as_nothing_are_refused_even_when_they_are_not_format_characters() {
+        for sql in [
+            "SELECT setval\u{3164}('s', 1)", // Hangul filler, category Lo
+            "SELECT setval\u{115F}('s', 1)", // Hangul choseong filler
+            "SELECT setval\u{FFA0}('s', 1)", // halfwidth Hangul filler
+            "SELECT setval\u{2800}('s', 1)", // braille pattern blank
+        ] {
+            assert!(
+                validate_readonly(sql).is_err(),
+                "a character that renders as nothing was allowed: {sql:?}"
+            );
+        }
+        // Homoglyphs are NOT covered and deliberately so: a Cyrillic 'е' is visible, it is a
+        // different letter, and PostgreSQL resolves `sеtval` to nothing at all. Filtering by
+        // appearance is not a boundary; the database's own name resolution is.
+        assert!(validate_readonly("SELECT s\u{0435}tval('s', 1)").is_ok());
     }
 
     #[test]

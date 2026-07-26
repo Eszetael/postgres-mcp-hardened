@@ -1197,10 +1197,25 @@ static SECRET_CMP_KEY: Lazy<Vec<u8>> = Lazy::new(|| {
 /// The scope a tool call needs. Running SQL is a different privilege from reading the schema, and
 /// `security_posture` deliberately sits with the read tools: an operator investigating a deployment
 /// should not need the scope that lets them query it.
+/// Which scope a tool needs. Every tool is named; nothing falls through to a default.
+///
+/// It used to end `_ => "mcp:read"`, and a test asserted that an unknown name — literally
+/// `"anything_added_later"` — was fine with the weakest scope. That is comfortable right up to the
+/// first tool that is more than a read: it would inherit the mildest right in the system without
+/// anyone deciding that, and nothing would say so. An independent review flagged it.
+///
+/// Now the fallback is the strongest scope, so a tool nobody classified is reachable only by an
+/// admin, and `every_tool_has_a_scope_decision` fails the build until someone classifies it.
 pub(crate) fn required_scope(tool: &str) -> &'static str {
     match tool {
+        // Runs caller-supplied SQL.
         "query" | "explain_query" => "mcp:query",
-        _ => "mcp:read",
+        // Metadata about the database: schemas, tables, health, index and query statistics.
+        "list_tables" | "list_schemas" | "describe_table" | "database_health"
+        | "analyze_indexes" | "top_queries" => "mcp:read",
+        // Reports the privileges this server holds, which is reconnaissance in its own right.
+        "security_posture" => "mcp:read",
+        _ => "mcp:admin",
     }
 }
 
@@ -2238,9 +2253,27 @@ mod tests {
             "database_health",
             "analyze_indexes",
             "top_queries",
-            "anything_added_later",
         ] {
             assert_eq!(required_scope(read_only), "mcp:read", "{read_only}");
+        }
+        // A name nobody classified is an admin's problem, not a reader's.
+        assert_eq!(required_scope("anything_added_later"), "mcp:admin");
+    }
+
+    /// Reads the tool list the server actually publishes, so adding a tool without deciding what it
+    /// may cost fails here rather than shipping under whatever the fallback happens to be.
+    #[test]
+    fn every_tool_has_a_scope_decision() {
+        let listed = handle_tools_list();
+        let tools = listed["result"]["tools"].as_array().expect("tools array");
+        assert!(!tools.is_empty(), "the tool list must not be empty");
+        for t in tools {
+            let name = t["name"].as_str().expect("tool name");
+            assert_ne!(
+                required_scope(name),
+                "mcp:admin",
+                "tool {name:?} has no scope decision — add it to required_scope"
+            );
         }
     }
 
