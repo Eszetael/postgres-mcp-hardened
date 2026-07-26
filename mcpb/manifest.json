@@ -4,20 +4,33 @@
   "display_name": "PostgreSQL (read-only, hardened)",
   "version": "0.1.0",
   "description": "Read-only PostgreSQL MCP server in Rust: AST-enforced read-only queries plus database-level read-only transaction, per-session statement_timeout, schema inspection.",
-  "author": { "name": "<AUTHOR>" },
-  "repository": "<REPO_URL>",
-  "homepage": "<REPO_URL>",
+  "author": {
+    "name": "Eszetael",
+    "url": "https://github.com/Eszetael"
+  },
+  "repository": "https://github.com/Eszetael/postgres-mcp-hardened",
+  "homepage": "https://github.com/Eszetael/postgres-mcp-hardened",
   "license": "MIT",
-  "keywords": ["postgresql", "mcp", "read-only", "rust", "database"],
+  "keywords": [
+    "postgresql",
+    "mcp",
+    "read-only",
+    "rust",
+    "database"
+  ],
   "server": {
     "type": "binary",
     "entry_point": "bin/postgres-mcp-hardened",
     "mcp_config": {
       "command": "bin/postgres-mcp-hardened",
-      "args": ["--stdio"],
+      "args": [
+        "--stdio"
+      ],
       "env": {
         "DATABASE_URL": "${user_config.database_url}",
-        "MCP_MAX_COST": "${user_config.max_cost}"
+        "MCP_MAX_COST": "${user_config.max_cost}",
+        "MCP_CLIENT_ID": "${user_config.client_id}",
+        "MCP_REDACT_COLUMNS": "${user_config.redact_columns}"
       }
     }
   },
@@ -35,17 +48,61 @@
       "description": "Reject queries whose estimated planner cost exceeds this value.",
       "required": false,
       "default": 1000000
+    },
+    "client_id": {
+      "type": "string",
+      "title": "Name this client in the audit log",
+      "description": "Written into every audit record over stdio, e.g. claude-desktop@my-laptop. Without it the log identifies you by operating-system user and process id.",
+      "required": false
+    },
+    "redact_columns": {
+      "type": "string",
+      "title": "Columns to keep out of results",
+      "description": "Comma-separated, e.g. password,ssn. Defence in depth: values are masked and the columns cannot be referenced. The boundary is a database privilege — run --print-setup-sql for the statements that create it.",
+      "required": false
     }
   },
   "tools": [
-    { "name": "query", "description": "Execute a read-only SQL query" },
-    { "name": "list_schemas", "description": "List all schemas" },
-    { "name": "list_tables", "description": "List tables in a schema" },
-    { "name": "describe_table", "description": "Describe table columns" }
+    {
+      "name": "query",
+      "description": "Run SQL (read-only)"
+    },
+    {
+      "name": "list_schemas",
+      "description": "List schemas"
+    },
+    {
+      "name": "list_tables",
+      "description": "List tables in a schema"
+    },
+    {
+      "name": "describe_table",
+      "description": "Describe a table"
+    },
+    {
+      "name": "explain_query",
+      "description": "Explain one query"
+    },
+    {
+      "name": "database_health",
+      "description": "Health snapshot"
+    },
+    {
+      "name": "top_queries",
+      "description": "Slowest statements server-wide"
+    },
+    {
+      "name": "analyze_indexes",
+      "description": "Index findings"
+    }
   ],
   "tools_generated": false,
   "compatibility": {
     "claude_desktop": ">=1.0.0",
-    "platforms": ["darwin", "win32", "linux"]
+    "platforms": [
+      "darwin",
+      "win32",
+      "linux"
+    ]
   }
 }

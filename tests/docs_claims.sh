@@ -61,9 +61,31 @@ while read var; do
     [ -n "$var" ] && { printf "FAIL env var '%s' in README.md but missing in src/main.rs\n" "$var"; fail=1; }
 done < "$tmpdir/missing_in_source.txt"
 
+# CONTROL C: the package manifest is the shop window — a client shows its tool list before anyone
+# connects. It listed four of eight tools, with descriptions from an earlier version, because nothing
+# tied it to the source.
+# tool_def( calls span several lines, so match on the flattened text rather than line by line.
+tr '\n' ' ' < src/main.rs | grep -o 'tool_def( *"[a-z_]*"' | sed 's/.*"\([a-z_]*\)"/\1/' | sort -u > "$tmpdir/src_tools.txt"
+sed -n 's/.*"name": "\([a-z_]*\)".*/\1/p' mcpb/manifest.json | sort -u > "$tmpdir/manifest_tools.txt"
+comm -23 "$tmpdir/src_tools.txt" "$tmpdir/manifest_tools.txt" | while read -r t; do
+    [ -n "$t" ] && printf "FAIL tool '%s' exists in src/main.rs but is missing from mcpb/manifest.json\n" "$t"
+done
+if [ -n "$(comm -23 "$tmpdir/src_tools.txt" "$tmpdir/manifest_tools.txt")" ]; then fail=1; fi
+comm -13 "$tmpdir/src_tools.txt" "$tmpdir/manifest_tools.txt" | while read -r t; do
+    [ -n "$t" ] && printf "FAIL tool '%s' advertised in mcpb/manifest.json but not in src/main.rs\n" "$t"
+done
+if [ -n "$(comm -13 "$tmpdir/src_tools.txt" "$tmpdir/manifest_tools.txt")" ]; then fail=1; fi
+
+# A placeholder that reaches a published package is worse than a missing field: it looks filled in.
+if grep -q '<[A-Z_]*>' mcpb/manifest.json; then
+    printf "FAIL mcpb/manifest.json still contains a placeholder\n"
+    fail=1
+fi
+
 if [ "$fail" -eq 0 ]; then
     echo "PASS Control A: every 'verified' claim names a test that exists"
     echo "PASS Control B: the documented settings and the source agree"
+    echo "PASS Control C: the package manifest matches the tools that exist"
 fi
 
 exit "$fail"
