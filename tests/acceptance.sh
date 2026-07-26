@@ -233,7 +233,13 @@ for sql in "SELECT customers::text FROM customers" \
            "SELECT to_jsonb(c) ->> 'email' FROM customers c" \
            "SELECT to_jsonb(c) #>> '{email}' FROM customers c" \
            "SELECT jsonb_path_query(to_jsonb(c), '\$.email') FROM customers c" \
-           "SELECT md5(to_jsonb(c) ->> 'email') FROM customers c"; do
+           "SELECT md5(to_jsonb(c) ->> 'email') FROM customers c" \
+           "SELECT ROW(c.*)::text FROM customers c" \
+           "SELECT to_jsonb(c.*)::text FROM customers c" \
+           "SELECT row_to_json(customers.*)::text FROM customers" \
+           "SELECT j ->> E'\\145mail' FROM customers c" \
+           "SELECT x.c3 FROM (SELECT * FROM customers) AS x(c1,c2,c3)" \
+           "WITH x(c1,c2,c3) AS (SELECT * FROM customers) SELECT c3 FROM x"; do
   r=$(tool query "{\"sql\":\"$sql\"}" | body)
   case "$r" in ERROR:*) ok "redaction holds: ${sql:0:44}";; *) case "$r" in *example.com*) no "REDACTED VALUE LEAKED" "$sql -> $r";; *) ok "redaction holds: ${sql:0:44}";; esac;; esac
 done
@@ -248,6 +254,16 @@ r=$(tool describe_table '{"schema":"public","table":"customers"}' | body)
 echo "$r" | grep -q '"redacted":true' && ok "describe_table marks a redacted column while planning" || no "redaction invisible in describe_table" "$r"
 r=$(tool query '{"sql":"SELECT id FROM orders LIMIT 1"}' | body)
 case "$r" in *redactedColumns*) no "redactedColumns reported where nothing was masked" "$r";; *) ok "redactedColumns describes the result, not the configuration";; esac
+# Queries that must keep working while redaction is on — the refusals above are narrow on purpose.
+for sql in "SELECT id, name FROM customers" "SELECT * FROM customers" "SELECT count(*) FROM customers" \
+           "SELECT c.* FROM customers c" "SELECT o.id, c.name FROM orders o JOIN customers c ON c.id = o.customer_id"; do
+  r=$(tool query "{\"sql\":\"$sql\"}" | body)
+  case "$r" in ERROR:*) no "redaction refused an ordinary query" "$sql -> $r";; *) ok "still works under redaction: ${sql:0:36}";; esac
+done
+# Deliberately conservative: whole-row serialisation is refused even for a table with no sensitive
+# column, because the validator does not read the catalog and cannot know which table is which.
+r=$(tool query '{"sql":"SELECT to_jsonb(t) FROM orders t"}' | body)
+case "$r" in ERROR:*whole\ row*) ok "whole-row serialisation is refused everywhere while redaction is on";; *) no "conservative refusal missing" "$r";; esac
 stop
 
 section "Answers an agent can act on"

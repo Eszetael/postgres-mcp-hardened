@@ -141,6 +141,7 @@ pub(crate) async fn main() {
     }
     // Configuration is checked BEFORE we serve anyone — see `preflight_config`.
     preflight_config();
+    spawn_redaction_verification();
     if args.contains(&"--stdio".to_string()) {
         // stdio: run the synchronous loop on a blocking task so the runtime stays free
         tokio::task::spawn_blocking(run_stdio).await.unwrap();
@@ -156,6 +157,95 @@ pub(crate) async fn main() {
 /// three such cases: an unreadable HMAC key file made the audit quietly fall back to plain SHA-256;
 /// `MCP_RATE_RPM=-5` silently disabled rate limiting; an unparsable `JWT_PUBKEY_PEM` produced a
 /// server with "working" auth that nobody could ever authenticate against.
+/// Asks the database whether redaction is actually enforced, instead of trusting our own filtering.
+///
+/// Three adversarial rounds got past the syntactic checks, each time through a shape nobody had
+/// listed: a row cast to text, a qualified wildcard, a column name assembled from `chr(112)`, a
+/// positional alias list. Enumerating shapes is a race the SQL language wins. So the server stops
+/// asserting and goes and looks: for every configured database it reports which tables still let the
+/// connected role read a redacted column, with the statement that fixes it. `MCP_REDACT_REQUIRE_REVOKE=1`
+/// turns that report into a refusal to run — which is the only way this setting becomes a guarantee.
+///
+/// It runs in the background: connecting at startup would trade a lazy, diagnosable first connection
+/// for a server that will not start when the database is briefly unavailable.
+pub(crate) fn spawn_redaction_verification() {
+    if !validate::redaction_configured() {
+        return;
+    }
+    let strict = std::env::var("MCP_REDACT_REQUIRE_REVOKE").is_ok_and(|v| v == "1" || v == "true");
+    std::thread::spawn(move || {
+        // Per table, not per column: the fix has to be a table-level REVOKE followed by a GRANT of the
+        // columns that stay. A bare `REVOKE SELECT (password) ON staff` is silently a no-op while the
+        // role holds SELECT on the whole table — this server printed exactly that advice until an
+        // end-to-end test followed it and the value came straight back.
+        const SQL: &str = "SELECT current_user AS role, n.nspname AS schema, c.relname AS rel, \
+                    array_to_string(array_agg(a.attname ORDER BY a.attnum) \
+                                    FILTER (WHERE lower(a.attname) = ANY($1)), ', ') AS exposed, \
+                    array_to_string(array_agg(quote_ident(a.attname) ORDER BY a.attnum) \
+                                    FILTER (WHERE lower(a.attname) <> ALL($1)), ', ') AS keep \
+             FROM pg_attribute a \
+             JOIN pg_class c ON c.oid = a.attrelid \
+             JOIN pg_namespace n ON n.oid = c.relnamespace \
+             WHERE a.attnum > 0 AND NOT a.attisdropped \
+               AND c.relkind IN ('r', 'p', 'v', 'm', 'f') \
+               AND n.nspname NOT IN ('pg_catalog', 'information_schema') \
+               AND has_column_privilege(c.oid, a.attnum, 'SELECT') \
+             GROUP BY 1, 2, 3 \
+             HAVING count(*) FILTER (WHERE lower(a.attname) = ANY($1)) > 0 \
+             ORDER BY 2, 3 LIMIT 50";
+        let pats: Vec<String> = validate::redacted_column_list();
+        let mut exposed: Vec<String> = Vec::new();
+        for name in configured_databases() {
+            let Ok(v) = query_catalog(SQL, &[&pats], Some(&name)) else {
+                continue;
+            };
+            let empty = vec![];
+            for row in v.get("rows").and_then(|r| r.as_array()).unwrap_or(&empty) {
+                let get = |k: &str| {
+                    row.get(k)
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("")
+                        .to_string()
+                };
+                let (role, schema, rel) = (get("role"), get("schema"), get("rel"));
+                let keep = get("keep");
+                exposed.push(format!(
+                    "  -- {}.{} in database {} exposes: {}\n  REVOKE SELECT ON {}.{} FROM {};\n  GRANT SELECT ({}) ON {}.{} TO {};",
+                    schema, rel, name, get("exposed"),
+                    schema, rel, role,
+                    if keep.is_empty() { "/* no other readable columns — do not re-grant */".into() } else { keep },
+                    schema, rel, role
+                ));
+            }
+        }
+        if exposed.is_empty() {
+            eprintln!(
+                "MCP_REDACT_COLUMNS: verified against the database — the connected role cannot read \
+                 those columns anywhere. Redaction is enforced by PostgreSQL, not only by this server."
+            );
+            return;
+        }
+        eprintln!(
+            "WARNING: MCP_REDACT_COLUMNS is NOT enforced by the database. The role can still read these \
+             columns, so masking is cosmetic against a caller who writes SQL. Run:"
+        );
+        for line in &exposed {
+            eprintln!("{}", line);
+        }
+        if strict {
+            eprintln!(
+                "MCP_REDACT_REQUIRE_REVOKE=1 — refusing to serve until those privileges are revoked."
+            );
+            std::process::exit(2);
+        }
+        eprintln!(
+            "  -- note: with column-level grants PostgreSQL refuses `SELECT *` on that table, so \
+             callers must name columns; describe_table lists them and marks the redacted one."
+        );
+        eprintln!("(set MCP_REDACT_REQUIRE_REVOKE=1 to make this fatal instead of advisory)");
+    });
+}
+
 pub(crate) fn preflight_config() {
     let mut fatal: Vec<String> = Vec::new();
 
@@ -241,14 +331,6 @@ pub(crate) fn preflight_config() {
             "NOTE: MCP_BEARER_TOKEN is ignored because OAuth is configured — a valid JWT is required. \
              Accepting the shared token as an alternative would give its holder full scope and leave \
              the audit without an identity. Remove one of the two."
-        );
-    }
-
-    if validate::redaction_configured() {
-        eprintln!(
-            "NOTE: MCP_REDACT_COLUMNS is defence in depth, not a boundary — the database role can \
-             still read those columns. For a guarantee the server cannot undo, revoke the privilege: \
-             REVOKE SELECT (password) ON staff FROM your_mcp_role;"
         );
     }
 
@@ -1099,7 +1181,8 @@ pub(crate) fn handle_database_health(args: &Value) -> Value {
                     count(*) AS in_use_cluster_wide, \
                     (SELECT setting::int FROM pg_settings WHERE name = 'max_connections') AS max_connections, \
                     count(*) FILTER (WHERE datname = current_database() AND state = 'idle in transaction') AS idle_in_transaction, \
-                    count(*) FILTER (WHERE state IS NULL AND pid <> pg_backend_pid() AND backend_type = 'client backend') AS sessions_not_visible \
+                    count(*) FILTER (WHERE state IS NULL AND pid <> pg_backend_pid() \
+                                     AND (backend_type IS NULL OR backend_type = 'client backend')) AS backends_not_visible \
              FROM pg_stat_activity",
         ),
         (
@@ -1111,15 +1194,18 @@ pub(crate) fn handle_database_health(args: &Value) -> Value {
             "SELECT round(EXTRACT(epoch FROM max(now() - query_start) FILTER (WHERE state = 'active'))::numeric, 1) AS longest_active_query_seconds, \
                     round(EXTRACT(epoch FROM max(now() - xact_start))::numeric, 1) AS longest_transaction_seconds, \
                     round(EXTRACT(epoch FROM max(now() - state_change) FILTER (WHERE state = 'idle in transaction'))::numeric, 1) AS longest_idle_in_transaction_seconds, \
-                    CASE WHEN count(*) FILTER (WHERE state IS NULL AND pid <> pg_backend_pid() AND backend_type = 'client backend') > 0 \
-                         THEN 'this role cannot see other sessions (grant pg_read_all_stats or pg_monitor); \
-                               the figures above describe its own connections only, so a zero here does NOT mean the database is idle' \
+                    CASE WHEN count(*) FILTER (WHERE state IS NULL AND pid <> pg_backend_pid() \
+                                                AND (backend_type IS NULL OR backend_type = 'client backend')) > 0 \
+                         THEN 'this role cannot see other backends (grant pg_read_all_stats or pg_monitor); the count \
+                               includes PostgreSQL background processes, and the figures above describe only what this \
+                               role can see — a zero here does NOT mean the database is idle' \
                          END AS note \
              FROM pg_stat_activity WHERE datname = current_database()",
         ),
         (
             "vacuum_backlog",
-            "SELECT relname AS table_name, n_dead_tup AS dead_rows, n_live_tup AS live_rows, last_autovacuum \
+            "SELECT relname AS table_name, n_dead_tup AS dead_rows, n_live_tup AS live_rows, last_autovacuum, \
+                    count(*) OVER () AS matching_total \
              FROM pg_stat_user_tables WHERE n_dead_tup > 1000 AND has_table_privilege(relid, 'SELECT') \
              ORDER BY n_dead_tup DESC LIMIT 10",
         ),
@@ -1132,7 +1218,8 @@ pub(crate) fn handle_database_health(args: &Value) -> Value {
         (
             "sequences_near_limit",
             "SELECT schemaname || '.' || sequencename AS sequence, last_value, max_value, \
-                    round(100.0 * last_value / NULLIF(max_value, 0), 2) AS pct_used \
+                    round(100.0 * last_value / NULLIF(max_value, 0), 2) AS pct_used, \
+                    count(*) OVER () AS matching_total \
              FROM pg_sequences WHERE last_value IS NOT NULL \
                AND 100.0 * last_value / NULLIF(max_value, 0) > 50 ORDER BY 4 DESC LIMIT 10",
         ),
@@ -1158,7 +1245,7 @@ pub(crate) fn handle_database_health(args: &Value) -> Value {
             "tables_never_analyzed",
             "SELECT relname AS table_name, n_live_tup AS estimated_rows, \
                     pg_size_pretty(pg_relation_size(relid)) AS size, \
-                    count(*) OVER () AS tables_in_this_state \
+                    count(*) OVER () AS matching_total \
              FROM pg_stat_user_tables \
              WHERE has_table_privilege(relid, 'SELECT') \
                AND last_analyze IS NULL AND last_autoanalyze IS NULL \
@@ -1210,7 +1297,7 @@ pub(crate) fn handle_top_queries(args: &Value) -> Value {
         .unwrap_or(10)
         .min(50) as i64;
     let sql = format!(
-        "SELECT calls, round(total_exec_time::numeric, 1) AS total_ms,                 round(mean_exec_time::numeric, 2) AS mean_ms, rows,                 left(query, 300) AS query          FROM pg_stat_statements ORDER BY total_exec_time DESC LIMIT {}",
+        "SELECT calls, round(total_exec_time::numeric, 1) AS total_ms,                 round(mean_exec_time::numeric, 2) AS mean_ms, rows,                 left(query, 300) AS query, count(*) OVER () AS matching_total          FROM pg_stat_statements ORDER BY total_exec_time DESC LIMIT {}",
         limit
     );
     match query_catalog(&sql, &[], db) {
@@ -1249,9 +1336,21 @@ pub(crate) fn handle_analyze_indexes(args: &Value) -> Value {
         .get("schema")
         .and_then(|v| v.as_str())
         .unwrap_or("public");
+    // `supports_foreign_key` is the context that decides whether "unused" means "droppable".
+    // idx_scan does not count the lookups a foreign-key check performs, so an index backing an FK can
+    // sit at zero scans for the life of the database and still be the only thing keeping DELETE on the
+    // parent table off a sequential scan. Without this the tool named indexes it was not safe to drop.
+    //
+    // `matching_total` exists because the list is capped at 20: a caller asking "which indexes are
+    // unused" was handed 20 of 29 with nothing to indicate the rest — the same silent truncation this
+    // server refuses to commit anywhere else.
     const UNUSED: &str =
         "SELECT s.relname AS table_name, s.indexrelname AS index_name, s.idx_scan AS scans, \
-                pg_size_pretty(pg_relation_size(s.indexrelid)) AS size \
+                pg_size_pretty(pg_relation_size(s.indexrelid)) AS size, \
+                EXISTS (SELECT 1 FROM pg_constraint con \
+                         WHERE con.contype = 'f' AND con.conrelid = s.relid \
+                           AND con.conkey[1] = i.indkey[0]) AS supports_foreign_key, \
+                count(*) OVER () AS matching_total \
          FROM pg_stat_user_indexes s JOIN pg_index i ON i.indexrelid = s.indexrelid \
          WHERE s.schemaname = $1 AND s.idx_scan = 0 AND NOT i.indisprimary AND NOT i.indisunique \
            AND has_table_privilege(s.relid, 'SELECT') \
@@ -1276,7 +1375,7 @@ pub(crate) fn handle_analyze_indexes(args: &Value) -> Value {
                 array_to_string(array_agg(c.relname || CASE WHEN i.indisunique THEN ' [unique — keep this one]' ELSE '' END \
                                           ORDER BY i.indisunique DESC, c.relname), ', ') AS duplicate_indexes, \
                 count(*) FILTER (WHERE i.indisunique) AS unique_in_group, \
-                pg_size_pretty(sum(pg_relation_size(c.oid))) AS combined_size \
+                pg_size_pretty(sum(pg_relation_size(c.oid))) AS combined_size, count(*) OVER () AS matching_total \
          FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid JOIN pg_class t ON t.oid = i.indrelid \
               JOIN pg_namespace n ON n.oid = t.relnamespace \
          WHERE n.nspname = $1 AND has_table_privilege(i.indrelid, 'SELECT') \
@@ -1287,10 +1386,14 @@ pub(crate) fn handle_analyze_indexes(args: &Value) -> Value {
          HAVING count(*) > 1 ORDER BY sum(pg_relation_size(c.oid)) DESC LIMIT 20";
     const SEQ_SCANS: &str =
         "SELECT relname AS table_name, seq_scan, idx_scan, n_live_tup AS rows, \
-                pg_size_pretty(pg_relation_size(relid)) AS size \
+                pg_size_pretty(pg_relation_size(relid)) AS size, count(*) OVER () AS matching_total \
          FROM pg_stat_user_tables WHERE schemaname = $1 AND seq_scan > COALESCE(idx_scan, 0) \
            AND n_live_tup > 10000 AND has_table_privilege(relid, 'SELECT') \
          ORDER BY seq_scan DESC LIMIT 10";
+    if let Some(e) = schema_missing(schema, db) {
+        audit("analyze_indexes", "error", None);
+        return e;
+    }
     let mut out = serde_json::Map::new();
     for (name, sql) in [
         ("unused_indexes", UNUSED),

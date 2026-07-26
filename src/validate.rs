@@ -2,7 +2,8 @@
 //! We trust the AST (sqlparser), not regexes: comments and obfuscation disappear when the tree is built.
 use once_cell::sync::Lazy;
 use sqlparser::ast::{
-    Expr, ObjectName, Query, SelectItem, SetExpr, Statement, TableFactor, Value, Visit, Visitor,
+    Expr, FunctionArg, FunctionArgExpr, FunctionArguments, ObjectName, Query, SelectItem, SetExpr,
+    Statement, TableAlias, TableFactor, Value, Visit, Visitor,
 };
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
@@ -115,6 +116,7 @@ pub fn validate_readonly(sql: &str) -> Result<(), ValidationError> {
     let mut scanner = SecurityScanner {
         hit: None,
         redacted: None,
+        redaction_on: !row_refs.is_empty() || redaction_configured(),
         row_refs,
         evasion: None,
     };
@@ -220,10 +222,33 @@ struct SecurityScanner {
     /// Table names and aliases in this statement, lower-cased. Only collected when redaction is on.
     row_refs: std::collections::HashSet<String>,
     evasion: Option<String>,
+    redaction_on: bool,
+}
+
+/// A column alias list renames columns BY POSITION, so `(SELECT * FROM staff) AS x(c1, …, c9, …)`
+/// hands back the ninth column under the name `c9`. The redacted name never appears in the statement
+/// and never appears as a key in the result, so neither the reference check nor the masking has
+/// anything to match. Refused while redaction is configured — there is no way to tell which position
+/// is which without the catalog, and guessing wrong here means handing over the secret.
+fn alias_renames_columns(alias: Option<&TableAlias>) -> bool {
+    alias.is_some_and(|a| !a.columns.is_empty())
 }
 impl Visitor for SecurityScanner {
     type Break = ();
     fn pre_visit_query(&mut self, q: &Query) -> ControlFlow<()> {
+        if self.redaction_on {
+            if let Some(w) = &q.with {
+                for cte in &w.cte_tables {
+                    if !cte.alias.columns.is_empty() {
+                        self.evasion = Some(format!(
+                            "renaming columns by position in the CTE `{}`",
+                            cte.alias.name
+                        ));
+                        return ControlFlow::Break(());
+                    }
+                }
+            }
+        }
         // FOR UPDATE/SHARE and data-modifying CTE / SELECT INTO at any depth.
         if !q.locks.is_empty() {
             self.hit = Some("row locks (FOR UPDATE/SHARE) in subquery".into());
@@ -259,11 +284,22 @@ impl Visitor for SecurityScanner {
                     return ControlFlow::Break(());
                 }
             }
+            // `t.*` inside an expression is a QualifiedWildcard, not an Identifier, so the whole-row
+            // check above walked straight past `ROW(t.*)::text` and `to_jsonb(t.*)::text`. In a plain
+            // projection `SELECT t.*` the columns keep their names and masking still applies, and that
+            // form is a SelectItem, not an Expr — so it is unaffected by this.
             // The column name as a STRING, not an identifier: `to_jsonb(t) ->> 'password'`,
             // `#>> '{password}'`, `jsonb_path_query(…, '$.password')`. The scanner matches
             // identifiers, so none of these looked like a reference to anything.
-            Expr::Value(Value::SingleQuotedString(s)) => {
-                if let Some(col) = redacted_name_inside(&s.to_lowercase()) {
+            // Every spelling of a string literal, not just the plain one: `E'\\160assword'`,
+            // `$$password$$` and the national/unicode forms all name the same key.
+            Expr::Value(
+                Value::SingleQuotedString(s)
+                | Value::EscapedStringLiteral(s)
+                | Value::NationalStringLiteral(s)
+                | Value::DoubleQuotedString(s),
+            ) => {
+                if let Some(col) = redacted_name_inside(&unescape_sql_literal(s).to_lowercase()) {
                     self.evasion = Some(format!(
                         "naming the redacted column `{}` inside a string literal",
                         col
@@ -282,6 +318,34 @@ impl Visitor for SecurityScanner {
             _ => {}
         }
         if let Expr::Function(f) = expr {
+            // `t.*` as a function argument is a FunctionArgExpr, not an Expr, so the whole-row check
+            // never saw `ROW(t.*)::text` or `to_jsonb(t.*)::text` — both of which flatten the record
+            // into one string and carry the redacted column out inside it. In a plain projection
+            // (`SELECT t.*`) the columns keep their names and masking still applies; that is a
+            // SelectItem, not a function argument, so it is unaffected.
+            if self.redaction_on {
+                let args = match &f.args {
+                    FunctionArguments::List(l) => l.args.as_slice(),
+                    _ => &[],
+                };
+                let whole_row = args.iter().any(|a| {
+                    matches!(
+                        a,
+                        FunctionArg::Unnamed(FunctionArgExpr::QualifiedWildcard(_))
+                            | FunctionArg::Unnamed(FunctionArgExpr::Wildcard)
+                            | FunctionArg::Named {
+                                arg: FunctionArgExpr::QualifiedWildcard(_),
+                                ..
+                            }
+                    )
+                });
+                if whole_row && !f.name.0.last().is_some_and(|n| n.value.eq_ignore_ascii_case("count"))
+                {
+                    self.evasion =
+                        Some("serialising a whole row through a wildcard argument".into());
+                    return ControlFlow::Break(());
+                }
+            }
             if let Some(last) = f.name.0.last() {
                 let name = last.value.to_lowercase();
                 if let Some(msg) = function_rejection(&name) {
@@ -310,6 +374,19 @@ impl Visitor for SecurityScanner {
     /// Full classification applies here, including the default denial for unknown catalog functions;
     /// otherwise `SELECT * FROM pg_export_snapshot()` would walk straight past the gate.
     fn pre_visit_table_factor(&mut self, tf: &TableFactor) -> ControlFlow<()> {
+        if self.redaction_on {
+            let alias = match tf {
+                TableFactor::Table { alias, .. }
+                | TableFactor::Derived { alias, .. }
+                | TableFactor::TableFunction { alias, .. }
+                | TableFactor::NestedJoin { alias, .. } => alias.as_ref(),
+                _ => None,
+            };
+            if alias_renames_columns(alias) {
+                self.evasion = Some("renaming columns by position in a subquery alias".into());
+                return ControlFlow::Break(());
+            }
+        }
         if let TableFactor::Table {
             name,
             args: Some(_),
@@ -540,6 +617,11 @@ impl Visitor for RowRefCollector {
     }
 }
 
+/// The configured column names, for a check that asks the database rather than the parser.
+pub(crate) fn redacted_column_list() -> Vec<String> {
+    redacted_names().to_vec()
+}
+
 pub(crate) fn redaction_configured() -> bool {
     !redacted_names().is_empty()
 }
@@ -557,6 +639,44 @@ fn redacted_names() -> &'static [String] {
             .unwrap_or_default()
     });
     &R
+}
+
+/// Resolves the escape sequences PostgreSQL accepts in `E'…'`, so a name spelled `E'\\160assword'`
+/// is compared as `password`. Only the octal and hex forms are decoded — enough for the ways an
+/// adversary actually wrote it, and this layer is best-effort by design: the guarantee comes from the
+/// privilege check, not from out-guessing string construction.
+fn unescape_sql_literal(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let b: Vec<char> = s.chars().collect();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == '\\' && i + 1 < b.len() {
+            let rest: String = b[i + 1..].iter().take(3).collect();
+            if b[i + 1] == 'x' {
+                let hex: String = rest.chars().skip(1).take(2).filter(|c| c.is_ascii_hexdigit()).collect();
+                if let Ok(n) = u32::from_str_radix(&hex, 16) {
+                    if let Some(c) = char::from_u32(n) {
+                        out.push(c);
+                        i += 2 + hex.len();
+                        continue;
+                    }
+                }
+            }
+            let oct: String = rest.chars().take_while(|c| ('0'..='7').contains(c)).collect();
+            if !oct.is_empty() {
+                if let Ok(n) = u32::from_str_radix(&oct, 8) {
+                    if let Some(c) = char::from_u32(n) {
+                        out.push(c);
+                        i += 1 + oct.len();
+                        continue;
+                    }
+                }
+            }
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    out
 }
 
 /// A redacted column name appearing anywhere inside a string literal. Substring, not equality:

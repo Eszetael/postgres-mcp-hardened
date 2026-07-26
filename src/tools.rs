@@ -27,7 +27,7 @@ pub(crate) fn handle_list_schemas(args: &Value) -> Value {
 /// `describe_table` already refuses a missing table by name; these two returned a complete, reassuring
 /// structure for `publik` instead — and an agent that has learned to trust the errors takes that as
 /// "nothing to report".
-fn schema_missing(schema: &str, db: Option<&str>) -> Option<Value> {
+pub(crate) fn schema_missing(schema: &str, db: Option<&str>) -> Option<Value> {
     match query_catalog(
         "SELECT nspname FROM pg_namespace WHERE nspname = $1",
         &[&schema],

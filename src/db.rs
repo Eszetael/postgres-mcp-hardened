@@ -213,6 +213,14 @@ pub(crate) fn build_pool(url: &str) -> Result<PgPool, String> {
         .build_unchecked(mgr))
 }
 
+/// Names of the configured databases, for checks that have to run against each of them.
+pub(crate) fn configured_databases() -> Vec<String> {
+    match PG_POOLS.as_ref() {
+        Ok(pools) => pools.iter().map(|(k, _)| k.clone()).collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
 /// The pool for a request. `None` picks the only configured database, or reports the choices.
 pub(crate) fn pool_for(name: Option<&str>) -> Result<&'static PgPool, String> {
     let pools = PG_POOLS.as_ref().map_err(|e| e.clone())?;

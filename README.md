@@ -253,10 +253,18 @@ offered, plus column comments, primary keys and **foreign keys** in the payload.
   it that an adversarial panel actually found — renaming (`SELECT password AS pw`), wrapping
   (`md5(password)`), serialising the whole row (`row_to_json(t)`, `t::text`, `json_agg(t)`), and
   naming the column as a string rather than an identifier (`to_jsonb(t) ->> 'password'`,
-  `#>> '{password}'`, `$.password`). It is still name-based filtering, and name-based filtering
-  cannot be a boundary against the whole SQL language. **The boundary is a privilege the role does
-  not have:** `REVOKE SELECT (password) ON staff FROM your_mcp_role;`. The server says this at
-  startup rather than letting the setting imply a guarantee it cannot keep.
+  `#>> '{password}'`, `$.password`), whole-row wildcards (`ROW(t.*)::text`) and positional renaming
+  (`(SELECT * FROM staff) AS x(c1, …, c9)`). It is still name-based filtering, and name-based
+  filtering cannot be a boundary against the whole SQL language — three adversarial rounds each got
+  past it through a shape nobody had listed.
+
+  So the server stops asserting and **asks the database**: at startup it reports every table where
+  the connected role can still read a redacted column, with the exact statements that fix it, and
+  `MCP_REDACT_REQUIRE_REVOKE=1` turns that report into a refusal to run. Note the fix is a table-level
+  `REVOKE` followed by a `GRANT` of the columns that stay — a bare `REVOKE SELECT (password) ON staff`
+  is silently a no-op while the role holds SELECT on the whole table. With column-level grants
+  PostgreSQL then refuses `SELECT *` on that table, so callers name columns instead; `describe_table`
+  lists them and marks the redacted one.
 - **Prompt-injection aware:** row data is returned inside a `trusted="false"` provenance block with delimiters escaped, so a malicious cell can't hijack the agent.
 - **No schema leaks:** database errors are mapped to structured, actionable messages that never echo table/column names.
 - **OAuth 2.1:** optional RS256 bearer-token validation (signature, `exp`, `aud`, `iss`) with scope enforcement; disabled when unconfigured for local/self-host use.
@@ -307,6 +315,7 @@ left resident memory flat and file descriptors unchanged.
 | `MCP_RATE_RPM` | per-client request rate limit (default 120/min; `0` disables) |
 | `MCP_RATE_BURST` | burst allowance for that limit (default `MCP_RATE_RPM / 4`, min 5) |
 | `MCP_METRICS_TOKEN` | token required on `/metrics`. Without it, `/metrics` follows whatever the server itself requires: open when the server has no authentication, the bearer token when one is set, and closed when OAuth is configured (a JWT is the wrong shape for a scraper — set this instead) |
+| `MCP_REDACT_REQUIRE_REVOKE` | `1` to refuse to serve while the database still lets the role read a redacted column — turns the setting above from advisory into a guarantee |
 | `MCP_STRUCTURED_CONTENT` | `1` to also return MCP `structuredContent`; off by default because a client that ignores it pays for every result twice. The provenance marker travels inside the object, but the delimiter escaping that protects the text block does not apply — a client that pastes structured output straight into a prompt loses that layer |
 | `MCP_RESERVED_AUTH_SLOTS` | database slots kept for authenticated traffic so an anonymous flood cannot take the pool (default: a quarter) |
 | `MCP_PUBLIC_URL` | this server's public base URL, used in the OAuth discovery metadata |

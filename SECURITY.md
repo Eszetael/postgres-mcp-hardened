@@ -81,6 +81,21 @@ database enforces:
 REVOKE SELECT (password) ON staff FROM your_mcp_role;
 ```
 
+**That statement alone does nothing while the role holds SELECT on the whole table** — PostgreSQL
+treats the table-level grant as covering every column, so the column-level REVOKE is silently a
+no-op. This server printed exactly that advice until an end-to-end test followed it and the value
+came straight back. The working form is:
+
+```sql
+REVOKE SELECT ON staff FROM your_mcp_role;
+GRANT SELECT (staff_id, first_name, last_name, ...) ON staff TO your_mcp_role;
+```
+
+At startup the server generates these statements for your schema, naming every table where the role
+can still read a redacted column. `MCP_REDACT_REQUIRE_REVOKE=1` makes it refuse to serve until they
+have been run. With column-level grants PostgreSQL refuses `SELECT *` on that table, so callers must
+name columns — `describe_table` lists them and marks the redacted one.
+
 With that in place a bypass returns a permission error instead of a secret, and the setting above
 becomes what it should be: a second layer, and a clear signal of intent to whoever reads the config.
 
