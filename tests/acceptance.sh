@@ -363,6 +363,13 @@ stop
 head -1 "$AUD" | grep -q '"decision":"startup"' && ok "the chain opens with what the server is" || no "no startup entry" "$(head -1 "$AUD")"
 head -1 "$AUD" | grep -q '"MCP_RATE_RPM":"42"' && ok "the settings in force are recorded" || no "settings not recorded" ""
 grep -q "$PGPW" "$AUD" && no "THE DATABASE PASSWORD IS IN THE AUDIT LOG" "" || ok "the connection password never reaches the log"
+# libpq accepts two spellings of a connection string and this server supports both; only one of them
+# was being redacted, so `host=… password=… ` went into the log in clear text.
+KWAUD=/tmp/acc_kw_$$.log; rm -f "$KWAUD"
+env DATABASE_URL="host=127.0.0.1 port=$PGPORT_ACC user=postgres password=$PGPW dbname=postgres" \
+    MCP_AUDIT_LOG="$KWAUD" MCP_ADDR="127.0.0.1:$((PORT+40))" timeout 4 "$BIN" >/dev/null 2>&1
+grep -q "$PGPW" "$KWAUD" && no "THE PASSWORD LEAKED IN THE KEYWORD FORM" "" || ok "the keyword form of a connection string is redacted too"
+rm -f "$KWAUD"
 grep -q 'acc_secret_token' "$AUD" && no "THE BEARER TOKEN IS IN THE AUDIT LOG" "" || ok "the shared token is fingerprinted, not written"
 "$BIN" --verify-audit "$AUD" >/dev/null 2>&1 && ok "the chain still verifies with the new fields" || no "chain broken by extra fields" ""
 rm -f "$AUD"
@@ -521,6 +528,8 @@ CREATE TABLE salaries (person text, amount numeric);
 INSERT INTO salaries VALUES ('ada', 100);
 CREATE VIEW customer_view AS SELECT id FROM customers;
 CREATE VIEW salary_view AS SELECT person FROM salaries;
+CREATE FUNCTION acc_hidden_ssn() RETURNS text LANGUAGE plpgsql AS $fn$ BEGIN RETURN (SELECT person FROM salaries LIMIT 1); END $fn$;
+CREATE FUNCTION acc_definer_leak() RETURNS SETOF salaries LANGUAGE sql SECURITY DEFINER AS $fn$ SELECT * FROM salaries $fn$;
 SQL
 start DATABASE_URL="$URL" MCP_ALLOW_TABLES="public.customers,public.events"
 r=$(tool query '{"sql":"SELECT id FROM customers LIMIT 1"}' | body)
@@ -546,6 +555,21 @@ r=$(tool query '{"sql":"SELECT * FROM events"}' | body)
 case "$r" in ERROR:*) no "a partitioned table was refused" "$r";; *) ok "a partition is covered by its parent";; esac
 r=$(tool query '{"sql":"SELECT * FROM pg_stat_activity"}' | body)
 case "$r" in *"outside the configured surface"*) ok "the catalog is outside the surface by default";; *) no "pg_catalog reachable under an allowlist" "$r";; esac
+# A function body is invisible to the planner: `SELECT f()` plans to a bare Result node while the
+# body reads whatever it likes. With SECURITY DEFINER it reads it as the owner, defeating the role
+# privileges this project calls the real boundary. Both demonstrated in review; both refused now.
+r=$(tool query '{"sql":"SELECT public.acc_hidden_ssn()"}' | body)
+case "$r" in *"cannot see inside"*) ok "a function the planner cannot see into is refused";; *) no "FUNCTION READ OUTSIDE THE SURFACE" "$r";; esac
+r=$(tool query '{"sql":"SELECT * FROM public.acc_definer_leak()"}' | body)
+case "$r" in *"cannot see inside"*) ok "a SECURITY DEFINER function is refused";; *) no "SECURITY DEFINER BYPASSED THE SURFACE" "$r";; esac
+r=$(tool query '{"sql":"SELECT upper(name) FROM customers LIMIT 1"}' | body)
+case "$r" in ERROR:*) no "a built-in function was refused" "$r";; *) ok "built-in functions still work";; esac
+# EXPLAIN skips the cost guard, and the surface check used to live only inside it — so the plan of a
+# query against an unlisted table came back with its columns, filters and row estimates.
+r=$(tool query '{"sql":"EXPLAIN VERBOSE SELECT person FROM salaries"}' | body)
+case "$r" in *"outside the configured surface"*) ok "EXPLAIN cannot describe a table off the list";; *) no "EXPLAIN LEAKED AN UNLISTED TABLE" "$r";; esac
+r=$(tool query '{"sql":"EXPLAIN SELECT id FROM customers"}' | body)
+case "$r" in ERROR:*) no "EXPLAIN on a listed table was refused" "$r";; *) ok "EXPLAIN on a listed table still works";; esac
 # Schema tools run fixed queries, not caller SQL, so they keep working.
 r=$(tool list_tables '{"schema":"public"}' | body)
 case "$r" in ERROR:*) no "schema introspection broke under the allowlist" "$r";; *) ok "schema introspection is unaffected";; esac

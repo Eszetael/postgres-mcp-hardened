@@ -397,7 +397,10 @@ fn config_snapshot() -> serde_json::Map<String, Value> {
                 "sha256:{}",
                 &hmac_sha256_hex(b"mcp-config-fingerprint".to_vec(), raw.as_bytes())[..8]
             )
-        } else if raw.contains("://") {
+        } else if raw.contains("://") || raw.contains("password=") {
+            // The test for a connection string was "does it contain ://", which is one of the two
+            // spellings libpq accepts and this server supports. The other, `host=… password=… `,
+            // went into the audit log verbatim.
             strip_password(&raw)
         } else if raw.len() > 120 {
             format!("<{} bytes>", raw.len())
@@ -411,6 +414,22 @@ fn config_snapshot() -> serde_json::Map<String, Value> {
 
 /// Removes the password from a connection string, keeping the shape an operator recognises.
 fn strip_password(url: &str) -> String {
+    // libpq accepts two spellings and this server supports both. Only the URL form was being
+    // redacted, so `host=... password=secret dbname=...` went into the audit log — and into whatever
+    // collects it — in clear text, under a comment promising the opposite.
+    if !url.contains("://") && url.contains("password=") {
+        let mut out = String::with_capacity(url.len());
+        for (i, tok) in url.split_whitespace().enumerate() {
+            if i > 0 {
+                out.push(' ');
+            }
+            match tok.split_once('=') {
+                Some((k, _)) if k.eq_ignore_ascii_case("password") => out.push_str("password=***"),
+                _ => out.push_str(tok),
+            }
+        }
+        return out;
+    }
     let mut out = String::with_capacity(url.len());
     for part in url.split(';') {
         if !out.is_empty() {
@@ -1951,6 +1970,28 @@ pub(crate) fn handle_query_tool(args: &Value) -> Value {
 
     // cost guard only for queries EXPLAIN can plan (SELECT/WITH/VALUES/TABLE); EXPLAIN/SHOW are
     // skipped (you cannot EXPLAIN an EXPLAIN — statement_timeout is the backstop there).
+    // EXPLAIN skips the cost guard (you cannot plan a plan), and the surface check lived inside it —
+    // so `EXPLAIN VERBOSE SELECT ... FROM elsewhere` reported the table's existence, its columns, the
+    // filter and the planner's row estimates, all from outside the configured surface. Row estimates
+    // are an oracle: repeated with different constants they leak values, without ever running.
+    if surface::active() && !is_row_query(&final_sql) {
+        if let Some(inner) = validate::explained_statement(&final_sql) {
+            let max_cost = f64::MAX; // the surface is the question here, not the cost
+            match cost_guard(&inner, max_cost, db) {
+                Ok(()) => {}
+                Err(CostErr::OutsideSurface(e)) => {
+                    audit("query", "denied_surface", Some(sql));
+                    METRICS.denied_validation.fetch_add(1, Ordering::Relaxed);
+                    return json!({ "error": { "code": -32602, "message": e } });
+                }
+                // A plan we cannot obtain is not permission to proceed.
+                Err(CostErr::QueryError(e)) | Err(CostErr::TooExpensive(e)) => {
+                    audit("query", "error", Some(sql));
+                    return json!({ "error": { "code": -32000, "message": e } });
+                }
+            }
+        }
+    }
     if is_row_query(&final_sql) {
         let max_cost: f64 = std::env::var("MCP_MAX_COST")
             .ok()

@@ -396,6 +396,50 @@ pub(crate) fn cost_guard(sql: &str, max_cost: f64, db: Option<&str>) -> Result<(
     // has already resolved aliases, applied search_path, expanded views and distinguished a CTE from
     // the table it shadows. Reading the statement instead is what lost three rounds.
     if surface::active() {
+        // Functions first, because a plan cannot answer for them. A function body is opaque to the
+        // planner, so `SELECT secret_lookup('x')` plans to a bare Result node and reads whatever it
+        // likes; with SECURITY DEFINER it reads it with the owner's privileges, defeating the role
+        // boundary this project calls the real one. While a surface is configured, a call to
+        // anything outside pg_catalog is refused unless the operator named it in MCP_ALLOW_FUNCTIONS.
+        let called = crate::validate::functions_called(sql);
+        if !called.is_empty() {
+            let v = query_catalog(
+                "SELECT p.proname AS name, n.nspname AS schema, p.prosecdef AS definer \
+                 FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace \
+                 WHERE lower(p.proname) = ANY($1) AND n.nspname <> 'pg_catalog'",
+                &[&called],
+                db,
+            )
+            .map_err(CostErr::QueryError)?;
+            let empty = vec![];
+            let rows = v.get("rows").and_then(|r| r.as_array()).unwrap_or(&empty);
+            let offenders: Vec<String> = rows
+                .iter()
+                .filter_map(|r| {
+                    let n = r.get("name")?.as_str()?;
+                    if crate::validate::function_explicitly_allowed(n) {
+                        return None;
+                    }
+                    let s = r.get("schema")?.as_str()?;
+                    let definer = r.get("definer").and_then(|d| d.as_bool()).unwrap_or(false);
+                    Some(format!(
+                        "{}.{}{}",
+                        s,
+                        n,
+                        if definer { " (SECURITY DEFINER)" } else { "" }
+                    ))
+                })
+                .collect();
+            if !offenders.is_empty() {
+                return Err(CostErr::OutsideSurface(format!(
+                    "calls a function this server cannot see inside: {}. While a surface allowlist is \
+                     configured, only built-in functions are permitted — a function body reads whatever \
+                     it likes, and the query plan does not show it. Add it to MCP_ALLOW_FUNCTIONS if \
+                     you have read it and it stays within the surface",
+                    offenders.join(", ")
+                )));
+            }
+        }
         let found = surface::relations_in_plan(&plan);
         let parents = |s: &str, r: &str| -> Option<(String, String)> {
             let v = query_catalog(

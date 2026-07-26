@@ -593,6 +593,103 @@ fn is_known_read(name: &str) -> bool {
 
 /// Columns the operator declared sensitive (`MCP_REDACT_COLUMNS`). Values are masked in results,
 /// and — because renaming would defeat masking — the column may not be referenced at all.
+/// Whether the operator named this function in `MCP_ALLOW_FUNCTIONS`.
+pub(crate) fn function_explicitly_allowed(name: &str) -> bool {
+    std::env::var("MCP_ALLOW_FUNCTIONS")
+        .map(|v| {
+            v.split(',')
+                .map(str::trim)
+                .any(|a| a.eq_ignore_ascii_case(name))
+        })
+        .unwrap_or(false)
+}
+
+/// Every function called in the statement, lower-cased and unqualified.
+///
+/// The surface allowlist reads the query plan, and a plan does not show what a function's body
+/// reads: `SELECT secret_lookup('x')` plans to a bare `Result` node. A review demonstrated the
+/// consequence — a `SECURITY DEFINER` function returned an entire table the role had been explicitly
+/// denied. The plan is the right authority for relations and no authority at all for functions.
+#[derive(Default)]
+struct FunctionCollector {
+    names: Vec<String>,
+}
+impl Visitor for FunctionCollector {
+    type Break = ();
+    fn pre_visit_expr(&mut self, expr: &Expr) -> ControlFlow<()> {
+        if let Expr::Function(f) = expr {
+            if let Some(last) = f.name.0.last() {
+                self.names.push(last.value.to_lowercase());
+            }
+        }
+        ControlFlow::Continue(())
+    }
+    fn pre_visit_table_factor(&mut self, tf: &TableFactor) -> ControlFlow<()> {
+        if let TableFactor::Table {
+            name,
+            args: Some(_),
+            ..
+        } = tf
+        {
+            if let Some(last) = name.0.last() {
+                self.names.push(last.value.to_lowercase());
+            }
+        }
+        ControlFlow::Continue(())
+    }
+}
+
+/// The functions a statement calls. Empty when it calls none.
+pub(crate) fn functions_called(sql: &str) -> Vec<String> {
+    let Ok(ast) = parse(sql) else {
+        return Vec::new();
+    };
+    let Some(stmt) = ast.first() else {
+        return Vec::new();
+    };
+    let mut c = FunctionCollector::default();
+    let _ = stmt.visit(&mut c);
+    c.names.sort();
+    c.names.dedup();
+    c.names
+}
+
+/// Strips a leading EXPLAIN, returning the statement it would explain.
+///
+/// `EXPLAIN` skips the cost guard — you cannot plan a plan — and the surface check lived inside it,
+/// so `EXPLAIN VERBOSE SELECT ... FROM secret` reported the table's existence, its column names, the
+/// filter and the planner's row estimates, all from outside the configured surface.
+pub(crate) fn explained_statement(sql: &str) -> Option<String> {
+    let t = sql.trim_start();
+    // `!t.len() >= 7` compiles — it negates the length bitwise and compares a huge number — so the
+    // guard was always true and this returned None for every input, silently disabling the check.
+    if t.len() < 7 || !t[..7].eq_ignore_ascii_case("explain") {
+        return None;
+    }
+    let rest = t[7..].trim_start();
+    // `EXPLAIN (opts) stmt` as well as the legacy `EXPLAIN VERBOSE stmt`.
+    let rest = if let Some(stripped) = rest.strip_prefix('(') {
+        let close = stripped.find(')')?;
+        stripped[close + 1..].trim_start()
+    } else {
+        let mut r = rest;
+        loop {
+            let word = r.split_whitespace().next().unwrap_or("");
+            if [
+                "verbose", "costs", "settings", "buffers", "format", "json", "text", "off", "on",
+            ]
+            .contains(&word.to_lowercase().as_str())
+            {
+                r = r[word.len()..].trim_start();
+            } else {
+                break;
+            }
+        }
+        r
+    };
+    (!rest.is_empty()).then(|| rest.to_string())
+}
+
 /// Every table name and alias in the statement — the set a bare identifier must not match when it is
 /// used as a value.
 #[derive(Default)]

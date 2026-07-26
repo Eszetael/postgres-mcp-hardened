@@ -86,7 +86,8 @@ server checks each one rather than assuming it.
 | Deny-listed function families | `validate.rs` | a function that takes SQL as text and is not in a denied family (this is why `*_to_xml*` is denied wholesale) |
 | `BEGIN TRANSACTION READ ONLY` + rollback | `db.rs` | functions that write outside transactional control (`pg_import_system_collations` and relatives — hence the family denial above) |
 | Column redaction | `validate.rs`, `db.rs` | **name-based filtering, defeated four ways in review. Depth, not a boundary.** The boundary is the column privilege. |
-| Role privileges | PostgreSQL | nothing this server does; that is the point |
+| Role privileges | PostgreSQL | a `SECURITY DEFINER` function, which runs as its owner — the one thing that defeats even this, and the reason the surface allowlist refuses functions it cannot see inside |
+| Surface allowlist | `surface.rs`, the query plan | anything the plan does not name: a function body is opaque to the planner, so calls outside `pg_catalog` are refused while an allowlist is active |
 | Start-up gate | `posture.rs` | an operator setting `i-accept-the-risk` — recorded in the audit |
 | Cost guard and timeouts | `tools.rs`, session settings | a query cheap to plan and expensive to run; `statement_timeout` is the backstop |
 | Rate and concurrency limits | `ratelimit.rs`, `pipeline.rs` | many source addresses; per-IP limiting does not isolate an actor, and we say so in the code |
@@ -105,6 +106,10 @@ server checks each one rather than assuming it.
   everything the role can see, including `pg_catalog`.
 - **Expensive but legitimate queries.** The cost guard uses estimates; a bad estimate is exactly
   when it fails, and bad estimates are common on databases nobody has analysed.
+- **Functions are refused under an allowlist.** Not narrowed — refused, unless named in
+  `MCP_ALLOW_FUNCTIONS`. A function body does not appear in a query plan, so there is nothing to
+  check; a review used one to read a table the role had been explicitly denied. This is a real cost
+  of turning the allowlist on, and it is the honest price of the guarantee.
 - **Views need their base tables allowed too.** The plan names base tables, not the view, so allowing
   only the view refuses the query. Allow both — and let the database privileges keep the base table
   unreachable directly, which is the boundary anyway. Verified by running it, after this document

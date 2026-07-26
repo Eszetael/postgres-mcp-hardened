@@ -495,6 +495,17 @@ pub(crate) fn handle_security_posture(args: &Value) -> Value {
 /// Two or three sentences for `initialize`, because in stdio nobody sees stderr and the agent is the
 /// only messenger the operator has.
 pub(crate) fn instructions() -> String {
+    // `initialize` is answered without a token when OAuth is configured — that is what the protocol
+    // asks for. So when the server requires authentication, this says only that a report exists:
+    // otherwise anyone who can reach the port learns the role name, the grade and which tables are
+    // writable, which is a map of the weaknesses drawn for the person least entitled to it.
+    let authed = env_set("MCP_BEARER_TOKEN") || env_set("JWT_PUBKEY_PEM");
+    if authed {
+        return "This server publishes a security posture report: call the security_posture tool \
+                (it needs the same credentials as any other call) for what this deployment is able \
+                to do to the database, and the commands that narrow it."
+            .into();
+    }
     let v = report(None);
     let grade = v.get("grade").and_then(|g| g.as_str()).unwrap_or("?");
     let worst: Vec<String> = v
