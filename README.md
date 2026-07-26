@@ -80,6 +80,22 @@ postgres-mcp-hardened
 >
 > **Tip:** point `DATABASE_URL` at a **least-privilege read-only role**. The server enforces read-only itself, but a scoped DB role is defense-in-depth.
 
+## Migrating from the deprecated server
+
+The most-discussed problems reported against `@modelcontextprotocol/server-postgres` were
+reproduced against this server; here is how each behaves:
+
+| What people reported | Here |
+|---|---|
+| Two instances (prod + dev) are indistinguishable, the client picks one | Resource URIs carry the database name (`postgres:///mydb/public/orders/schema`) and `MCP_SERVER_LABEL` names the instance in the client UI |
+| Hangs indefinitely against RDS with no output or error | Bounded: an unreachable host answers in ~8 s with the reason, never silently |
+| `self-signed certificate in certificate chain` | Point `MCP_SSLROOTCERT` at the CA bundle; the error names that variable |
+| Connection string only as a command-line argument | `DATABASE_URL` **or** the positional argument — the original invocation keeps working |
+| `INVALID_URL` with special characters in the password | The error says which characters to percent-encode, and how |
+| Partition children flood the table and resource lists | Hidden by default; `MCP_SHOW_PARTITIONS=1` brings them back |
+| `-32601 Method not found`, `Unexpected end of JSON input` | `ping` and resources implemented; multi-line JSON is buffered until complete; batches are refused with a clear error rather than silence |
+| No row limit — one query floods the context | Auto-`LIMIT`, an 8 MB byte cap, and an explicit `truncated` flag |
+
 ## Resources
 
 Every table and view is exposed as an MCP **resource** (`postgres:///<schema>/<table>/schema`), so a

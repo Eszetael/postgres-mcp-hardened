@@ -543,6 +543,30 @@ use r2d2_postgres::PostgresConnectionManager;
 type PgTls = tokio_postgres_rustls::MakeRustlsConnect;
 type PgPool = Pool<PostgresConnectionManager<PgTls>>;
 
+/// Connection string: `DATABASE_URL`, or the first positional argument.
+///
+/// The deprecated server took the URL as `argv[2]`, so people migrating paste exactly that command
+/// into their config. Accepting both means their existing invocation keeps working (issue #845 in
+/// the upstream tracker asked for the environment variable; we support both rather than either).
+fn database_url() -> Option<String> {
+    if let Ok(u) = std::env::var("DATABASE_URL") {
+        if !u.trim().is_empty() {
+            return Some(u);
+        }
+    }
+    std::env::args().skip(1).find(|a| {
+        a.starts_with("postgres://") || a.starts_with("postgresql://") || a.contains("host=")
+    })
+}
+
+/// The database name, used to tell instances apart in resource URIs.
+fn database_name() -> String {
+    database_url()
+        .and_then(|u| normalize_sslmode(&u).parse::<postgres::Config>().ok())
+        .and_then(|c| c.get_dbname().map(|s| s.to_string()))
+        .unwrap_or_else(|| "postgres".to_string())
+}
+
 /// The `postgres` driver understands only `disable`/`prefer`/`require`, while libpq (and every cloud
 /// console, and OUR OWN documentation) also uses `verify-ca`, `verify-full` and `allow`. Without this
 /// rewrite, pasting a connection string from RDS or Supabase ended in "invalid connection string" —
@@ -624,10 +648,16 @@ fn build_tls() -> Result<PgTls, String> {
 }
 
 static PG_POOL: Lazy<Result<PgPool, String>> = Lazy::new(|| {
-    let url = std::env::var("DATABASE_URL").map_err(|_| "DATABASE_URL not set".to_string())?;
+    let url = database_url().ok_or_else(|| {
+        "no connection string: set DATABASE_URL or pass it as the first argument".to_string()
+    })?;
     let mut config = normalize_sslmode(&url)
         .parse::<postgres::Config>()
-        .map_err(|e| format!("invalid DATABASE_URL: {e}"))?;
+        .map_err(|_| {
+            "invalid connection string — if the password contains @ : / # or ?, percent-encode it \
+             (@ becomes %40, : becomes %3A, / becomes %2F, # becomes %23)"
+                .to_string()
+        })?;
     // Without it, on a network that DROPS packets (rather than refusing connections) the worker thread
     // hangs forever and cannot be cancelled — further requests pile on until the thread pool is gone.
     if config.get_connect_timeout().is_none() {
@@ -656,18 +686,25 @@ static DB_SEM: Lazy<Arc<tokio::sync::Semaphore>> =
 /// translate the cause into a hint. The CLIENT gets the error class only (no user, host or database
 /// name — this is still an unauthenticated surface); the full text goes to the operator stderr.
 fn pool_error_detail() -> String {
-    let Ok(url) = std::env::var("DATABASE_URL") else {
-        return "DATABASE_URL not set".to_string();
+    let Some(url) = database_url() else {
+        return "no connection string: set DATABASE_URL or pass it as the first argument"
+            .to_string();
     };
     // the same normalisation as when building the pool — otherwise the ERROR path reports a false
     // cause ("invalid connection string") where the certificate was what actually failed.
     let mut cfg = match normalize_sslmode(&url).parse::<postgres::Config>() {
         Ok(c) => c,
-        Err(e) => return format!("invalid DATABASE_URL: {}", e),
+        // The upstream tracker is full of "INVALID_URL" reports whose real cause is a password with
+        // `@`, `:`, `/` or `#` in it. Say that outright instead of leaving the user to guess.
+        Err(e) => {
+            let _ = e;
+            return "invalid connection string — if the password contains @ : / # or ?, percent-encode it \
+                    (@ becomes %40, : becomes %3A, / becomes %2F, # becomes %23)"
+                .to_string();
+        }
     };
-    if cfg.get_connect_timeout().is_none() {
-        cfg.connect_timeout(std::time::Duration::from_secs(10));
-    }
+    // The pool has already waited its own timeout; this attempt only explains WHY, so keep it short.
+    cfg.connect_timeout(std::time::Duration::from_secs(3));
     let tls = match build_tls() {
         Ok(t) => t,
         Err(e) => return e,
@@ -919,10 +956,11 @@ fn handle_list_tables(args: &Value) -> Value {
         "       obj_description(c.oid) AS description ",
         "FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace ",
         "WHERE n.nspname = $1 AND c.relkind IN ('r','p','v','m','f') ",
-        "  AND has_table_privilege(c.oid, 'SELECT') ",
+        "  AND has_table_privilege(c.oid, 'SELECT') AND (NOT c.relispartition OR $2) ",
         "ORDER BY c.relname"
     );
-    match query_catalog(SQL, &[&schema]) {
+    let show_parts = show_partitions();
+    match query_catalog(SQL, &[&schema, &show_parts]) {
         Ok(v) => {
             audit("list_tables", "allowed", None);
             ok_content(&v)
@@ -935,6 +973,21 @@ fn handle_list_tables(args: &Value) -> Value {
 }
 
 /// The resource list = one entry per table/view in user schemas (the system catalog is excluded).
+/// Whether partition children are listed (off by default — see the query comment).
+fn show_partitions() -> bool {
+    std::env::var("MCP_SHOW_PARTITIONS")
+        .map(|v| v == "1" || v == "true")
+        .unwrap_or(false)
+}
+
+/// Server name shown to the client, optionally suffixed with `MCP_SERVER_LABEL`.
+fn server_label() -> String {
+    match std::env::var("MCP_SERVER_LABEL") {
+        Ok(l) if !l.trim().is_empty() => format!("postgres-mcp-hardened ({})", l.trim()),
+        _ => "postgres-mcp-hardened".to_string(),
+    }
+}
+
 fn handle_resources_list() -> Value {
     const SQL: &str = concat!(
         "SELECT n.nspname AS table_schema, c.relname AS table_name, ",
@@ -946,9 +999,15 @@ fn handle_resources_list() -> Value {
         "WHERE n.nspname NOT IN ('pg_catalog', 'information_schema') ",
         "  AND n.nspname NOT LIKE 'pg_toast%' AND n.nspname NOT LIKE 'pg_temp%' ",
         "  AND c.relkind IN ('r','p','v','m','f') AND has_table_privilege(c.oid, 'SELECT') ",
+        // Partition CHILDREN are an implementation detail: a table split by month adds dozens of
+        // near-identical entries and drowns the real schema. The parent is listed; set
+        // MCP_SHOW_PARTITIONS=1 to see the children too.
+        "  AND (NOT c.relispartition OR $1) ",
         "ORDER BY n.nspname, c.relname LIMIT 1000"
     );
-    match query_catalog(SQL, &[]) {
+    let db = database_name();
+    let show_parts = show_partitions();
+    match query_catalog(SQL, &[&show_parts]) {
         Ok(v) => {
             let rows = v
                 .get("rows")
@@ -973,7 +1032,10 @@ fn handle_resources_list() -> Value {
                         .map(|d| d.to_string())
                         .unwrap_or_else(|| format!("{} {}.{}", kind.to_lowercase(), s, t));
                     json!({
-                        "uri": format!("postgres:///{}/{}/schema", s, t),
+                        // The database name is part of the URI so two instances (production and
+                        // development, say) never produce colliding resource identifiers — the most
+                        // upvoted complaint about the deprecated server was exactly this ambiguity.
+                        "uri": format!("postgres:///{}/{}/{}/schema", db, s, t),
                         "name": format!("{}.{}", s, t),
                         "description": desc,
                         "mimeType": "application/json"
@@ -995,11 +1057,19 @@ fn handle_resources_read(params: &Value) -> Value {
     let uri = params.get("uri").and_then(|v| v.as_str()).unwrap_or("");
     let rest = uri.strip_prefix("postgres:///").unwrap_or("");
     let parts: Vec<&str> = rest.split('/').collect();
-    if parts.len() != 3 || parts[2] != "schema" || parts[0].is_empty() || parts[1].is_empty() {
-        return json!({ "error": { "code": -32602, "message":
-            "unknown resource — expected postgres:///<schema>/<table>/schema" } });
+    // Accept both `<db>/<schema>/<table>/schema` and the shorter `<schema>/<table>/schema`.
+    let (schema, table) = match parts.as_slice() {
+        [_db, s, t, "schema"] => (*s, *t),
+        [s, t, "schema"] => (*s, *t),
+        _ => {
+            return json!({ "error": { "code": -32602, "message":
+                "unknown resource — expected postgres:///<database>/<schema>/<table>/schema" } })
+        }
+    };
+    if schema.is_empty() || table.is_empty() {
+        return json!({ "error": { "code": -32602, "message": "unknown resource — empty schema or table" } });
     }
-    let desc = handle_describe_table(&json!({ "schema": parts[0], "table": parts[1] }));
+    let desc = handle_describe_table(&json!({ "schema": schema, "table": table }));
     // `describe_table` returns a ready `content` block; a resource needs the `contents` shape.
     match desc
         .get("result")
@@ -1813,7 +1883,9 @@ fn handle_initialize() -> Value {
     json!({
         "result": {
             "protocolVersion": "2025-06-18",
-            "serverInfo": { "name": "postgres-mcp-hardened", "version": "0.1.0" },
+            // MCP_SERVER_LABEL lets an operator running several instances tell them apart in the
+            // client UI ("postgres-mcp-hardened (production)") instead of seeing identical entries.
+            "serverInfo": { "name": server_label(), "version": "0.1.0" },
             "capabilities": { "tools": {}, "resources": {} }
         }
     })
