@@ -65,7 +65,23 @@ fn take(b: &mut Bucket, now: f64, rate_per_s: f64, cap: f64) -> bool {
 
 /// `true` = allow. `false` = over the limit (answer 429).
 pub fn allow(key: &str) -> bool {
-    let rpm = rpm();
+    allow_for(key, "http")
+}
+
+/// Per-transport limit. An agent exploring a schema over stdio legitimately makes dozens of calls a
+/// minute, and throttling that would train people to switch the limiter off; a runaway loop against
+/// a production database is still what a DBA fears most, so stdio gets a higher ceiling rather than
+/// no ceiling. Two variable names, not one name with two meanings — the second is how a setting
+/// starts surprising people.
+pub fn allow_for(key: &str, transport: &str) -> bool {
+    let rpm = if transport == "stdio" {
+        std::env::var("MCP_RATE_RPM_STDIO")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(600.0)
+    } else {
+        rpm()
+    };
     if rpm <= 0.0 {
         return true; // deliberately disabled
     }

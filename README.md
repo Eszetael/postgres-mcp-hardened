@@ -355,6 +355,8 @@ left resident memory flat and file descriptors unchanged.
 | `MCP_SSLROOTCERT` | path to a PEM CA bundle for TLS to PostgreSQL (e.g. the AWS RDS bundle); system and Mozilla roots are trusted by default |
 | `MCP_MAX_INFLIGHT_PER_CLIENT` | max concurrent requests from one client (default 4; `0` disables) |
 | `MCP_RATE_RPM` | per-client request rate limit (default 120/min; `0` disables) |
+| `MCP_RATE_RPM_STDIO` | the same limit for stdio (default 600/min): an agent exploring a schema legitimately makes dozens of calls a minute, but a runaway loop against a production database is still what a DBA fears most |
+| `MCP_CLIENT_ID` | a name for this client in the audit log over stdio, e.g. `claude-desktop@ada-laptop`; without it the identity falls back to the operating system's user and process |
 | `MCP_RATE_BURST` | burst allowance for that limit (default `MCP_RATE_RPM / 4`, min 5) |
 | `MCP_METRICS_TOKEN` | token required on `/metrics`. Without it, `/metrics` follows whatever the server itself requires: open when the server has no authentication, the bearer token when one is set, and closed when OAuth is configured (a JWT is the wrong shape for a scraper — set this instead) |
 | `MCP_REDACT_REQUIRE_REVOKE` | `1` to refuse to serve while the database still lets the role read a redacted column — turns the setting above from advisory into a guarantee |

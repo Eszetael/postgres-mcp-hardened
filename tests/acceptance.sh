@@ -408,6 +408,31 @@ case "$r" in *"permission denied"*) ok "a table outside the named surface is unr
 stop
 rm -f /tmp/acc_setup_$$.sql
 
+section "stdio is not the unguarded transport"
+# stdio is how Claude Desktop and Claude Code connect — the most common way to run this server, and
+# the one that had no rate limit, no concurrency cap, no share of the pool, and "-" for every caller.
+SIN=/tmp/acc_stdin_$$.jsonl; SAUD=/tmp/acc_stdio_$$.log; rm -f "$SAUD"
+python3 - "$SIN" <<'PY2'
+import json, sys
+with open(sys.argv[1], "w") as f:
+    for i in range(1, 21):
+        f.write(json.dumps({"jsonrpc":"2.0","id":i,"method":"tools/call",
+                            "params":{"name":"query","arguments":{"sql":"SELECT 1"}}}) + "\n")
+PY2
+out=$(env DATABASE_URL="$URL" MCP_RATE_RPM_STDIO=5 MCP_CLIENT_ID=acc-client MCP_AUDIT_LOG="$SAUD" \
+      "$BIN" --stdio < "$SIN" 2>/dev/null)
+limited=$(echo "$out" | grep -c 'rate limit exceeded' || true)
+[ "$limited" -gt 0 ] && ok "the rate limit applies over stdio too ($limited of 20 refused)" || no "stdio ignored the rate limit" "$out"
+grep -q '"caller":"client:acc-client"' "$SAUD" && ok "stdio requests carry an identity in the audit" || no "stdio caller still anonymous" "$(tail -2 "$SAUD")"
+grep -q '"decision":"denied_rate"' "$SAUD" && ok "and stdio refusals reach the durable chain" || no "stdio denial not audited" ""
+grep -q '"transport":"stdio"' "$SAUD" && ok "the startup record knows which transport it was" || no "no transport in startup record" ""
+# Without MCP_CLIENT_ID the identity falls back to the operating system's, never to a dash.
+rm -f "$SAUD"
+echo '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"query","arguments":{"sql":"SELECT 1"}}}' \
+  | env DATABASE_URL="$URL" MCP_AUDIT_LOG="$SAUD" "$BIN" --stdio >/dev/null 2>&1
+grep -q '"caller":"stdio:uid=' "$SAUD" && ok "an unnamed stdio client still gets an identity" || no "fallback identity missing" "$(cat "$SAUD")"
+rm -f "$SIN" "$SAUD"
+
 section "Deployment shapes"
 start MCP_DATABASE_URLS="a=$URL;b=$URL"
 r=$(tool query '{"sql":"SELECT 1 AS x","database":"b"}' | body); echo "$r" | grep -q '"x":1' && ok "several databases from one server" || no "multi-database" "$r"

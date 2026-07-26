@@ -24,6 +24,7 @@ pub(crate) use audit_log::*;
 pub(crate) use db::*;
 pub(crate) use http::*;
 pub(crate) use tools::*;
+mod pipeline;
 mod posture;
 mod setup_sql;
 mod ratelimit;
@@ -303,9 +304,11 @@ pub(crate) const KNOWN_VARS: &[&str] = &[
     "MCP_MAX_INFLIGHT_PER_CLIENT",
     "MCP_METRICS_TOKEN",
     "MCP_PASSWORD_FILE",
+    "MCP_CLIENT_ID",
     "MCP_PUBLIC_URL",
     "MCP_RATE_BURST",
     "MCP_RATE_RPM",
+    "MCP_RATE_RPM_STDIO",
     "MCP_REDACT_COLUMNS",
     "MCP_REDACT_REQUIRE_REVOKE",
     "MCP_RESERVED_AUTH_SLOTS",
@@ -530,6 +533,9 @@ pub(crate) fn preflight_config() {
 // --- STDIO TRANSPORT (stara logika main, bez zmian) ---
 pub(crate) fn run_stdio() {
     use std::io::{self, BufRead, Write};
+    // One key for the whole session: stdio has a single peer by construction, so the limiter measures
+    // this client rather than pretending to distinguish several.
+    let caller_key = pipeline::stdio_caller();
     let stdin = io::stdin();
     let mut stdout = io::stdout();
     // Buffer: JSON-RPC does not require a message to fit on one line — a pretty-printed request is
@@ -590,9 +596,20 @@ pub(crate) fn run_stdio() {
         if req.is_object() && req.get("id").is_none() {
             continue;
         }
-        let mut resp = handle_request(&req);
+        // The same gates HTTP applies. Before this, the transport most people actually use had none
+        // of them, and every record in the audit named the caller "-".
+        let id = req.get("id").cloned().unwrap_or(Value::Null);
+        let _scope = audit_log::set_caller(Some(pipeline::stdio_caller()));
+        let mut resp = match pipeline::gate(&caller_key, "stdio") {
+            Ok(guards) => {
+                let r = handle_request(&req);
+                drop(guards);
+                r
+            }
+            Err(rej) => pipeline::rejection_response(&rej, id.clone()),
+        };
         resp["jsonrpc"] = serde_json::Value::String("2.0".into());
-        resp["id"] = req.get("id").cloned().unwrap_or(Value::Null);
+        resp["id"] = id;
         emit(resp, &mut stdout);
     }
 }
@@ -706,13 +723,8 @@ pub(crate) async fn mcp_handler(
         &peer.ip().to_string(),
         headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()),
     );
-    if !ratelimit::allow(&key) {
-        METRICS.denied_rate.fetch_add(1, Ordering::Relaxed);
-        // Denials MUST reach the durable, chained audit — otherwise an attempt to flood the server
-        // leaves a trace only in a counter that disappears on restart.
-        audit("http", "denied_rate", None);
-        let body = json!({ "jsonrpc": "2.0", "id": req.get("id").cloned().unwrap_or(Value::Null),
-            "error": { "code": -32000, "message": "rate limit exceeded, slow down" } });
+    if let Err(rej) = pipeline::gate_rate(&key, "http") {
+        let body = pipeline::rejection_response(&rej, req.get("id").cloned().unwrap_or(Value::Null));
         let mut hdrs = HeaderMap::new();
         hdrs.insert("Retry-After", HeaderValue::from_static("1"));
         return (StatusCode::TOO_MANY_REQUESTS, hdrs, Json(body)).into_response();
@@ -734,14 +746,11 @@ pub(crate) async fn mcp_handler(
     // when a single query runs until `statement_timeout` — without this one client took the whole pool.
     // Once the database pool is busy we tighten the per-client cap to 1 — an attacker then needs as
     // many addresses as there are slots, instead of four times fewer.
-    let free = DB_SEM.available_permits();
-    let tight = free <= (MAX_DB_CONNS as usize) / 4;
-    let effective_cap = if tight { 1 } else { ratelimit::max_in_flight() };
-    let slot = match ratelimit::acquire_slot_capped(&key, effective_cap) {
-        Some(g) => g,
-        None => {
-            let body = json!({ "jsonrpc": "2.0", "id": req.get("id").cloned().unwrap_or(Value::Null),
-                "error": { "code": -32000, "message": "too many concurrent requests from this client" } });
+    let slot = match pipeline::gate_in_flight(&key, "http") {
+        Ok(g) => g,
+        Err(rej) => {
+            let body =
+                pipeline::rejection_response(&rej, req.get("id").cloned().unwrap_or(Value::Null));
             let mut hdrs = HeaderMap::new();
             hdrs.insert("Retry-After", HeaderValue::from_static("1"));
             return (StatusCode::SERVICE_UNAVAILABLE, hdrs, Json(body)).into_response();
@@ -833,12 +842,11 @@ pub(crate) async fn mcp_handler(
     // orphaned work: 12 requests aborted after 0.2s left 4 backends busy, and the next request got a
     // 200 in 5 ms. Repeating that in a loop drained the whole pool from a single connection.
     // Now release happens only when the work finishes.
-    let permit = match DB_SEM.clone().try_acquire_owned() {
+    let permit = match pipeline::gate_pool("http") {
         Ok(p) => p,
-        Err(_) => {
-            audit("http", "denied_busy", None);
-            let body = json!({ "jsonrpc": "2.0", "id": req.get("id").cloned().unwrap_or(Value::Null),
-                "error": { "code": -32000, "message": "server busy, retry shortly" } });
+        Err(rej) => {
+            let body =
+                pipeline::rejection_response(&rej, req.get("id").cloned().unwrap_or(Value::Null));
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
                 HeaderMap::new(),
