@@ -1,0 +1,10 @@
+# cargo-audit exceptions. Every entry must state a reason and a scope.
+[advisories]
+ignore = [
+    # RUSTSEC-2023-0071 (Marvin, a timing side-channel in RSA). No fixed release available.
+    # Scope here: [dev-dependencies] ONLY - the `rsa` crate generates an ephemeral key pair for the
+    # auth unit tests (no private key lives in the repository). It never reaches the release binary
+    # or the image: `cargo tree --edges normal` does not list it.
+    # Re-checked on every dependency change; remove this entry once an upstream fix exists.
+    "RUSTSEC-2023-0071",
+]
