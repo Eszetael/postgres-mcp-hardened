@@ -160,8 +160,32 @@ command in a terminal: a configuration mistake prints its reason and exits with 
 than dying quietly, and a connection problem is reported on the first query with the cause.
 
 **`self-signed certificate in certificate chain` / `unable to verify the first certificate`** —
-your provider uses a private CA (GCP and RDS both do). Download their CA bundle and set
-`MCP_SSLROOTCERT` to it. The error message says so too. We do not offer a "trust anything" switch.
+your provider uses a private CA (Supabase, GCP and RDS all do). Download their CA bundle and set
+`MCP_SSLROOTCERT` to it. The error message names the step for your provider. We do not offer a
+"trust anything" switch.
+
+### Managed providers
+
+This server **always verifies the database certificate**, including with `sslmode=require`. That is
+a deliberate deviation from libpq, where `require` encrypts without verifying and a machine in the
+middle can therefore read and rewrite every query and result without anyone noticing. The cost of
+being strict is that a provider with a private CA needs one extra step; the cost of being lax is
+that you never find out. If you disagree with the trade-off, `verify-full` with the bundle below is
+the same amount of work and leaves no doubt either way.
+
+| Provider | What to expect |
+|---|---|
+| **Supabase** | Private CA. Dashboard → Project Settings → Database → SSL configuration → download the certificate, then set `MCP_SSLROOTCERT` to it. The direct host (`db.<ref>.supabase.co`) is **IPv6-only** — on an IPv4 network use the Supavisor pooler string (port 6543), which also fits serverless and short-lived connections. |
+| **Amazon RDS / Aurora** | Private CA: `https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem`. IAM authentication works — put the generated token in the password field, and remember it expires in 15 minutes. |
+| **Google Cloud SQL** | Private CA: Connections → Security → `server-ca.pem`. Through the Cloud SQL Auth Proxy, connect to the proxy on localhost and TLS is the proxy's business. |
+| **Azure Database for PostgreSQL** | Public CA (DigiCert) — no bundle needed. |
+| **Neon** | Public CA (Let's Encrypt) — no bundle needed. Pooled and direct endpoints both work. |
+| **DigitalOcean** | Private CA: download the certificate from the cluster's Overview page. |
+
+With a connection pooler (Supavisor, PgBouncer) in transaction mode, note that this server sets
+`statement_timeout` and `idle_in_transaction_session_timeout` per session and runs every query in an
+explicit read-only transaction. Both are compatible with transaction pooling; session-level
+`SET` outside a transaction is not, which is why we do neither.
 
 **`no pg_hba.conf entry … no encryption`** — the server accepts only TLS connections for that
 host and user. Add `?sslmode=require` to the connection string.
