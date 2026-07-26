@@ -334,12 +334,7 @@ fn tls_fact(db: Option<&str>) -> Option<bool> {
         db,
     )
     .ok()?;
-    v.get("rows")?
-        .as_array()?
-        .first()?
-        .get("ssl")?
-        .as_bool()
-        .into()
+    v.get("rows")?.as_array()?.first()?.get("ssl")?.as_bool()
 }
 
 /// The whole posture: what the role may do, how the transport is exposed, and what to do about it.
