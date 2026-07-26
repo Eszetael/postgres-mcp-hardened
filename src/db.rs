@@ -262,6 +262,42 @@ pub(crate) static DB_SEM: Lazy<Arc<tokio::sync::Semaphore>> =
 /// "db error" — neither tells the user what to fix. We make ONE direct connection attempt and
 /// translate the cause into a hint. The CLIENT gets the error class only (no user, host or database
 /// name — this is still an unauthenticated surface); the full text goes to the operator stderr.
+/// The next step, named for the provider the connection string points at.
+///
+/// "Point MCP_SSLROOTCERT at the provider CA bundle" is correct and still leaves someone hunting
+/// through a dashboard. Every managed provider that signs with a private CA puts that file in a
+/// different place, and the first connection is exactly where a new user gives up.
+fn provider_hint(url: &str) -> Option<&'static str> {
+    let h = url.to_ascii_lowercase();
+    if h.contains(".supabase.co") || h.contains(".supabase.com") {
+        Some("Supabase signs its databases with its own CA: Dashboard → Project Settings → Database → \
+              SSL configuration → download the certificate, then set MCP_SSLROOTCERT to that file")
+    } else if h.contains(".rds.amazonaws.com") {
+        Some("Amazon RDS bundle: https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem")
+    } else if h.contains(".ondigitalocean.com") {
+        Some("DigitalOcean: download the CA certificate from the database cluster's Overview page")
+    } else if h.contains("cloudsql") || h.contains(".gcp.") {
+        Some("Google Cloud SQL: Connections → Security → download server-ca.pem")
+    } else if h.contains(".azure.com") {
+        Some("Azure Database for PostgreSQL uses a public CA — if verification still fails, check \
+              that the host name matches the certificate rather than supplying a bundle")
+    } else {
+        None
+    }
+}
+
+/// Supabase's direct database host resolves over IPv6 only (IPv4 is a paid add-on). On an
+/// IPv4-only network the connection simply never establishes, which reads as "the server is down".
+fn reachability_hint(url: &str) -> Option<&'static str> {
+    let h = url.to_ascii_lowercase();
+    if h.contains(".supabase.co") && h.contains("db.") {
+        Some("note: Supabase's direct host is IPv6-only — from an IPv4-only network use the \
+              Supavisor pooler connection string (port 6543) instead")
+    } else {
+        None
+    }
+}
+
 pub(crate) fn pool_error_detail() -> String {
     let Some(url) = database_url() else {
         return "no connection string: set DATABASE_URL or pass it as the first argument"
@@ -334,10 +370,13 @@ pub(crate) fn pool_error_detail() -> String {
                     || d.contains("self-signed")
                     || d.contains("selfsigned")
                 {
-                    "cannot connect to PostgreSQL: the server certificate is not signed by any CA we \
-                     trust — typical of a private CA (GCP, RDS, self-hosted). Download that provider \
-                     CA bundle and point MCP_SSLROOTCERT at the PEM file"
-                        .to_string()
+                    let base = "cannot connect to PostgreSQL: the server certificate is not signed by \
+                                any CA we trust — typical of a private CA (Supabase, RDS, Cloud SQL, \
+                                self-hosted). Point MCP_SSLROOTCERT at that provider CA bundle";
+                    match provider_hint(&url) {
+                        Some(h) => format!("{}. {}", base, h),
+                        None => base.to_string(),
+                    }
                 } else if d.contains("notvalidforname") || d.contains("not valid for name") {
                     "cannot connect to PostgreSQL: the server certificate does not cover this host \
                      name — connect using the name in the certificate rather than an IP address"
@@ -347,8 +386,11 @@ pub(crate) fn pool_error_detail() -> String {
                 } else {
                     format!(
                         "cannot connect to PostgreSQL: {} — check host, port and sslmode; \
-                         for a private CA (e.g. an RDS bundle) point MCP_SSLROOTCERT at the PEM file",
-                        e
+                         for a private CA (e.g. an RDS bundle) point MCP_SSLROOTCERT at the PEM file{}",
+                        e,
+                        reachability_hint(&url)
+                            .map(|h| format!(". {}", h))
+                            .unwrap_or_default()
                     )
                 }
             }
