@@ -5,6 +5,8 @@
 | `docker-compose.yml` | PostgreSQL with sample data plus the server, ready in one command |
 | `seed.sql` | The sample schema, including the least-privilege `reader` role |
 | `claude_desktop_config.json` | A stdio configuration for Claude Desktop or Cursor |
+| `vscode_mcp.json` | The same for VS Code (`.vscode/mcp.json`), with the password prompted rather than written down |
+| `setup-role.sh` | Prints the DDL for the read-only role, for you to read and then run with your own `psql` |
 
 ## One command
 

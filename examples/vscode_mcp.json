@@ -1,0 +1,23 @@
+{
+  "//": "VS Code: put this in .vscode/mcp.json. `inputs` keeps the password out of the file — VS Code asks for it once and stores it in its own secret store, which is the point.",
+  "inputs": [
+    {
+      "id": "pgpass",
+      "type": "promptString",
+      "description": "Password for the read-only PostgreSQL role",
+      "password": true
+    }
+  ],
+  "servers": {
+    "postgres": {
+      "type": "stdio",
+      "command": "postgres-mcp-hardened",
+      "args": ["--stdio"],
+      "env": {
+        "DATABASE_URL": "postgres://reader:${input:pgpass}@localhost:5432/mydb?sslmode=verify-full",
+        "MCP_ALLOW_SCHEMAS": "public",
+        "MCP_AUDIT_LOG": "${workspaceFolder}/.postgres-mcp-audit.log"
+      }
+    }
+  }
+}
