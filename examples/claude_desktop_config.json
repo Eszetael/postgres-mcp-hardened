@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "postgres": {
+      "command": "/usr/local/bin/postgres-mcp-hardened",
+      "args": ["--stdio"],
+      "env": {
+        "DATABASE_URL": "postgres://reader:YOUR_PASSWORD@localhost:5432/mydb",
+        "MCP_REDACT_COLUMNS": "ssn, card_number, password"
+      }
+    }
+  }
+}

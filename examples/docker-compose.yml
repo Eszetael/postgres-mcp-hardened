@@ -1,0 +1,37 @@
+# A working setup in one command: a PostgreSQL with sample data and the MCP server in front of it.
+#
+#   docker compose -f examples/docker-compose.yml up -d
+#   curl -s -H content-type:application/json http://127.0.0.1:8080/mcp \
+#     -d '{"jsonrpc":"2.0","id":1,"method":"tools/call",
+#          "params":{"name":"query","arguments":{"sql":"SELECT * FROM people"}}}'
+#
+# The server connects as `reader`, a role with SELECT and nothing else — the deployment this
+# project recommends, not a superuser shortcut that only works in a demo.
+services:
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_PASSWORD: example
+    volumes:
+      - ./seed.sql:/docker-entrypoint-initdb.d/seed.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 3s
+      retries: 20
+
+  mcp:
+    build: ..
+    # Published image: ghcr.io/eszetael/postgres-mcp-hardened:latest
+
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://reader:reader_pw@db:5432/postgres
+      MCP_ADDR: 0.0.0.0:8080
+      # Values that must never reach the model, whatever the query asks for:
+      MCP_REDACT_COLUMNS: ssn, card_number
+      # Uncomment to require a token on every request:
+      # MCP_BEARER_TOKEN: change-me
+    ports:
+      - "127.0.0.1:8080:8080"

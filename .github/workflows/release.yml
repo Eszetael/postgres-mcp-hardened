@@ -83,6 +83,20 @@ jobs:
 
   # The most common complaint against the leading alternative is that its published image lags the
   # code by months. Publishing from the same tag that builds the binaries makes that impossible.
+  # A software bill of materials belongs with the artifact, not in a promise: reviewers in regulated
+  # environments ask for it first.
+  sbom:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.83.0
+      - run: cargo install cargo-cyclonedx --locked
+      - run: cargo cyclonedx --format json --all
+      - name: Attach the SBOM to the release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: "**/*.cdx.json"
+
   container:
     runs-on: ubuntu-latest
     permissions:

@@ -113,6 +113,12 @@ Beyond unit tests, the repository carries two harnesses that run in CI on every 
   configuration mistakes failing loudly, audit tamper detection, fair use under load, and
   multi-database deployments.
 
+## Every reported problem, answered
+
+[`docs/COMMUNITY_ISSUES.md`](docs/COMMUNITY_ISSUES.md) is the complete ledger: every problem
+reported against the deprecated server and every open issue against the maintained alternatives,
+each with what happens here — including the handful we could not fix in code, said plainly.
+
 ## What we learned from the alternatives
 
 Every server in this space has an issue tracker, and those trackers are a map of what goes wrong.
@@ -207,6 +213,8 @@ offered, plus column comments, primary keys and **foreign keys** in the payload.
 - **No schema leaks:** database errors are mapped to structured, actionable messages that never echo table/column names.
 - **OAuth 2.1:** optional RS256 bearer-token validation (signature, `exp`, `aud`, `iss`) with scope enforcement; disabled when unconfigured for local/self-host use.
 - **Audit:** every tool decision is logged as a tamper-evident, hash-chained JSON line (no raw SQL).
+- **Supply chain:** dependency licences, sources and advisories enforced in CI (`cargo deny`,
+  `cargo audit`); a CycloneDX SBOM is attached to every release.
 - **Runtime:** ships as a distroless, non-root container (~34 MB, built and smoke-tested in CI).
 
 ## Configuration
