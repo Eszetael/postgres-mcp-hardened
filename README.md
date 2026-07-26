@@ -100,6 +100,19 @@ reproduced against this server; here is how each behaves:
 | `-32601 Method not found`, `Unexpected end of JSON input` | `ping` and resources implemented; multi-line JSON is buffered until complete; batches are refused with a clear error rather than silence |
 | No row limit — one query floods the context | Auto-`LIMIT`, an 8 MB byte cap, and an explicit `truncated` flag |
 
+## Testing
+
+Beyond unit tests, the repository carries two harnesses that run in CI on every change:
+
+- `--fuzz` — a deterministic fuzzer that mutates a corpus of known writes with transformations
+  that do not change SQL meaning (comments, case, dollar-quoting, invisible Unicode, parentheses)
+  and asserts that none of them ever becomes an allowed statement.
+- `tests/acceptance.sh` — an end-to-end suite that starts its own PostgreSQL and checks 43
+  behaviours: every write-bypass reported against the deprecated server (including the
+  `COMMIT`/`END` injection), truthful results, schema introspection, protocol conformance,
+  configuration mistakes failing loudly, audit tamper detection, fair use under load, and
+  multi-database deployments.
+
 ## Troubleshooting
 
 Answers to the questions people actually asked about the deprecated server, so nobody has to open
