@@ -57,7 +57,18 @@ pub fn validate_readonly(sql: &str) -> Result<(), ValidationError> {
     if has_trailing_statement(sql) {
         return Err(ValidationError::MultiStatement);
     }
-    let ast = parse(sql)?;
+    let ast = match parse(sql) {
+        Ok(a) => a,
+        // A statement our parser does not know is still refused — but say WHY correctly. Telling a
+        // user "SQL parse error" for `REFRESH MATERIALIZED VIEW` sends them hunting for a typo,
+        // when the real answer is that this server never performs writes.
+        Err(e) => {
+            return Err(match leading_write_keyword(sql) {
+                Some(kw) => ValidationError::NotReadOnly(format!("{} is a write operation", kw)),
+                None => e,
+            })
+        }
+    };
     if ast.len() > 1 {
         return Err(ValidationError::MultiStatement);
     }
@@ -81,6 +92,61 @@ pub fn validate_readonly(sql: &str) -> Result<(), ValidationError> {
         return Err(ValidationError::NotReadOnly(f));
     }
     Ok(())
+}
+
+/// The leading keyword when it is unmistakably a write/maintenance command. Used only to explain a
+/// rejection better — the rejection itself already happened, this just replaces a misleading message.
+fn leading_write_keyword(sql: &str) -> Option<&'static str> {
+    const WRITE_KEYWORDS: &[&str] = &[
+        "REFRESH",
+        "CLUSTER",
+        "VACUUM",
+        "ANALYZE",
+        "REINDEX",
+        "CHECKPOINT",
+        "LOCK",
+        "TRUNCATE",
+        "GRANT",
+        "REVOKE",
+        "SECURITY",
+        "LISTEN",
+        "UNLISTEN",
+        "NOTIFY",
+        "DISCARD",
+        "RESET",
+        "DEALLOCATE",
+        "PREPARE",
+        "EXECUTE",
+        "DECLARE",
+        "FETCH",
+        "MOVE",
+        "CLOSE",
+        "COPY",
+        "IMPORT",
+        "CALL",
+        "DO",
+        "BEGIN",
+        "COMMIT",
+        "ROLLBACK",
+        "SAVEPOINT",
+        "RELEASE",
+        "SET",
+        "ALTER",
+        "CREATE",
+        "DROP",
+        "INSERT",
+        "UPDATE",
+        "DELETE",
+        "MERGE",
+        "COMMENT",
+        "REASSIGN",
+    ];
+    let first = sql
+        .trim_start()
+        .split(|c: char| c.is_whitespace() || c == '(')
+        .next()?
+        .to_ascii_uppercase();
+    WRITE_KEYWORDS.iter().find(|k| **k == first).copied()
 }
 
 /// Is there a `;` outside literals and comments with any further token after it?

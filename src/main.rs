@@ -909,24 +909,44 @@ fn handle_list_tables(args: &Value) -> Value {
         .get("schema")
         .and_then(|v| v.as_str())
         .unwrap_or("public");
-    match query_catalog(
-        "SELECT table_name, table_type FROM information_schema.tables WHERE table_schema = $1 ORDER BY table_name",
-        &[&schema],
-    ) {
-        Ok(v) => { audit("list_tables", "allowed", None); ok_content(&v) }
-        Err(e) => { audit("list_tables", "error", None); err_content(-32000, e) }
+    // Built on pg_class rather than information_schema, which does not list MATERIALIZED VIEWS at
+    // all — a database keeping its aggregates in matviews would look half empty through this tool.
+    const SQL: &str = concat!(
+        "SELECT c.relname AS table_name, ",
+        "       CASE c.relkind WHEN 'r' THEN 'BASE TABLE' WHEN 'p' THEN 'PARTITIONED TABLE' ",
+        "                      WHEN 'v' THEN 'VIEW' WHEN 'm' THEN 'MATERIALIZED VIEW' ",
+        "                      WHEN 'f' THEN 'FOREIGN TABLE' ELSE c.relkind::text END AS table_type, ",
+        "       obj_description(c.oid) AS description ",
+        "FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace ",
+        "WHERE n.nspname = $1 AND c.relkind IN ('r','p','v','m','f') ",
+        "  AND has_table_privilege(c.oid, 'SELECT') ",
+        "ORDER BY c.relname"
+    );
+    match query_catalog(SQL, &[&schema]) {
+        Ok(v) => {
+            audit("list_tables", "allowed", None);
+            ok_content(&v)
+        }
+        Err(e) => {
+            audit("list_tables", "error", None);
+            err_content(-32000, e)
+        }
     }
 }
 
 /// The resource list = one entry per table/view in user schemas (the system catalog is excluded).
 fn handle_resources_list() -> Value {
     const SQL: &str = concat!(
-        "SELECT c.table_schema, c.table_name, c.table_type, obj_description(rel.oid) AS description ",
-        "FROM information_schema.tables c ",
-        "JOIN pg_class rel ON rel.relname = c.table_name ",
-        "JOIN pg_namespace ns ON ns.oid = rel.relnamespace AND ns.nspname = c.table_schema ",
-        "WHERE c.table_schema NOT IN ('pg_catalog', 'information_schema') ",
-        "ORDER BY c.table_schema, c.table_name LIMIT 1000"
+        "SELECT n.nspname AS table_schema, c.relname AS table_name, ",
+        "       CASE c.relkind WHEN 'r' THEN 'table' WHEN 'p' THEN 'partitioned table' ",
+        "                      WHEN 'v' THEN 'view' WHEN 'm' THEN 'materialized view' ",
+        "                      WHEN 'f' THEN 'foreign table' ELSE c.relkind::text END AS table_type, ",
+        "       obj_description(c.oid) AS description ",
+        "FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace ",
+        "WHERE n.nspname NOT IN ('pg_catalog', 'information_schema') ",
+        "  AND n.nspname NOT LIKE 'pg_toast%' AND n.nspname NOT LIKE 'pg_temp%' ",
+        "  AND c.relkind IN ('r','p','v','m','f') AND has_table_privilege(c.oid, 'SELECT') ",
+        "ORDER BY n.nspname, c.relname LIMIT 1000"
     );
     match query_catalog(SQL, &[]) {
         Ok(v) => {
@@ -1008,29 +1028,33 @@ fn handle_describe_table(args: &Value) -> Value {
     // guess. A schema comment is the cheapest available truth about meaning, and the primary key says
     // what to join on instead of inferring it from the name.
     const SQL: &str = concat!(
-        "SELECT c.column_name, c.data_type, c.is_nullable, c.column_default, ",
-        "       col_description(rel.oid, c.ordinal_position::int) AS description, ",
-        "       (pk.attname IS NOT NULL) AS is_primary_key, ",
-        // FOREIGN KEY: without it the agent guesses what to join on — and guessing from column names is
-        // the most common source of quiet, convincing-looking nonsense in results.
+        // Built on pg_attribute/pg_class, not information_schema: the latter reports every enum,
+        // domain and composite type as the useless string "USER-DEFINED", and omits materialized
+        // views entirely. `format_type` gives the real name (`mood`, `addr`, `numeric(30,10)`).
+        "SELECT a.attname AS column_name, ",
+        "       format_type(a.atttypid, a.atttypmod) AS data_type, ",
+        "       CASE WHEN a.attnotnull THEN 'NO' ELSE 'YES' END AS is_nullable, ",
+        "       pg_get_expr(ad.adbin, ad.adrelid) AS column_default, ",
+        "       col_description(rel.oid, a.attnum) AS description, ",
+        "       COALESCE(i.indisprimary, false) AS is_primary_key, ",
+        // FOREIGN KEY: without it the agent guesses what to join on — and guessing from column names
+        // is the most common source of quiet, convincing-looking nonsense in results.
         "       (SELECT cl2.relname || '.' || a2.attname ",
         "        FROM pg_constraint con ",
         "        JOIN pg_class cl2 ON cl2.oid = con.confrelid ",
         "        JOIN pg_attribute a2 ON a2.attrelid = con.confrelid ",
-        "             AND a2.attnum = con.confkey[array_position(con.conkey, c.ordinal_position::smallint)] ",
-        "        WHERE con.contype = 'f' AND con.conrelid = rel.oid ",
-        "              AND c.ordinal_position::smallint = ANY (con.conkey) LIMIT 1) AS references_column, ",
+        "             AND a2.attnum = con.confkey[array_position(con.conkey, a.attnum)] ",
+        "        WHERE con.contype = 'f' AND con.conrelid = rel.oid AND a.attnum = ANY (con.conkey) ",
+        "        LIMIT 1) AS references_column, ",
         "       obj_description(rel.oid) AS table_description ",
-        "FROM information_schema.columns c ",
-        "JOIN pg_class rel ON rel.relname = c.table_name ",
-        "JOIN pg_namespace ns ON ns.oid = rel.relnamespace AND ns.nspname = c.table_schema ",
-        "LEFT JOIN ( ",
-        "    SELECT a.attname FROM pg_index i ",
-        "    JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY (i.indkey) ",
-        "    WHERE i.indisprimary AND i.indrelid = to_regclass(format('%I.%I', $1::text, $2::text)) ",
-        ") pk ON pk.attname = c.column_name ",
-        "WHERE c.table_schema = $1 AND c.table_name = $2 ",
-        "ORDER BY c.ordinal_position"
+        "FROM pg_class rel ",
+        "JOIN pg_namespace ns ON ns.oid = rel.relnamespace ",
+        "JOIN pg_attribute a ON a.attrelid = rel.oid AND a.attnum > 0 AND NOT a.attisdropped ",
+        "LEFT JOIN pg_attrdef ad ON ad.adrelid = rel.oid AND ad.adnum = a.attnum ",
+        "LEFT JOIN pg_index i ON i.indrelid = rel.oid AND i.indisprimary AND a.attnum = ANY (i.indkey) ",
+        "WHERE ns.nspname = $1 AND rel.relname = $2 AND rel.relkind IN ('r','p','v','m','f') ",
+        "  AND has_table_privilege(rel.oid, 'SELECT') ",
+        "ORDER BY a.attnum"
     );
     match query_catalog(SQL, &[&schema, &table]) {
         Ok(v) => {
