@@ -806,12 +806,42 @@ fn pool_error_detail() -> String {
                     db.code().code()
                 )
             } else {
-                // brak DbError = warstwa transportu: host/port/TLS/certyfikat
-                format!(
-                    "cannot connect to PostgreSQL: {} — check host, port and sslmode; \
-                     for a private CA (e.g. an RDS bundle) point MCP_SSLROOTCERT at the PEM file",
-                    e
-                )
+                // No DbError = the transport layer. The precise cause sits in the error source
+                // chain; surfacing it turns "TLS handshake failed" into an actionable sentence.
+                // Two of the most-reported problems against the deprecated server were exactly
+                // this: "self-signed certificate in certificate chain" and "unable to verify the
+                // first certificate" — both a private CA (GCP, RDS) that nobody had supplied.
+                let mut detail = e.to_string();
+                detail.push(' ');
+                let mut src: Option<&(dyn std::error::Error + 'static)> =
+                    std::error::Error::source(&e);
+                while let Some(s) = src {
+                    detail.push_str(&s.to_string());
+                    detail.push(' ');
+                    src = std::error::Error::source(s);
+                }
+                let d = detail.to_ascii_lowercase();
+                if d.contains("unknownissuer")
+                    || d.contains("self-signed")
+                    || d.contains("selfsigned")
+                {
+                    "cannot connect to PostgreSQL: the server certificate is not signed by any CA we \
+                     trust — typical of a private CA (GCP, RDS, self-hosted). Download that provider \
+                     CA bundle and point MCP_SSLROOTCERT at the PEM file"
+                        .to_string()
+                } else if d.contains("notvalidforname") || d.contains("not valid for name") {
+                    "cannot connect to PostgreSQL: the server certificate does not cover this host \
+                     name — connect using the name in the certificate rather than an IP address"
+                        .to_string()
+                } else if d.contains("expired") {
+                    "cannot connect to PostgreSQL: the server certificate has expired".to_string()
+                } else {
+                    format!(
+                        "cannot connect to PostgreSQL: {} — check host, port and sslmode; \
+                         for a private CA (e.g. an RDS bundle) point MCP_SSLROOTCERT at the PEM file",
+                        e
+                    )
+                }
             }
         }
     }

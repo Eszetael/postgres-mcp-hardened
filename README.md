@@ -100,6 +100,45 @@ reproduced against this server; here is how each behaves:
 | `-32601 Method not found`, `Unexpected end of JSON input` | `ping` and resources implemented; multi-line JSON is buffered until complete; batches are refused with a clear error rather than silence |
 | No row limit — one query floods the context | Auto-`LIMIT`, an 8 MB byte cap, and an explicit `truncated` flag |
 
+## Troubleshooting
+
+Answers to the questions people actually asked about the deprecated server, so nobody has to open
+an issue to find them.
+
+**`spawn npx ENOENT` / "which Node version do I need?"** — none. This is a single static binary.
+Download it from the releases page (or `cargo install postgres-mcp-hardened`) and point your client
+at the file. There is no `node_modules`, no `npx`, nothing to keep up to date.
+
+**"The server starts but nothing is listening on a port."** — that is stdio mode, which is correct
+for Claude Desktop and Cursor: the client talks to the process over its standard input and output,
+not over a socket. If you want a network endpoint, start it without `--stdio`; it then prints
+`MCP HTTP listening on http://…` and speaks Streamable HTTP.
+
+**"Can my client on another machine reach the database?"** — yes: run the server next to the
+database in HTTP mode, expose it, and enable OAuth (`JWT_PUBKEY_PEM`, `JWT_AUD`, `JWT_ISS`). The
+database credentials then never leave the host the server runs on.
+
+**"Could not attach to MCP server."** — the process exited before the handshake. Run the same
+command in a terminal: a configuration mistake prints its reason and exits with status 2 rather
+than dying quietly, and a connection problem is reported on the first query with the cause.
+
+**`self-signed certificate in certificate chain` / `unable to verify the first certificate`** —
+your provider uses a private CA (GCP and RDS both do). Download their CA bundle and set
+`MCP_SSLROOTCERT` to it. The error message says so too. We do not offer a "trust anything" switch.
+
+**`no pg_hba.conf entry … no encryption`** — the server accepts only TLS connections for that
+host and user. Add `?sslmode=require` to the connection string.
+
+**`INVALID_URL` / `invalid connection string`** — a password containing `@`, `:`, `/`, `#` or `?`
+must be percent-encoded (`@` → `%40`, `:` → `%3A`, `/` → `%2F`, `#` → `%23`).
+
+**"My table has hundreds of partitions and the list is unusable."** — partition children are hidden
+by default; the parent is listed. Set `MCP_SHOW_PARTITIONS=1` if you need them.
+
+**"I need production and staging at the same time."** — either run one server per database (they
+are distinguishable: set `MCP_SERVER_LABEL`), or configure both in one server with
+`MCP_DATABASE_URLS` and pass `database` in the tool arguments.
+
 ## Resources
 
 Every table and view is exposed as an MCP **resource** (`postgres:///<schema>/<table>/schema`), so a
