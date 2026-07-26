@@ -119,14 +119,18 @@ pub(crate) fn build_tls() -> Result<PgTls, String> {
     }
     // 2. bundled Mozilla roots — so it also works without a system store
     roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-    // 3. prywatne CA operatora (bundle RDS/Supabase, self-signed w intranecie)
+    // 3. the operator's private CA (an RDS/Supabase bundle, or self-signed on an intranet).
+    //    PEM parsing comes from rustls' own pki-types; the separate rustls-pemfile crate was
+    //    dropped after cargo-deny flagged it unmaintained (RUSTSEC-2025-0134). Carrying fewer
+    //    dependencies is the point of a security-first build, not a slogan.
     if let Ok(path) = std::env::var("MCP_SSLROOTCERT") {
-        let f = std::fs::File::open(&path)
-            .map_err(|e| format!("MCP_SSLROOTCERT: cannot open {}: {}", path, e))?;
-        let mut rd = std::io::BufReader::new(f);
+        use rustls::pki_types::pem::PemObject;
+        let certs = rustls::pki_types::CertificateDer::pem_file_iter(&path)
+            .map_err(|e| format!("MCP_SSLROOTCERT: cannot read {}: {}", path, e))?;
         let mut added = 0usize;
-        for cert in rustls_pemfile::certs(&mut rd) {
-            let cert = cert.map_err(|e| format!("MCP_SSLROOTCERT: invalid PEM: {}", e))?;
+        for cert in certs {
+            let cert =
+                cert.map_err(|e| format!("MCP_SSLROOTCERT: invalid PEM in {}: {}", path, e))?;
             roots
                 .add(cert)
                 .map_err(|e| format!("MCP_SSLROOTCERT: rejected certificate: {}", e))?;
