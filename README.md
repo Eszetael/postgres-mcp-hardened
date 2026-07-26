@@ -217,6 +217,23 @@ offered, plus column comments, primary keys and **foreign keys** in the payload.
   `cargo audit`); a CycloneDX SBOM is attached to every release.
 - **Runtime:** ships as a distroless, non-root container (~34 MB, built and smoke-tested in CI).
 
+## Footprint
+
+Measured on an ordinary VPS against a 16k-row sample database, so you can check the "written in
+Rust" claim rather than take it:
+
+| | |
+|---|---|
+| Resident memory, idle | 5.2 MB |
+| Resident memory, after a benchmark run | 9.2 MB |
+| Median request latency | ~8 ms — including the `curl` process the measurement spawns, so the server's own share is lower |
+| Start to first validated statement | 7 ms |
+| Binary | 11 MB, static, no runtime to install |
+| Container image | ~34 MB distroless, non-root |
+
+A twelve-minute soak of mixed traffic (reads, refusals, errors, aborted requests, session churn)
+left resident memory flat and file descriptors unchanged.
+
 ## Configuration
 
 | Env | Purpose |
