@@ -75,7 +75,7 @@ postgres-mcp-hardened
 > **TLS:** connections to PostgreSQL are encrypted whenever the server supports it, and
 > `sslmode=require`, `verify-ca` and `verify-full` are all accepted (the certificate chain *and*
 > the hostname are always verified, so `require` behaves like `verify-full`) — so managed Postgres (RDS, Supabase, Neon, Render)
-> works out of the box. Certificates are **always verified**; for a private CA, point
+> works out of the box. Certificates and host names are **always verified** — *verified* (acceptance: "a certificate naming another host is refused, by name"); for a private CA, point
 > `MCP_SSLROOTCERT` at the PEM bundle. There is no "trust anything" switch.
 >
 > **Tip:** point `DATABASE_URL` at a **least-privilege read-only role**. The server enforces read-only itself, but a scoped DB role is defense-in-depth.

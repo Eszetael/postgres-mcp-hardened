@@ -122,6 +122,17 @@ jobs:
           ADV_URL: postgres://postgres:ci@127.0.0.1:5432/postgres  # pragma: allowlist secret
         run: ./tests/adversarial/run.sh
 
+  tls:
+    # The only cryptographic claim this project makes, and until this job existed it had no executor:
+    # CI ran PostgreSQL without TLS and the acceptance suite never touched it.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.83.0
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --locked --release
+      - run: ./tests/tls.sh
+
   docs-claims:
     # Documentation honesty as a build gate. Claims drift from code silently — a "verified" that
     # names no test, a settings table that has fallen behind — and by the time a user notices, the

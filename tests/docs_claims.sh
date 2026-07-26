@@ -16,7 +16,9 @@ for file in README.md SECURITY.md CHANGELOG.md docs/COMMUNITY_ISSUES.md; do
     while IFS=: read -r lineno line; do
         acceptance_text=$(echo "$line" | sed -n 's/.*(acceptance: "\([^"]*\)").*/\1/p')
         if [ -n "$acceptance_text" ]; then
-            if ! grep -Fq "$acceptance_text" tests/acceptance.sh 2>/dev/null; then
+            # Across every suite, not only acceptance.sh: TLS and the adversarial corpus live in
+            # their own files, and a claim proved there is proved just as well.
+            if ! grep -Fq "$acceptance_text" tests/*.sh tests/adversarial/*.sh 2>/dev/null; then
                 printf 'FAIL %s:%s: %.80s\n' "$file" "$lineno" "$line"
                 fail=1
             fi

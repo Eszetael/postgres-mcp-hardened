@@ -167,13 +167,16 @@ pub(crate) async fn main() {
         let t = transport.to_string();
         tokio::task::spawn_blocking(move || {
             posture::enforce_start_policy(&t, &addr);
-            // The chain should record what the server was ALLOWED to do, not only what it was
-            // configured with: privileges are the half an incident actually turns on.
-            posture::audit_posture();
         })
         .await
         .expect("start policy check");
     }
+    // In the background, deliberately. The chain should record what the server was ALLOWED to do,
+    // not only what it was configured with — but that means querying the database, and doing it
+    // before the listener binds meant a database that was slow, unreachable or refusing a
+    // certificate held the whole process before it could answer /health. Found by the TLS test,
+    // which hung here long before it could test anything about TLS.
+    std::thread::spawn(posture::audit_posture);
     spawn_redaction_verification();
     if stdio {
         // stdio: run the synchronous loop on a blocking task so the runtime stays free
