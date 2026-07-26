@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+# Run the fast half of CI before anything leaves this machine.
+#
+# This exists because of a specific mistake, not as a ritual: a commit went out with a failing
+# clippy lint because the check sat in a shell chain that does not stop on error, and the first
+# anyone knew of it was a failure email. A gate that depends on remembering to look is not a gate.
+#
+# It runs what is fast (format, lint, unit tests, documentation claims) and deliberately NOT the
+# acceptance suite or the PostgreSQL matrix — those need Docker and twenty minutes, and a hook
+# people cannot afford to run is a hook people bypass. CI still runs everything.
+#
+# Enable:  git config core.hooksPath .githooks
+# Bypass:  git push --no-verify   (for a branch you WANT to see fail in CI)
+set -uo pipefail
+
+export PATH="$HOME/.cargo/bin:$PATH"
+command -v cargo >/dev/null || { echo "pre-push: cargo is not on PATH — refusing to guess"; exit 1; }
+
+fail=0
+run() {
+  printf '  %-34s' "$1"; shift
+  if out=$("$@" 2>&1); then printf 'ok\n'; else printf 'FAILED\n%s\n' "$out" | tail -25; fail=1; fi
+}
+
+echo "pre-push checks:"
+run "cargo fmt --check"        cargo fmt --check
+run "cargo clippy -D warnings" cargo clippy --release --all-targets -- -D warnings
+run "cargo test"               cargo test --release
+[ -x tests/docs_claims.sh ] && run "documentation claims" ./tests/docs_claims.sh
+
+if [ "$fail" -ne 0 ]; then
+  echo
+  echo "Refusing to push. Fix the above, or use --no-verify if you mean to send it red."
+  exit 1
+fi
+echo "pre-push: clear"

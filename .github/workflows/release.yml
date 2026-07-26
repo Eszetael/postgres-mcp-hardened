@@ -132,7 +132,13 @@ jobs:
           n=0
           for f in dist/*; do
             [ -f "$f" ] || continue
-            cosign sign-blob --yes --output-signature "$f.sig" --output-certificate "$f.pem" "$f"
+            # Two forms on purpose. The bundle is what Sigstore wants now — signature, certificate
+            # and transparency-log entry in one file, verified with `cosign verify-blob --bundle`.
+            # The separate .sig/.pem are the older shape, which every cosign in the wild still
+            # accepts and which the flags in our README use; cosign already prints a deprecation
+            # warning for them, so they exist for people who have not upgraded yet, not forever.
+            cosign sign-blob --yes --bundle "$f.bundle" \
+                             --output-signature "$f.sig" --output-certificate "$f.pem" "$f"
             n=$((n+1))
           done
           # Signing nothing must not pass for signing everything.
@@ -158,6 +164,7 @@ jobs:
           files: |
             dist/*.sig
             dist/*.pem
+            dist/*.bundle
 
   sbom:
     needs: [checks]

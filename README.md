@@ -56,15 +56,21 @@ is no private key for us to lose, and the certificate names the workflow, reposi
 produced the file. Each artefact ships with a `.sig` and a `.pem` beside it:
 
 ```bash
-cosign verify-blob postgres-mcp-hardened-x86_64-unknown-linux-gnu.tar.gz \
-  --signature  postgres-mcp-hardened-x86_64-unknown-linux-gnu.tar.gz.sig \
-  --certificate postgres-mcp-hardened-x86_64-unknown-linux-gnu.tar.gz.pem \
+F=postgres-mcp-hardened-x86_64-unknown-linux-gnu.tar.gz
+cosign verify-blob "$F" --bundle "$F.bundle" \
   --certificate-identity-regexp '^https://github.com/Eszetael/postgres-mcp-hardened/' \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com
 ```
 
 Pin the identity, not just the signature. Without `--certificate-identity-regexp` and
 `--certificate-oidc-issuer` the check answers "somebody signed this", which is not the question.
+A verified certificate names the workflow, the repository and the tag that built the file — you
+can read it with `base64 -d "$F.pem" | openssl x509 -noout -text` (cosign writes the certificate
+base64-encoded, which surprises people who try `openssl` on it directly).
+
+Older cosign builds predate `--bundle`; separate `.sig` and `.pem` files are published alongside
+for them, used as `--signature "$F.sig" --certificate "$F.pem"`. Current cosign marks those flags
+deprecated, so prefer the bundle.
 
 Public releases additionally carry SLSA build provenance, verifiable with
 `gh attestation verify <file> --repo Eszetael/postgres-mcp-hardened`.
@@ -305,6 +311,22 @@ gateway can route and authorise without parsing the body, and if header and body
 the thing that authorised and the thing that executes saw two different requests. And a client
 stating a version we do not implement is told so (`-32022`) rather than quietly served under a
 contract it never agreed to.
+
+## Working on this
+
+```bash
+git config core.hooksPath .githooks   # once, per clone
+```
+
+`.githooks/pre-push` runs format, clippy, the unit tests and the documentation-claim checks before
+anything leaves your machine. It exists because of a specific mistake: a commit went out with a
+failing clippy lint, and the first anyone knew of it was a failure email. Note that `cargo test`
+passes on that code — clippy lints are not compiler errors — so "it builds locally" is not the
+same answer as "CI will be green".
+
+It deliberately skips the acceptance suite and the PostgreSQL matrix: those need Docker and about
+twenty minutes, and a hook people cannot afford to run is a hook people bypass. CI runs everything.
+`git push --no-verify` when you want to see something fail in CI on purpose.
 
 ## Setting up the role
 
