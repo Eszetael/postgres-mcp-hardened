@@ -10,7 +10,7 @@ repository = "https://github.com/Eszetael/postgres-mcp-hardened"
 readme = "README.md"
 
 [dependencies]
-sqlparser = { version = "0.49.0", features = ["visitor"] }
+sqlparser = { version = "0.62.0", features = ["visitor"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["arbitrary_precision"] }
 tokio = { version = "1", features = ["full"] }
