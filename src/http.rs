@@ -13,6 +13,7 @@ pub(crate) struct Metrics {
     pub(crate) denied_cost: AtomicU64,
     pub(crate) denied_auth: AtomicU64,
     pub(crate) denied_rate: AtomicU64,
+    pub(crate) denied_origin: AtomicU64,
     pub(crate) audit_write_failed: AtomicU64,
     pub(crate) errors: AtomicU64,
 }
@@ -60,12 +61,68 @@ pub(crate) fn render_metrics() -> String {
         METRICS.denied_rate.load(Ordering::Relaxed)
     );
     push_metric!(
+        "mcp_denied_origin_total",
+        METRICS.denied_origin.load(Ordering::Relaxed)
+    );
+    push_metric!(
         "mcp_audit_write_failed_total",
         METRICS.audit_write_failed.load(Ordering::Relaxed)
     );
     push_metric!("mcp_errors_total", METRICS.errors.load(Ordering::Relaxed));
 
     buf
+}
+
+/// Refuses browser-originated requests unless the operator named the origin.
+///
+/// A page the user is merely visiting can make its browser POST to `http://localhost:8080/mcp`.
+/// That is DNS rebinding's whole trick, and against a local database server it is the difference
+/// between reading a news site and reading `salaries`. The MCP specification requires 403 here; the
+/// default is strict because a browser has no business talking to this server until somebody says
+/// otherwise, and the people who need it (a web-based MCP client) know they need it.
+///
+/// `Host` is checked only when we listen on loopback. That is precisely the rebinding case — a name
+/// the attacker controls resolving to 127.0.0.1 — while a server behind a reverse proxy legitimately
+/// sees any hostname, and refusing those would break real deployments to guard against nothing.
+pub(crate) fn check_origin(headers: &HeaderMap, listen: &str) -> Result<(), String> {
+    if let Some(origin) = headers.get("origin").and_then(|v| v.to_str().ok()) {
+        let allowed = std::env::var("MCP_ALLOWED_ORIGINS").unwrap_or_default();
+        let ok = allowed
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            // Exact match on the whole origin, never a prefix or suffix: `https://evil-localhost.com`
+            // contains `localhost` and would sail through a substring test.
+            .any(|a| a.eq_ignore_ascii_case(origin.trim_end_matches('/')));
+        if !ok {
+            return Err(format!(
+                "origin {:?} is not allowed — a browser page may not talk to this server unless its \
+                 origin is listed in MCP_ALLOWED_ORIGINS",
+                origin
+            ));
+        }
+    }
+    let on_loopback = listen.starts_with("127.") || listen.starts_with("[::1]") || listen.starts_with("localhost");
+    if on_loopback {
+        if let Some(host) = headers.get("host").and_then(|v| v.to_str().ok()) {
+            let bare = host.split(':').next().unwrap_or(host);
+            let extra = std::env::var("MCP_ALLOWED_HOSTS").unwrap_or_default();
+            let ok = matches!(bare, "localhost" | "127.0.0.1" | "::1" | "[::1]")
+                || extra
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .any(|a| a.eq_ignore_ascii_case(bare));
+            if !ok {
+                return Err(format!(
+                    "host header {:?} does not name this loopback server — a name that resolves to \
+                     127.0.0.1 is how DNS rebinding reaches it; add it to MCP_ALLOWED_HOSTS if it is yours",
+                    host
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 pub(crate) async fn metrics_handler(headers: HeaderMap) -> impl IntoResponse {

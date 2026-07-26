@@ -57,6 +57,22 @@ pub(crate) fn sql_fingerprint(sql: &str) -> String {
 
 // --- Main audit function ---
 pub(crate) fn audit(tool: &str, decision: &str, sql: Option<&str>) {
+    audit_extra(tool, decision, sql, serde_json::Map::new())
+}
+
+/// As `audit`, with additional fields on the record.
+///
+/// Extra keys are safe for the chain because `serde_json` here builds a `BTreeMap` (the
+/// `preserve_order` feature is off), so every record serialises with its keys sorted and the
+/// verifier — which strips `prev`/`hash` and re-serialises — reproduces the same bytes. A test pins
+/// this, because turning that feature on somewhere in the dependency tree would break every chain
+/// silently.
+pub(crate) fn audit_extra(
+    tool: &str,
+    decision: &str,
+    sql: Option<&str>,
+    extra: serde_json::Map<String, Value>,
+) {
     // 1. Timestamp (sekundy od epoki)
     let ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -84,6 +100,11 @@ pub(crate) fn audit(tool: &str, decision: &str, sql: Option<&str>) {
     // operator would learn to ignore "CORRUPTED" — masking a real tamper.
     if let Some((_, fp)) = &key {
         entry["key_fp"] = Value::String(fp.clone());
+    }
+    if let Some(obj) = entry.as_object_mut() {
+        for (k, v) in extra {
+            obj.insert(k, v);
+        }
     }
 
     // 4. Chain: HMAC-SHA256(key, prev || entry) when a key is set, otherwise plain SHA-256.

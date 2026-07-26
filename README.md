@@ -266,6 +266,16 @@ offered, plus column comments, primary keys and **foreign keys** in the payload.
   PostgreSQL then refuses `SELECT *` on that table, so callers name columns instead; `describe_table`
   lists them and marks the redacted one.
 - **Prompt-injection aware:** row data is returned inside a `trusted="false"` provenance block with delimiters escaped, so a malicious cell can't hijack the agent.
+- **A browser cannot reach it:** a request carrying an `Origin` is refused with 403 unless the
+  operator listed that origin, and on a loopback listener a `Host` that is not localhost is refused
+  too — the shape a DNS-rebinding attack takes when it aims at a database server on your laptop.
+- **The audit knows the configuration:** the chain opens with a `startup` record naming the version,
+  the transport and every setting in force, with connection passwords stripped and secrets reduced to
+  fingerprints, plus a `config_fp` an operator can pin across restarts. A log that says what happened
+  but not under which settings cannot answer the first question an incident asks.
+- **A misspelt setting is fatal:** `MCP_REDACT_COLUMN` (singular) used to start the server with
+  redaction quietly switched off. Unknown `MCP_*` variables now stop startup and name the intended
+  spelling; `MCP_X_*` is reserved for the operator's own use.
 - **No schema leaks:** database errors are mapped to structured, actionable messages that never echo table/column names.
 - **OAuth 2.1:** optional RS256 bearer-token validation (signature, `exp`, `aud`, `iss`) with scope enforcement; disabled when unconfigured for local/self-host use.
 - **Audit:** every tool decision is logged as a tamper-evident, hash-chained JSON line (no raw SQL).
@@ -320,6 +330,8 @@ left resident memory flat and file descriptors unchanged.
 | `MCP_RESERVED_AUTH_SLOTS` | database slots kept for authenticated traffic so an anonymous flood cannot take the pool (default: a quarter) |
 | `MCP_PUBLIC_URL` | this server's public base URL, used in the OAuth discovery metadata |
 | `MCP_AUTH_SERVERS` | authorization server URLs advertised in that metadata |
+| `MCP_ALLOWED_ORIGINS` | browser origins permitted to call this server, e.g. `https://my-client.example`. Empty means no browser page may reach it: a page the user is merely visiting can make their browser POST to `localhost`, which is DNS rebinding's whole trick |
+| `MCP_ALLOWED_HOSTS` | extra `Host` values accepted when listening on loopback (localhost and 127.0.0.1 always are) |
 | `MCP_TRUST_PROXY` | set to `1` only behind a reverse proxy — then the rate limiter keys on `X-Forwarded-For` instead of the peer address |
 
 ## License

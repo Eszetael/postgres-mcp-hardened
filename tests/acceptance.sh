@@ -307,6 +307,40 @@ else no "shared token still audits as anonymous" "$(tail -1 /tmp/acc_audit2_$$.l
 stop
 rm -f /tmp/acc_audit_$$.log /tmp/acc_audit2_$$.log
 
+section "A browser page cannot reach this server"
+start DATABASE_URL="$URL"
+o(){ curl -s -o /dev/null -w '%{http_code}' -m 15 -H content-type:application/json "$@" \
+      "http://127.0.0.1:$PORT/mcp" -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"query","arguments":{"sql":"SELECT 1"}}}'; }
+[ "$(o)" = 200 ] && ok "a non-browser client (no Origin) is unaffected" || no "plain client blocked" "$(o)"
+[ "$(o -H 'origin: https://evil.example')" = 403 ] && ok "a page from another origin gets 403" || no "foreign origin allowed" ""
+# `evil-localhost.com` contains `localhost`; a substring test would let it through.
+[ "$(o -H 'origin: https://evil-localhost.com')" = 403 ] && ok "an origin that merely contains a trusted name is refused" || no "substring origin allowed" ""
+# DNS rebinding: a name the attacker controls resolving to 127.0.0.1.
+[ "$(o -H 'host: attacker.example')" = 403 ] && ok "a foreign Host on a loopback listener is refused" || no "rebinding host allowed" ""
+stop
+start DATABASE_URL="$URL" MCP_ALLOWED_ORIGINS="https://my-client.example"
+[ "$(o -H 'origin: https://my-client.example')" = 200 ] && ok "an origin the operator listed is allowed" || no "listed origin blocked" ""
+[ "$(o -H 'origin: https://my-client.example.evil.com')" = 403 ] && ok "a lookalike of a listed origin is refused" || no "lookalike allowed" ""
+stop
+
+section "The server knows, and records, what it is"
+r=$(env DATABASE_URL="$URL" MCP_REDACT_COLUMN=ssn "$BIN" 2>&1; echo "rc=$?")
+case "$r" in *"did you mean MCP_REDACT_COLUMNS"*) ok "a misspelt setting is refused, with the correct name";; *) no "typo silently ignored" "$r";; esac
+case "$r" in *"rc=2"*) ok "and the refusal is fatal, not a warning";; *) no "typo did not stop startup" "$r";; esac
+r=$(env DATABASE_URL="$URL" MCP_X_MINE=1 MCP_ADDR=127.0.0.1:$PORT timeout 3 "$BIN" 2>&1; true)
+case "$r" in *listening*) ok "MCP_X_* stays free for the operator's own variables";; *) no "reserved prefix rejected" "$r";; esac
+AUD=/tmp/acc_startup_$$.log; rm -f "$AUD"
+start DATABASE_URL="$URL" MCP_AUDIT_LOG="$AUD" MCP_BEARER_TOKEN=acc_secret_token MCP_RATE_RPM=42
+curl -s -o /dev/null -m 20 -H content-type:application/json -H "authorization: Bearer acc_secret_token" \
+  "http://127.0.0.1:$PORT/mcp" -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"query","arguments":{"sql":"SELECT 1"}}}'
+stop
+head -1 "$AUD" | grep -q '"decision":"startup"' && ok "the chain opens with what the server is" || no "no startup entry" "$(head -1 "$AUD")"
+head -1 "$AUD" | grep -q '"MCP_RATE_RPM":"42"' && ok "the settings in force are recorded" || no "settings not recorded" ""
+grep -q "$PGPW" "$AUD" && no "THE DATABASE PASSWORD IS IN THE AUDIT LOG" "" || ok "the connection password never reaches the log"
+grep -q 'acc_secret_token' "$AUD" && no "THE BEARER TOKEN IS IN THE AUDIT LOG" "" || ok "the shared token is fingerprinted, not written"
+"$BIN" --verify-audit "$AUD" >/dev/null 2>&1 && ok "the chain still verifies with the new fields" || no "chain broken by extra fields" ""
+rm -f "$AUD"
+
 section "Deployment shapes"
 start MCP_DATABASE_URLS="a=$URL;b=$URL"
 r=$(tool query '{"sql":"SELECT 1 AS x","database":"b"}' | body); echo "$r" | grep -q '"x":1' && ok "several databases from one server" || no "multi-database" "$r"

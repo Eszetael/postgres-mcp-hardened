@@ -141,8 +141,10 @@ pub(crate) async fn main() {
     }
     // Configuration is checked BEFORE we serve anyone — see `preflight_config`.
     preflight_config();
+    let stdio = args.contains(&"--stdio".to_string());
+    audit_startup(if stdio { "stdio" } else { "http" });
     spawn_redaction_verification();
-    if args.contains(&"--stdio".to_string()) {
+    if stdio {
         // stdio: run the synchronous loop on a blocking task so the runtime stays free
         tokio::task::spawn_blocking(run_stdio).await.unwrap();
     } else {
@@ -246,6 +248,162 @@ pub(crate) fn spawn_redaction_verification() {
     });
 }
 
+/// Every environment variable this server reads. One list, so that a typo cannot pass for a setting.
+///
+/// `MCP_REDACT_COLUMN=ssn` — singular, one letter short — used to start the server with redaction
+/// silently switched off, and nothing anywhere would say so. A configuration mistake that turns a
+/// protection off must be louder than one that turns it on, and the only way to be loud about a
+/// misspelling is to know every correct spelling.
+///
+/// `MCP_X_*` is reserved for whoever needs their own variables in the same environment (another MCP
+/// server in the same compose file, say) and is never rejected.
+pub(crate) const KNOWN_VARS: &[&str] = &[
+    "DATABASE_URL",
+    "JWT_AUD",
+    "JWT_ISS",
+    "JWT_PUBKEY_PEM",
+    "MCP_ADDR",
+    "MCP_ALLOWED_HOSTS",
+    "MCP_ALLOWED_ORIGINS",
+    "MCP_ALLOW_ANONYMOUS_NETWORK",
+    "MCP_ALLOW_EXCESSIVE_ROLE",
+    "MCP_ALLOW_FUNCTIONS",
+    "MCP_AUDIT_HMAC_KEY",
+    "MCP_AUDIT_HMAC_KEYS_OLD",
+    "MCP_AUDIT_HMAC_KEY_FILE",
+    "MCP_AUDIT_LOG",
+    "MCP_AUTH_SERVERS",
+    "MCP_BEARER_TOKEN",
+    "MCP_DATABASE_URLS",
+    "MCP_FUZZ_VERBOSE",
+    "MCP_MAX_COST",
+    "MCP_MAX_INFLIGHT_PER_CLIENT",
+    "MCP_METRICS_TOKEN",
+    "MCP_PASSWORD_FILE",
+    "MCP_PUBLIC_URL",
+    "MCP_RATE_BURST",
+    "MCP_RATE_RPM",
+    "MCP_REDACT_COLUMNS",
+    "MCP_REDACT_REQUIRE_REVOKE",
+    "MCP_RESERVED_AUTH_SLOTS",
+    "MCP_SEARCH_PATH",
+    "MCP_SERVER_LABEL",
+    "MCP_SHOW_PARTITIONS",
+    "MCP_SSLROOTCERT",
+    "MCP_STATEMENT_TIMEOUT",
+    "MCP_STRUCTURED_CONTENT",
+    "MCP_TRUST_PROXY",
+];
+
+/// Levenshtein distance, for turning "unknown variable" into "did you mean".
+fn edit_distance(a: &str, b: &str) -> usize {
+    let (a, b): (Vec<char>, Vec<char>) = (a.chars().collect(), b.chars().collect());
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    let mut cur = vec![0usize; b.len() + 1];
+    for (i, ca) in a.iter().enumerate() {
+        cur[0] = i + 1;
+        for (j, cb) in b.iter().enumerate() {
+            let cost = usize::from(ca != cb);
+            cur[j + 1] = (prev[j + 1] + 1).min(cur[j] + 1).min(prev[j] + cost);
+        }
+        std::mem::swap(&mut prev, &mut cur);
+    }
+    prev[b.len()]
+}
+
+fn unknown_vars() -> Vec<String> {
+    std::env::vars()
+        .map(|(k, _)| k)
+        .filter(|k| k.starts_with("MCP_") && !k.starts_with("MCP_X_"))
+        .filter(|k| !KNOWN_VARS.contains(&k.as_str()))
+        .map(|k| {
+            match KNOWN_VARS
+                .iter()
+                .map(|known| (edit_distance(&k, known), *known))
+                .min()
+            {
+                Some((d, known)) if d <= 3 => {
+                    format!("unknown setting {}: did you mean {}?", k, known)
+                }
+                _ => format!("unknown setting {} (no similar name exists)", k),
+            }
+        })
+        .collect()
+}
+
+/// Variables whose value must never reach the log — recorded as a fingerprint so a rotation is
+/// visible without the secret ever being written down.
+const SECRET_VARS: &[&str] = &[
+    "MCP_BEARER_TOKEN",
+    "MCP_METRICS_TOKEN",
+    "MCP_AUDIT_HMAC_KEY",
+    "MCP_AUDIT_HMAC_KEYS_OLD",
+];
+
+/// The settings the server is actually running with, rendered for the audit log.
+///
+/// The chain used to begin at the first query, so it could say what happened but never under what
+/// configuration — and "was the rate limit on when this happened?" is exactly the question an
+/// incident asks. Connection strings lose their password; secrets become fingerprints; the whole
+/// thing is hashed into `config_fp`, which an operator can pin and compare across restarts.
+fn config_snapshot() -> serde_json::Map<String, Value> {
+    let mut out = serde_json::Map::new();
+    for name in KNOWN_VARS {
+        let Ok(raw) = std::env::var(name) else { continue };
+        let rendered = if SECRET_VARS.contains(name) {
+            format!(
+                "sha256:{}",
+                &hmac_sha256_hex(b"mcp-config-fingerprint".to_vec(), raw.as_bytes())[..8]
+            )
+        } else if raw.contains("://") {
+            strip_password(&raw)
+        } else if raw.len() > 120 {
+            format!("<{} bytes>", raw.len())
+        } else {
+            raw
+        };
+        out.insert((*name).to_string(), Value::String(rendered));
+    }
+    out
+}
+
+/// Removes the password from a connection string, keeping the shape an operator recognises.
+fn strip_password(url: &str) -> String {
+    let mut out = String::with_capacity(url.len());
+    for part in url.split(';') {
+        if !out.is_empty() {
+            out.push(';');
+        }
+        match (part.find("://"), part.find('@')) {
+            (Some(s), Some(at)) if at > s => {
+                let creds = &part[s + 3..at];
+                let user = creds.split(':').next().unwrap_or("");
+                out.push_str(&part[..s + 3]);
+                out.push_str(user);
+                out.push_str(":***");
+                out.push_str(&part[at..]);
+            }
+            _ => out.push_str(part),
+        }
+    }
+    out
+}
+
+/// Opens the chain with what this process is, before it serves anything.
+pub(crate) fn audit_startup(transport: &str) {
+    let snapshot = config_snapshot();
+    let canonical = serde_json::to_string(&snapshot).unwrap_or_default();
+    let mut extra = serde_json::Map::new();
+    extra.insert("version".into(), json!(env!("CARGO_PKG_VERSION")));
+    extra.insert("transport".into(), json!(transport));
+    extra.insert(
+        "config_fp".into(),
+        json!(&hmac_sha256_hex(b"mcp-config-fingerprint".to_vec(), canonical.as_bytes())[..16]),
+    );
+    extra.insert("config".into(), Value::Object(snapshot));
+    audit_extra("server", "startup", None, extra);
+}
+
 pub(crate) fn preflight_config() {
     let mut fatal: Vec<String> = Vec::new();
 
@@ -333,6 +491,8 @@ pub(crate) fn preflight_config() {
              the audit without an identity. Remove one of the two."
         );
     }
+
+    fatal.extend(unknown_vars());
 
     if !fatal.is_empty() {
         eprintln!("CONFIGURATION ERROR — the server will not start:");
@@ -454,6 +614,11 @@ pub(crate) async fn delete_session_handler(
 ) -> impl IntoResponse {
     // This endpoint takes a WRITE lock on the session map — the same lock every request carrying an
     // `Mcp-Session-Id` needs. Without a rate limit it could be used to choke normal traffic.
+    if let Err(msg) = http::check_origin(&headers, &listen_addr()) {
+        METRICS.denied_origin.fetch_add(1, Ordering::Relaxed);
+        audit("http", "denied_origin", None);
+        return (StatusCode::FORBIDDEN, msg).into_response();
+    }
     let key = ratelimit::client_key(
         &peer.ip().to_string(),
         headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()),
@@ -488,6 +653,11 @@ pub(crate) async fn delete_session_handler(
 }
 
 // --- HANDLER /mcp (STREAMABLE HTTP) ---
+/// The address the server was told to listen on, for checks that depend on exposure.
+pub(crate) fn listen_addr() -> String {
+    std::env::var("MCP_ADDR").unwrap_or_else(|_| "127.0.0.1:8080".to_string())
+}
+
 pub(crate) async fn mcp_handler(
     ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
     headers: HeaderMap,
@@ -495,6 +665,13 @@ pub(crate) async fn mcp_handler(
     Json(req): Json<serde_json::Value>,
 ) -> impl IntoResponse {
     METRICS.requests.fetch_add(1, Ordering::Relaxed);
+    // Before anything else, including the rate limit: a browser page must not be able to reach this
+    // server at all, so it should not even be able to consume the rate-limit budget.
+    if let Err(msg) = http::check_origin(&headers, &listen_addr()) {
+        METRICS.denied_origin.fetch_add(1, Ordering::Relaxed);
+        audit("http", "denied_origin", None);
+        return (StatusCode::FORBIDDEN, msg).into_response();
+    }
     // Rate limit BEFORE auth: verifying an RS256 signature costs CPU, so a flood of junk tokens must
     // bounce earlier. DB_SEM caps concurrency; this caps rate.
     let key = ratelimit::client_key(
