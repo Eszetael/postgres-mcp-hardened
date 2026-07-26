@@ -242,6 +242,23 @@ offered, plus column comments, primary keys and **foreign keys** in the payload.
   column *means* and what it points at instead of guessing from its name — and a missing table is an
   error, not an empty column list.
 
+## Setting up the role
+
+```bash
+DATABASE_URL=postgres://admin@host/mydb postgres-mcp-hardened \
+  --print-setup-sql --role mcp_reader --schemas public --redact ssn,email > setup.sql
+# read it, then:
+psql -v pw="$(openssl rand -base64 24)" -f setup.sql mydb
+```
+
+Run with a connection string and the table and column lists come from the catalogue; without one you
+get the same document with placeholders. The difference matters most for redaction: the columns to
+grant back have to be read from the database, because writing them from memory is how a column meant
+to stay hidden gets handed back.
+
+The output ends with checks that return no rows when it worked, and a reminder that the server itself
+will tell you what the role can do the moment you point it at the database.
+
 ## Security model
 
 - **Encrypted transport:** TLS to PostgreSQL via rustls (no OpenSSL in the image), certificate
@@ -266,6 +283,11 @@ offered, plus column comments, primary keys and **foreign keys** in the payload.
   PostgreSQL then refuses `SELECT *` on that table, so callers name columns instead; `describe_table`
   lists them and marks the redacted one.
 - **Prompt-injection aware:** row data is returned inside a `trusted="false"` provenance block with delimiters escaped, so a malicious cell can't hijack the agent.
+- **It generates the role you should be running as:** `--print-setup-sql` writes the DDL for a role
+  that inherits nothing, bypasses nothing, creates nothing, reads only the relations you name, and —
+  where you have named sensitive columns — has them revoked in the order that actually works. It
+  prints; it never executes. Applying this needs administrative rights, and a tool whose whole
+  identity is "read-only" has no business holding an administrator's password.
 - **It will not expose a role that can write:** when the listen address is reachable from the
   network, the server asks PostgreSQL what the connected role is actually allowed to do — superuser,
   `BYPASSRLS`, membership of `pg_write_all_data` and friends, and write privileges on a bounded sample

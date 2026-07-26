@@ -374,6 +374,40 @@ grep -q "listening" /tmp/acc_loop_$$.log && ok "loopback is left alone — the c
 kill -9 $LOOPPID 2>/dev/null; rm -f /tmp/acc_loop_$$.log
 PORT=$((PORT+910))
 
+section "The generated role moves the boundary into PostgreSQL"
+# The decisive test of the whole project: follow our own instructions, then check that the refusal
+# arrives from the database as SQLSTATE 42501 rather than from our validator. A validator can be
+# wrong — it has been, repeatedly. A privilege the role does not hold cannot be.
+"$BIN" --print-setup-sql --role acc_gen --tables public.customers,public.orders --redact email \
+  > /tmp/acc_setup_$$.sql 2>/dev/null
+grep -q 'NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOBYPASSRLS NOREPLICATION' /tmp/acc_setup_$$.sql \
+  && ok "the generated role inherits nothing and bypasses nothing" || no "role attributes missing" ""
+DATABASE_URL="$URL" "$BIN" --print-setup-sql --role acc_gen --tables public.customers,public.orders \
+  --redact email > /tmp/acc_setup_$$.sql 2>/dev/null
+# Online, the column list comes from the catalogue — writing it from guesswork would re-grant the
+# very column meant to stay hidden.
+grep -q 'REVOKE SELECT ON "public"."customers"' /tmp/acc_setup_$$.sql \
+  && ok "a redacted table is revoked at table level first" || no "no table-level revoke" "$(cat /tmp/acc_setup_$$.sql)"
+grep -q 'GRANT SELECT ("id", "name") ON "public"."customers"' /tmp/acc_setup_$$.sql \
+  && ok "and only the remaining columns are granted back" || no "column grant wrong" "$(grep GRANT /tmp/acc_setup_$$.sql)"
+grep -q 'ALTER DEFAULT PRIVILEGES FOR ROLE' /tmp/acc_setup_$$.sql \
+  && ok "future tables do not appear by themselves" || no "no default privileges rule" ""
+docker exec -i acc_pg psql -U postgres -q -v pw=acc_gen_pw -v ON_ERROR_STOP=1 < /tmp/acc_setup_$$.sql >/dev/null \
+  && ok "the generated SQL applies cleanly" || no "generated SQL failed to apply" "$(cat /tmp/acc_setup_$$.sql)"
+GURL="postgres://acc_gen:acc_gen_pw@127.0.0.1:$PGPORT_ACC/postgres"
+start DATABASE_URL="$GURL" MCP_REDACT_COLUMNS=email
+r=$(tool query '{"sql":"SELECT id, name FROM customers"}' | body)
+case "$r" in ERROR:*) no "the granted columns are unreadable" "$r";; *) ok "the columns the role was granted still read";; esac
+# If our validator were bypassed tomorrow, this is what would happen instead.
+r=$(docker exec -i acc_pg psql -U postgres -q -c "SET ROLE acc_gen; SELECT email FROM customers LIMIT 1;" 2>&1)
+case "$r" in *"permission denied"*) ok "the database itself refuses the redacted column (42501)";; *) no "database did not refuse" "$r";; esac
+r=$(docker exec -i acc_pg psql -U postgres -q -c "SET ROLE acc_gen; INSERT INTO customers VALUES (99,'x','y');" 2>&1)
+case "$r" in *"permission denied"*) ok "the database itself refuses a write";; *) no "database allowed a write" "$r";; esac
+r=$(docker exec -i acc_pg psql -U postgres -q -c "SET ROLE acc_gen; SELECT * FROM events LIMIT 1;" 2>&1)
+case "$r" in *"permission denied"*) ok "a table outside the named surface is unreachable";; *) no "ungranted table readable" "$r";; esac
+stop
+rm -f /tmp/acc_setup_$$.sql
+
 section "Deployment shapes"
 start MCP_DATABASE_URLS="a=$URL;b=$URL"
 r=$(tool query '{"sql":"SELECT 1 AS x","database":"b"}' | body); echo "$r" | grep -q '"x":1' && ok "several databases from one server" || no "multi-database" "$r"

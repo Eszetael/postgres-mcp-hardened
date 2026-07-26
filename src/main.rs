@@ -25,6 +25,7 @@ pub(crate) use db::*;
 pub(crate) use http::*;
 pub(crate) use tools::*;
 mod posture;
+mod setup_sql;
 mod ratelimit;
 mod validate;
 
@@ -103,6 +104,16 @@ pub(crate) async fn main() {
     }
     // Dev: show the TEXT that would actually reach the database (canonical AST + enforced LIMIT).
     // We validate one thing and execute another — this command lets harnesses compare the two.
+    // Generates the least-privilege role to connect as. Prints; never executes — see setup_sql.rs.
+    if args.iter().any(|a| a == "--print-setup-sql") {
+        // On the blocking pool: the PostgreSQL driver is synchronous, and blocking on a runtime
+        // thread panics. Same reason as the start-up check.
+        let a = args.clone();
+        let rc = tokio::task::spawn_blocking(move || setup_sql::run(&a))
+            .await
+            .unwrap_or(2);
+        std::process::exit(rc);
+    }
     if let Some(pos) = args.iter().position(|a| a == "--canon") {
         let sql = args.get(pos + 1).map(|s| s.as_str()).unwrap_or("");
         match validate::enforce_limit(sql, 1000) {
