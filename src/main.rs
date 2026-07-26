@@ -181,6 +181,25 @@ fn preflight_config() {
         }
     }
 
+    // Statement timeout must be a value PostgreSQL accepts; a typo would otherwise surface as a
+    // failed query much later, or (worse) be silently ignored.
+    if let Ok(v) = std::env::var("MCP_STATEMENT_TIMEOUT") {
+        let ok = !v.trim().is_empty()
+            && v.trim()
+                .chars()
+                .all(|c| c.is_ascii_digit() || c.is_ascii_alphabetic() || c == ' ');
+        if !ok {
+            fatal.push(format!(
+                "MCP_STATEMENT_TIMEOUT is not a PostgreSQL interval: {:?}",
+                v
+            ));
+        }
+    }
+    if let Ok(p) = std::env::var("MCP_PASSWORD_FILE") {
+        if let Err(e) = std::fs::read_to_string(&p) {
+            fatal.push(format!("MCP_PASSWORD_FILE {}: {}", p, e));
+        }
+    }
     // TLS CA: better to learn at startup than on the first query
     if std::env::var("MCP_SSLROOTCERT").is_ok() {
         if let Err(e) = build_tls() {
@@ -549,9 +568,49 @@ type PgPool = Pool<PostgresConnectionManager<PgTls>>;
 /// into their config. Accepting both means their existing invocation keeps working (issue #845 in
 /// the upstream tracker asked for the environment variable; we support both rather than either).
 fn database_url() -> Option<String> {
+    // A password kept in a file (Kubernetes secret, systemd credential, .pgpass-style) rather than
+    // in the client configuration: `MCP_PASSWORD_FILE` is substituted into the connection string.
+    let with_password = |u: String| -> String {
+        match std::env::var("MCP_PASSWORD_FILE")
+            .ok()
+            .and_then(|p| std::fs::read_to_string(p).ok())
+        {
+            Some(pw) => {
+                let pw = pw.trim_end_matches(['\n', '\r']);
+                let enc: String = pw
+                    .chars()
+                    .map(|c| match c {
+                        '@' => "%40".to_string(),
+                        ':' => "%3A".to_string(),
+                        '/' => "%2F".to_string(),
+                        '#' => "%23".to_string(),
+                        '?' => "%3F".to_string(),
+                        c => c.to_string(),
+                    })
+                    .collect();
+                if let Some(rest) = u
+                    .strip_prefix("postgres://")
+                    .or_else(|| u.strip_prefix("postgresql://"))
+                {
+                    let scheme = if u.starts_with("postgresql://") {
+                        "postgresql://"
+                    } else {
+                        "postgres://"
+                    };
+                    // user[:pw]@host…  →  user:<file password>@host…
+                    if let Some((userinfo, hostpart)) = rest.split_once('@') {
+                        let user = userinfo.split(':').next().unwrap_or(userinfo);
+                        return format!("{}{}:{}@{}", scheme, user, enc, hostpart);
+                    }
+                }
+                u
+            }
+            None => u,
+        }
+    };
     if let Ok(u) = std::env::var("DATABASE_URL") {
         if !u.trim().is_empty() {
-            return Some(u);
+            return Some(with_password(u));
         }
     }
     std::env::args().skip(1).find(|a| {
@@ -901,7 +960,15 @@ fn execute_readonly(final_sql: &str, db: Option<&str>) -> Result<Value, String> 
     client
         .batch_execute("DISCARD ALL")
         .map_err(|e| e.to_string())?;
-    client.batch_execute("SET statement_timeout='30s'; SET idle_in_transaction_session_timeout='10s'; SET default_transaction_read_only=on;")
+    // Configurable, because a hardcoded ceiling is either too low for analytics or too high for a
+    // shared database — the most requested setting against the leading alternative.
+    client
+        .batch_execute(&format!(
+            "SET statement_timeout='{}'; SET idle_in_transaction_session_timeout='10s'; \
+             SET default_transaction_read_only=on;{}",
+            statement_timeout(),
+            search_path_stmt()
+        ))
         .map_err(|e| e.to_string())?;
     // EXPLICIT READ ONLY TRANSACTION, always finished with ROLLBACK.
     //
@@ -1016,7 +1083,11 @@ fn query_catalog(
         .batch_execute("DISCARD ALL")
         .map_err(|e| e.to_string())?;
     client
-        .batch_execute("SET statement_timeout='15s'; SET default_transaction_read_only=on;")
+        .batch_execute(&format!(
+            "SET statement_timeout='{}'; SET default_transaction_read_only=on;{}",
+            statement_timeout(),
+            search_path_stmt()
+        ))
         .map_err(|e| e.to_string())?;
     client
         .batch_execute("BEGIN TRANSACTION READ ONLY")
@@ -1114,6 +1185,33 @@ fn handle_list_tables(args: &Value) -> Value {
 }
 
 /// The resource list = one entry per table/view in user schemas (the system catalog is excluded).
+/// Query time limit. `MCP_STATEMENT_TIMEOUT` (a PostgreSQL interval such as `30s`, `2min`).
+/// Validated at startup, so a typo cannot silently turn the limit off.
+fn statement_timeout() -> String {
+    std::env::var("MCP_STATEMENT_TIMEOUT")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or_else(|| "30s".to_string())
+}
+
+/// Optional `search_path`, so a database whose tables live in a custom schema works without
+/// qualifying every name — a reported failure mode of at least one alternative.
+fn search_path_stmt() -> String {
+    match std::env::var("MCP_SEARCH_PATH") {
+        // Each schema is quoted separately: `SET search_path='a,b'` would name ONE schema called
+        // "a,b" and silently find nothing.
+        Ok(p) if !p.trim().is_empty() => {
+            let list = p
+                .split(',')
+                .map(|s| format!("\"{}\"", s.trim().replace('"', "")))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!(" SET search_path TO {};", list)
+        }
+        _ => String::new(),
+    }
+}
+
 /// Whether partition children are listed (off by default — see the query comment).
 fn show_partitions() -> bool {
     std::env::var("MCP_SHOW_PARTITIONS")
@@ -1335,7 +1433,10 @@ fn cost_guard(sql: &str, max_cost: f64, db: Option<&str>) -> Result<(), CostErr>
         .batch_execute("DISCARD ALL")
         .map_err(|e| CostErr::QueryError(e.to_string()))?;
     client
-        .batch_execute("SET statement_timeout='5s'; SET default_transaction_read_only=on;")
+        .batch_execute(&format!(
+            "SET statement_timeout='5s'; SET default_transaction_read_only=on;{}",
+            search_path_stmt()
+        ))
         .map_err(|e| CostErr::QueryError(e.to_string()))?;
     let row = client
         .query_one(&format!("EXPLAIN (FORMAT JSON) {}", sql), &[])

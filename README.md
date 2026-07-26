@@ -113,6 +113,24 @@ Beyond unit tests, the repository carries two harnesses that run in CI on every 
   configuration mistakes failing loudly, audit tamper detection, fair use under load, and
   multi-database deployments.
 
+## What we learned from the alternatives
+
+Every server in this space has an issue tracker, and those trackers are a map of what goes wrong.
+The ones we deliberately built against:
+
+- **A published image that lags the code.** The most-supported open complaint against the leading
+  alternative. Our container is built and pushed from the same tag that produces the binaries, so
+  it cannot drift.
+- **A hardcoded query timeout.** Also among their most requested settings. `MCP_STATEMENT_TIMEOUT`
+  is configurable and validated at startup.
+- **Unrestricted access by default.** Some servers default to read/write and rely on the operator
+  to restrict it. This one has no write path at all.
+- **Credentials in the client configuration.** `MCP_PASSWORD_FILE` keeps the password out of it.
+- **Tables in a non-default schema silently not found.** `MCP_SEARCH_PATH` fixes the lookup, and
+  the tools take an explicit `schema` anyway.
+- **Deprecated transport.** SSE was replaced by Streamable HTTP in the 2025-06-18 specification;
+  we speak the current one.
+
 ## Troubleshooting
 
 Answers to the questions people actually asked about the deprecated server, so nobody has to open
@@ -190,6 +208,9 @@ offered, plus column comments, primary keys and **foreign keys** in the payload.
 | `MCP_AUDIT_LOG` | path to the append-only audit log (hash-chained); verify with `--verify-audit <file> [--expect-last <hash>]` |
 | `MCP_AUDIT_HMAC_KEY` / `MCP_AUDIT_HMAC_KEY_FILE` | key that turns the audit chain into HMAC-SHA256 — keep it off the host so the log cannot be rewritten (a trailing newline in the file is ignored) |
 | `MCP_AUDIT_HMAC_KEYS_OLD` | comma-separated previous keys, so a log that survived a key rotation still verifies |
+| `MCP_STATEMENT_TIMEOUT` | query time limit (PostgreSQL interval, default `30s`) |
+| `MCP_SEARCH_PATH` | schemas to search when a table name is unqualified, e.g. `analytics, public` |
+| `MCP_PASSWORD_FILE` | read the database password from a file instead of putting it in the connection string |
 | `MCP_DATABASE_URLS` | several databases from one server: `prod=postgres://…;dev=postgres://…` (tools then take a `database` argument) |
 | `MCP_SERVER_LABEL` | name shown in the client UI, e.g. `production` → `postgres-mcp-hardened (production)` |
 | `MCP_SHOW_PARTITIONS` | `1` to list partition children as well (hidden by default) |
