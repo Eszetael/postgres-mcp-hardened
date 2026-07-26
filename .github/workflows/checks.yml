@@ -88,6 +88,15 @@ jobs:
       - run: cargo build --locked --release
       - run: ./tests/acceptance.sh
 
+  docs-claims:
+    # Documentation honesty as a build gate. Claims drift from code silently — a "verified" that
+    # names no test, a settings table that has fallen behind — and by the time a user notices, the
+    # damage is to trust, not to a feature.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sh tests/docs_claims.sh
+
   audit:
     runs-on: ubuntu-latest
     steps:

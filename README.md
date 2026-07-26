@@ -385,6 +385,7 @@ left resident memory flat and file descriptors unchanged.
 | `MCP_ALLOW_ANONYMOUS_NETWORK` | set to `i-accept-the-risk` to serve a network listener with no authentication |
 | `MCP_ALLOWED_ORIGINS` | browser origins permitted to call this server, e.g. `https://my-client.example`. Empty means no browser page may reach it: a page the user is merely visiting can make their browser POST to `localhost`, which is DNS rebinding's whole trick |
 | `MCP_ALLOWED_HOSTS` | extra `Host` values accepted when listening on loopback (localhost and 127.0.0.1 always are) |
+| `MCP_FUZZ_VERBOSE` | development only: makes `--fuzz` print each mutation it tried |
 | `MCP_TRUST_PROXY` | set to `1` only behind a reverse proxy — then the rate limiter keys on `X-Forwarded-For` instead of the peer address |
 
 ## License

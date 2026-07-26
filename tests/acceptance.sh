@@ -72,6 +72,21 @@ done
 r=$(tool query '{"sql":"SELECT count(*) AS n FROM orders"}' | body)
 [ "$(echo "$r" | grep -c '"n":2')" = 1 ] && ok "ordinary read works" || no "ordinary read" "$r"
 
+# Its own server with the rate limit off: ten extra requests on a shared instance ate the burst
+# budget and made unrelated sections fail, which is how a suite starts being ignored.
+stop
+start DATABASE_URL="$URL" MCP_RATE_RPM=0
+# The row in COMMUNITY_ISSUES claims all eight spellings are refused; two were being checked.
+for sql in "COMMIT" "COMMIT WORK" "COMMIT TRANSACTION" "COMMIT AND CHAIN" \
+           "END" "END WORK" "END TRANSACTION" "END AND NO CHAIN" \
+           "ROLLBACK" "ABORT"; do
+  r=$(tool query "{\"sql\":\"$sql\"}" | body)
+  case "$r" in ERROR:*) ok "transaction control refused: $sql";; *) no "TRANSACTION CONTROL ACCEPTED" "$sql -> $r";; esac
+done
+stop
+# The next section reuses this server, so put one back.
+start DATABASE_URL="$URL"
+
 section "Results that never lie"
 r=$(tool query '{"sql":"SELECT total FROM orders WHERE id=1"}' | body)
 echo "$r" | grep -q '12345678901.1234567890' && ok "numeric keeps every digit" || no "numeric precision" "$r"
