@@ -125,6 +125,29 @@ pub(crate) async fn main() {
         }
         return;
     }
+    /// Write a line of command-line output, and treat a closed pipe as the end of the job.
+    ///
+    /// `println!` panics when stdout goes away, which is what every other Unix tool treats as "the
+    /// reader has seen enough". `--verify-audit … | head` printed a Rust panic and a non-zero status
+    /// on a log long enough to race — it looked like the verification had failed when it had not.
+    /// Every other write error is still real and still reported.
+    fn say(line: String) {
+        use std::io::Write;
+        let mut out = std::io::stdout().lock();
+        match out
+            .write_all(line.as_bytes())
+            .and_then(|_| out.write_all(b"\n"))
+            .and_then(|_| out.flush())
+        {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => std::process::exit(0),
+            Err(e) => {
+                eprintln!("cannot write to stdout: {}", e);
+                std::process::exit(1);
+            }
+        }
+    }
+
     // Audit chain verification. "Tamper-evident" without a tool to check it is a slogan, not a
     // control — the user must be able to confirm the log was not touched THEMSELVES, using the same
     // code that wrote it (rather than guessing our key ordering).
@@ -137,7 +160,7 @@ pub(crate) async fn main() {
             .map(|s| s.as_str());
         match verify_audit_file(path, expect) {
             Ok((summary, _last)) => {
-                println!(
+                say(format!(
                     "OK ({}): {}",
                     if audit_key().is_some() {
                         "HMAC-SHA256"
@@ -145,10 +168,10 @@ pub(crate) async fn main() {
                         "SHA-256, unkeyed"
                     },
                     summary
-                );
+                ));
             }
             Err(e) => {
-                println!("TAMPERED: {}", e);
+                say(format!("TAMPERED: {}", e));
                 std::process::exit(1);
             }
         }

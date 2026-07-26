@@ -137,7 +137,14 @@ section "Audit trail"
 AUD=$(mktemp); start DATABASE_URL="$URL" MCP_AUDIT_LOG="$AUD" MCP_AUDIT_HMAC_KEY=acc_key
 tool query '{"sql":"SELECT 1"}' >/dev/null; tool query '{"sql":"DROP TABLE orders"}' >/dev/null
 stop
-MCP_AUDIT_HMAC_KEY=acc_key "$BIN" --verify-audit "$AUD" | grep -q '^OK' && ok "chain verifies" || no "chain verification"
+v=$(MCP_AUDIT_HMAC_KEY=acc_key "$BIN" --verify-audit "$AUD" 2>&1)
+case "$v" in ^OK*|OK\ *) ok "chain verifies";; *) no "chain verification" "$v";; esac
+# A reader that stops early is not a failure. `--verify-audit … | head` used to print a Rust panic
+# and exit non-zero, which reads as "the log was tampered with" when nothing of the sort happened —
+# and it only showed up on a log long enough to race, so it looked like a flaky test rather than a
+# defect in the tool.
+( set -o pipefail; MCP_AUDIT_HMAC_KEY=acc_key "$BIN" --verify-audit "$AUD" 2>&1 | head -1 >/dev/null )
+[ $? -eq 0 ] && ok "a reader that stops early does not look like a failure" || no "broken pipe treated as an error"
 sed -i '1d' "$AUD"
 MCP_AUDIT_HMAC_KEY=acc_key "$BIN" --verify-audit "$AUD" >/dev/null 2>&1 && no "tampering not detected" || ok "removing an entry is detected"
 rm -f "$AUD"
