@@ -43,6 +43,9 @@ alternative to the deprecated `@modelcontextprotocol/server-postgres`.
 - **Tamper-evident audit log** (hash-chained), **Prometheus `/metrics`**,
   **`/health` + `/ready`** probes.
 - **Transports:** Streamable HTTP + stdio. Ships as a distroless, non-root container.
+- **Several databases from one server** (`MCP_DATABASE_URLS`) — every tool takes an optional
+  `database`, resources span all connections and their URIs carry the database name, so a
+  production and a development connection can never be confused.
 - **Schema as MCP resources** — every table and view is readable as
   `postgres:///<schema>/<table>/schema`, matching what the deprecated server offered and adding
   comments, primary keys and foreign keys.

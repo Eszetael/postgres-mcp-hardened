@@ -559,10 +559,11 @@ fn database_url() -> Option<String> {
     })
 }
 
-/// The database name, used to tell instances apart in resource URIs.
-fn database_name() -> String {
-    database_url()
-        .and_then(|u| normalize_sslmode(&u).parse::<postgres::Config>().ok())
+/// The database name inside a connection string — used to label a single-database deployment.
+fn database_name_of(url: &str) -> String {
+    normalize_sslmode(url)
+        .parse::<postgres::Config>()
+        .ok()
         .and_then(|c| c.get_dbname().map(|s| s.to_string()))
         .unwrap_or_else(|| "postgres".to_string())
 }
@@ -647,33 +648,100 @@ fn build_tls() -> Result<PgTls, String> {
     Ok(tokio_postgres_rustls::MakeRustlsConnect::new(cfg))
 }
 
-static PG_POOL: Lazy<Result<PgPool, String>> = Lazy::new(|| {
+/// Named connection pools. One server can serve several databases — the second most requested
+/// feature against the deprecated server, where the connection string was a command-line argument
+/// and a client config could therefore hold only one database per instance.
+///
+/// `MCP_DATABASE_URLS="prod=postgres://…;dev=postgres://…"` defines them; `DATABASE_URL` (or the
+/// positional argument) remains the single-database form and is registered under the database name.
+static PG_POOLS: Lazy<Result<Vec<(String, PgPool)>, String>> = Lazy::new(|| {
+    let mut out: Vec<(String, PgPool)> = Vec::new();
+    if let Ok(spec) = std::env::var("MCP_DATABASE_URLS") {
+        for entry in spec.split(';').map(str::trim).filter(|s| !s.is_empty()) {
+            let (name, url) = entry
+                .split_once('=')
+                .ok_or_else(|| format!("MCP_DATABASE_URLS: expected name=url, got {:?}", entry))?;
+            let name = name.trim().to_string();
+            if name.is_empty() {
+                return Err("MCP_DATABASE_URLS: empty connection name".to_string());
+            }
+            out.push((name, build_pool(url.trim())?));
+        }
+        if out.is_empty() {
+            return Err("MCP_DATABASE_URLS is set but defines no connections".to_string());
+        }
+        return Ok(out);
+    }
     let url = database_url().ok_or_else(|| {
-        "no connection string: set DATABASE_URL or pass it as the first argument".to_string()
+        "no connection string: set DATABASE_URL, MCP_DATABASE_URLS, or pass it as the first argument"
+            .to_string()
     })?;
-    let mut config = normalize_sslmode(&url)
+    let name = database_name_of(&url);
+    out.push((name, build_pool(&url)?));
+    Ok(out)
+});
+
+fn build_pool(url: &str) -> Result<PgPool, String> {
+    let mut config = normalize_sslmode(url)
         .parse::<postgres::Config>()
         .map_err(|_| {
             "invalid connection string — if the password contains @ : / # or ?, percent-encode it \
              (@ becomes %40, : becomes %3A, / becomes %2F, # becomes %23)"
                 .to_string()
         })?;
-    // Without it, on a network that DROPS packets (rather than refusing connections) the worker thread
-    // hangs forever and cannot be cancelled — further requests pile on until the thread pool is gone.
+    // Without it, on a network that DROPS packets (rather than refusing connections) the worker
+    // thread hangs forever and cannot be cancelled — requests pile up until the thread pool is gone.
     if config.get_connect_timeout().is_none() {
         config.connect_timeout(std::time::Duration::from_secs(10));
     }
     let mgr = PostgresConnectionManager::new(config, build_tls()?);
-    // `build_unchecked` = a LAZY pool. `build()` connects eagerly up to max_size with a retry loop, so
-    // a typo in the password or `sslmode=require` made the server simply HANG for tens of seconds with
-    // no message at all — the first five minutes of every new user. Now it starts immediately and a
-    // connection error surfaces on the first query, with a concrete message.
+    // `build_unchecked` = a LAZY pool. `build()` connects eagerly up to max_size with a retry loop,
+    // so a typo in the password made the server simply HANG for tens of seconds with no message.
     Ok(Pool::builder()
         .max_size(MAX_DB_CONNS)
         .min_idle(Some(0))
         .connection_timeout(std::time::Duration::from_secs(5))
         .build_unchecked(mgr))
-});
+}
+
+/// The pool for a request. `None` picks the only configured database, or reports the choices.
+fn pool_for(name: Option<&str>) -> Result<&'static PgPool, String> {
+    let pools = PG_POOLS.as_ref().map_err(|e| e.clone())?;
+    match name {
+        Some(n) => pools
+            .iter()
+            .find(|(k, _)| k == n)
+            .map(|(_, p)| p)
+            .ok_or_else(|| {
+                format!(
+                    "unknown database {:?} — configured: {}",
+                    n,
+                    pools
+                        .iter()
+                        .map(|(k, _)| k.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            }),
+        None if pools.len() == 1 => Ok(&pools[0].1),
+        None => Err(format!(
+            "several databases are configured ({}) — pass \"database\" in the tool arguments",
+            pools
+                .iter()
+                .map(|(k, _)| k.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )),
+    }
+}
+
+/// Names of all configured databases, in configuration order.
+fn database_names() -> Vec<String> {
+    PG_POOLS
+        .as_ref()
+        .map(|p| p.iter().map(|(k, _)| k.clone()).collect())
+        .unwrap_or_default()
+}
 
 /// Upper bound on database connections and concurrent operations (pool exhaustion / DoS defence).
 const MAX_DB_CONNS: u32 = 16;
@@ -716,7 +784,18 @@ fn pool_error_detail() -> String {
             if let Some(db) = e.as_db_error() {
                 let hint = match db.code().code() {
                     "28P01" => "authentication failed — check the password in DATABASE_URL",
-                    "28000" => "connection rejected by pg_hba.conf — check host/user rules",
+                    // The most common form of 28000 in the wild is "no pg_hba.conf entry ... SSL off":
+                    // the server demands TLS and the client did not offer it. Say that plainly.
+                    "28000" => {
+                        // PostgreSQL words this differently across versions: "SSL off" in older
+                        // releases, "no encryption" from 15 onwards. Match both.
+                        let msg = db.message();
+                        if msg.contains("SSL off") || msg.contains("no encryption") {
+                            "the server requires TLS for this host/user — add ?sslmode=require to DATABASE_URL"
+                        } else {
+                            "connection rejected by pg_hba.conf — check the host, user and database rules"
+                        }
+                    }
                     "3D000" => "database does not exist",
                     "53300" => "too many connections on the server",
                     _ => "server refused the connection",
@@ -778,8 +857,8 @@ fn is_row_query(sql: &str) -> bool {
         || up.starts_with("TABLE")
 }
 
-fn execute_readonly(final_sql: &str) -> Result<Value, String> {
-    let pool = PG_POOL.as_ref().map_err(|e| e.clone())?;
+fn execute_readonly(final_sql: &str, db: Option<&str>) -> Result<Value, String> {
+    let pool = pool_for(db)?;
     let mut client = pool.get().map_err(|_| pool_error_detail())?;
     // Session-level defence in depth: timeouts + read-only (the database refuses a write even if the
     // validator let something through). DISCARD ALL resets pooled session state (Session Pollution).
@@ -891,8 +970,12 @@ fn execute_readonly(final_sql: &str) -> Result<Value, String> {
 
 use postgres::types::ToSql;
 
-fn query_catalog(sql: &str, params: &[&(dyn ToSql + Sync)]) -> Result<Value, String> {
-    let pool = PG_POOL.as_ref().map_err(|e| e.clone())?;
+fn query_catalog(
+    sql: &str,
+    params: &[&(dyn ToSql + Sync)],
+    db: Option<&str>,
+) -> Result<Value, String> {
+    let pool = pool_for(db)?;
     let mut client = pool.get().map_err(|_| pool_error_detail())?;
     client
         .batch_execute("DISCARD ALL")
@@ -931,10 +1014,12 @@ fn err_content(code: i32, msg: String) -> Value {
     json!({ "error": { "code": code, "message": msg } })
 }
 
-fn handle_list_schemas() -> Value {
+fn handle_list_schemas(args: &Value) -> Value {
+    let db = args.get("database").and_then(|v| v.as_str());
     match query_catalog(
         "SELECT schema_name FROM information_schema.schemata WHERE schema_name NOT IN ('pg_catalog','information_schema') AND schema_name NOT LIKE 'pg_%' ORDER BY 1",
         &[],
+        db,
     ) {
         Ok(v) => { audit("list_schemas", "allowed", None); ok_content(&v) }
         Err(e) => { audit("list_schemas", "error", None); err_content(-32000, e) }
@@ -946,6 +1031,7 @@ fn handle_list_tables(args: &Value) -> Value {
         .get("schema")
         .and_then(|v| v.as_str())
         .unwrap_or("public");
+    let db = args.get("database").and_then(|v| v.as_str());
     // Built on pg_class rather than information_schema, which does not list MATERIALIZED VIEWS at
     // all — a database keeping its aggregates in matviews would look half empty through this tool.
     const SQL: &str = concat!(
@@ -960,7 +1046,7 @@ fn handle_list_tables(args: &Value) -> Value {
         "ORDER BY c.relname"
     );
     let show_parts = show_partitions();
-    match query_catalog(SQL, &[&schema, &show_parts]) {
+    match query_catalog(SQL, &[&schema, &show_parts], db) {
         Ok(v) => {
             audit("list_tables", "allowed", None);
             ok_content(&v)
@@ -989,6 +1075,27 @@ fn server_label() -> String {
 }
 
 fn handle_resources_list() -> Value {
+    // With several databases configured, the list spans all of them; the URI carries the database
+    // name, so entries from different connections never collide.
+    let names = database_names();
+    if names.len() > 1 {
+        let mut all: Vec<Value> = Vec::new();
+        for n in &names {
+            if let Some(Value::Array(items)) = resources_of(Some(n))
+                .get("result")
+                .and_then(|r| r.get("resources"))
+                .cloned()
+            {
+                all.extend(items);
+            }
+        }
+        audit("resources/list", "allowed", None);
+        return json!({ "result": { "resources": all } });
+    }
+    resources_of(None)
+}
+
+fn resources_of(db: Option<&str>) -> Value {
     const SQL: &str = concat!(
         "SELECT n.nspname AS table_schema, c.relname AS table_name, ",
         "       CASE c.relkind WHEN 'r' THEN 'table' WHEN 'p' THEN 'partitioned table' ",
@@ -1005,9 +1112,11 @@ fn handle_resources_list() -> Value {
         "  AND (NOT c.relispartition OR $1) ",
         "ORDER BY n.nspname, c.relname LIMIT 1000"
     );
-    let db = database_name();
+    let db = db
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| database_names().first().cloned().unwrap_or_default());
     let show_parts = show_partitions();
-    match query_catalog(SQL, &[&show_parts]) {
+    match query_catalog(SQL, &[&show_parts], db.as_str().into()) {
         Ok(v) => {
             let rows = v
                 .get("rows")
@@ -1058,9 +1167,9 @@ fn handle_resources_read(params: &Value) -> Value {
     let rest = uri.strip_prefix("postgres:///").unwrap_or("");
     let parts: Vec<&str> = rest.split('/').collect();
     // Accept both `<db>/<schema>/<table>/schema` and the shorter `<schema>/<table>/schema`.
-    let (schema, table) = match parts.as_slice() {
-        [_db, s, t, "schema"] => (*s, *t),
-        [s, t, "schema"] => (*s, *t),
+    let (db, schema, table) = match parts.as_slice() {
+        [d, s, t, "schema"] => (Some(*d), *s, *t),
+        [s, t, "schema"] => (None, *s, *t),
         _ => {
             return json!({ "error": { "code": -32602, "message":
                 "unknown resource — expected postgres:///<database>/<schema>/<table>/schema" } })
@@ -1069,7 +1178,11 @@ fn handle_resources_read(params: &Value) -> Value {
     if schema.is_empty() || table.is_empty() {
         return json!({ "error": { "code": -32602, "message": "unknown resource — empty schema or table" } });
     }
-    let desc = handle_describe_table(&json!({ "schema": schema, "table": table }));
+    let mut a = json!({ "schema": schema, "table": table });
+    if let Some(d) = db {
+        a["database"] = Value::String(d.to_string());
+    }
+    let desc = handle_describe_table(&a);
     // `describe_table` returns a ready `content` block; a resource needs the `contents` shape.
     match desc
         .get("result")
@@ -1089,6 +1202,7 @@ fn handle_describe_table(args: &Value) -> Value {
         .get("schema")
         .and_then(|v| v.as_str())
         .unwrap_or("public");
+    let db = args.get("database").and_then(|v| v.as_str());
     let table = match args.get("table").and_then(|v| v.as_str()) {
         Some(t) => t,
         None => return err_content(-32602, "missing 'table'".into()),
@@ -1126,7 +1240,7 @@ fn handle_describe_table(args: &Value) -> Value {
         "  AND has_table_privilege(rel.oid, 'SELECT') ",
         "ORDER BY a.attnum"
     );
-    match query_catalog(SQL, &[&schema, &table]) {
+    match query_catalog(SQL, &[&schema, &table], db) {
         Ok(v) => {
             // Pusty wynik = tabela nie istnieje albo rola jej nie widzi. Bez tego agent dostaje
             // `rowCount: 0` and reads it as "a table with no columns" — a hallucination instead of an error.
@@ -1157,10 +1271,8 @@ enum CostErr {
     QueryError(String),
 }
 
-fn cost_guard(sql: &str, max_cost: f64) -> Result<(), CostErr> {
-    let pool = PG_POOL
-        .as_ref()
-        .map_err(|e| CostErr::QueryError(e.clone()))?;
+fn cost_guard(sql: &str, max_cost: f64, db: Option<&str>) -> Result<(), CostErr> {
+    let pool = pool_for(db).map_err(CostErr::QueryError)?;
     let mut client = pool
         .get()
         .map_err(|_| CostErr::QueryError(pool_error_detail()))?;
@@ -1782,7 +1894,7 @@ async fn health_handler() -> impl axum::response::IntoResponse {
 async fn ready_handler() -> impl axum::response::IntoResponse {
     // pool.get() is blocking (r2d2/postgres block_on) and panics from an async handler
     // ("runtime within runtime"), so the DB check goes through spawn_blocking.
-    let res = tokio::task::spawn_blocking(|| match PG_POOL.as_ref() {
+    let res = tokio::task::spawn_blocking(|| match pool_for(None) {
         // get_timeout, not get(): with a busy pool the probe must answer "not ready" within a second
         // rather than hang until connection_timeout — otherwise the orchestrator restarts the container
         // mid-attack and deepens the outage.
@@ -1900,20 +2012,25 @@ fn handle_tools_list() -> Value {
                 "type": "object",
                 "properties": {
                     "sql": { "type": "string" },
+                    "database": { "type": "string", "description": "which configured database to use; omit when only one is configured" },
                     "limit": { "type": "integer", "minimum": 1, "default": 1000 }
                 },
                 "required": ["sql"]
             })
         ),
-        tool_def("list_schemas", "List all schemas", json!({"type": "object", "properties": {}})),
-        tool_def("list_tables", "List tables in a schema", json!({
+        tool_def(
+            "list_schemas",
+            "List all schemas",
+            json!({"type": "object", "properties": { "database": { "type": "string", "description": "which configured database to use; omit when only one is configured" } }}),
+        ),
+        tool_def("list_tables", "List tables, views and materialized views in a schema", json!({
             "type": "object",
-            "properties": { "schema": { "type": "string" } },
+            "properties": { "schema": { "type": "string" }, "database": { "type": "string", "description": "which configured database to use; omit when only one is configured" } },
             "required": ["schema"]
         })),
         tool_def("describe_table", "Describe table columns: type, nullability, default, primary key, and the schema comment documenting what the column means", json!({
             "type": "object",
-            "properties": { "schema": { "type": "string" }, "table": { "type": "string" } },
+            "properties": { "schema": { "type": "string" }, "table": { "type": "string" }, "database": { "type": "string", "description": "which configured database to use; omit when only one is configured" } },
             "required": ["schema", "table"]
         })),
     ];
@@ -1939,7 +2056,7 @@ fn handle_tools_call(params: &Value) -> Value {
 
     match name {
         "query" => handle_query_tool(&args),
-        "list_schemas" => handle_list_schemas(),
+        "list_schemas" => handle_list_schemas(&args),
         "list_tables" => handle_list_tables(&args),
         "describe_table" => handle_describe_table(&args),
         _ => json!({ "error": { "code": -32601, "message": format!("Unknown tool: {}", name) } }),
@@ -1947,6 +2064,7 @@ fn handle_tools_call(params: &Value) -> Value {
 }
 
 fn handle_query_tool(args: &Value) -> Value {
+    let db = args.get("database").and_then(|v| v.as_str());
     let sql = match args.get("sql").and_then(|v| v.as_str()) {
         Some(s) => s,
         None => return json!({ "error": { "code": -32602, "message": "Missing 'sql' argument" } }),
@@ -1979,7 +2097,7 @@ fn handle_query_tool(args: &Value) -> Value {
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(1_000_000.0);
-        match cost_guard(&final_sql, max_cost) {
+        match cost_guard(&final_sql, max_cost, db) {
             Ok(()) => {}
             Err(CostErr::TooExpensive(e)) => {
                 audit("query", "denied_cost", Some(sql));
@@ -1994,7 +2112,7 @@ fn handle_query_tool(args: &Value) -> Value {
             }
         }
     }
-    match execute_readonly(&final_sql) {
+    match execute_readonly(&final_sql, db) {
         Ok(mut data) => {
             mark_truncation(&mut data, limit);
             audit("query", "allowed", Some(sql));
