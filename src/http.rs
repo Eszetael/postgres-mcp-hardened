@@ -71,8 +71,19 @@ pub(crate) fn render_metrics() -> String {
 pub(crate) async fn metrics_handler(headers: HeaderMap) -> impl IntoResponse {
     // Open by default (scraped from a private network). When `MCP_METRICS_TOKEN` is set we require it —
     // otherwise a public deployment lets anyone watch traffic and how well auth denials are working.
-    if let Ok(expected) = std::env::var("MCP_METRICS_TOKEN") {
-        if !expected.is_empty() {
+    // When `MCP_METRICS_TOKEN` is unset but `MCP_BEARER_TOKEN` is, the bearer token is inherited:
+    // an operator who protects the server expects the whole HTTP surface to be protected, and this
+    // endpoint reveals traffic volume and how often auth denials fire.
+    let configured = std::env::var("MCP_METRICS_TOKEN")
+        .ok()
+        .filter(|t| !t.is_empty())
+        .or_else(|| {
+            std::env::var("MCP_BEARER_TOKEN")
+                .ok()
+                .filter(|t| !t.is_empty())
+        });
+    if let Some(expected) = configured {
+        {
             let given = headers
                 .get("authorization")
                 .and_then(|v| v.to_str().ok())
@@ -155,7 +166,11 @@ pub(crate) async fn oauth_protected_resource_handler() -> impl axum::response::I
 pub(crate) async fn server_card_handler() -> impl axum::response::IntoResponse {
     let base = std::env::var("MCP_PUBLIC_URL").unwrap_or_default();
     let base = base.trim_end_matches('/');
-    let auth_required = std::env::var("JWT_PUBKEY_PEM").is_ok();
+    // A shared bearer token counts as authentication too — reporting "open" while it is enforced
+    // would make a registry advertise the server as public when it is not.
+    let auth_required = ["JWT_PUBKEY_PEM", "MCP_BEARER_TOKEN"]
+        .iter()
+        .any(|k| std::env::var(k).map(|v| !v.trim().is_empty()) == Ok(true));
     let tools = handle_tools_list()["result"]["tools"].clone();
     Json(json!({
         "name": "postgres-mcp-hardened",

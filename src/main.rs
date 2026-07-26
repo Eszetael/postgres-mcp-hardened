@@ -188,9 +188,18 @@ pub(crate) fn preflight_config() {
     }
 
     // JWT public key: unparsable = auth nobody can get through
-    if let Ok(pem) = std::env::var("JWT_PUBKEY_PEM") {
-        if jsonwebtoken::DecodingKey::from_rsa_pem(pem.as_bytes()).is_err() {
-            fatal.push("JWT_PUBKEY_PEM is not a valid RSA public key in PEM format".to_string());
+    if std::env::var("JWT_PUBKEY_PEM").map(|v| !v.trim().is_empty()) == Ok(true) {
+        match jwt_pubkey_pem() {
+            None => fatal.push(
+                "JWT_PUBKEY_PEM is set but is neither PEM text nor a readable file path".to_string(),
+            ),
+            Some(pem) => {
+                if jsonwebtoken::DecodingKey::from_rsa_pem(&pem).is_err() {
+                    fatal.push(
+                        "JWT_PUBKEY_PEM is not a valid RSA public key in PEM format".to_string(),
+                    );
+                }
+            }
         }
     }
 
@@ -348,6 +357,18 @@ pub(crate) async fn delete_session_handler(
         METRICS.denied_rate.fetch_add(1, Ordering::Relaxed);
         audit("http", "denied_rate", None);
         return (StatusCode::TOO_MANY_REQUESTS, "rate limit exceeded").into_response();
+    }
+    // Session teardown is a state change, so it goes through the same gate as everything else on
+    // this surface. It used to be reachable without a token: anyone who saw a session id (a log, a
+    // proxy, a crash report) could end that client's session on an otherwise authenticated server.
+    if let Err((code, msg, _)) = enforce_auth(&headers, &json!({"method": "session/delete"})) {
+        METRICS.denied_auth.fetch_add(1, Ordering::Relaxed);
+        audit("http", "denied_auth", None);
+        return (
+            StatusCode::from_u16(code).unwrap_or(StatusCode::UNAUTHORIZED),
+            msg,
+        )
+            .into_response();
     }
     match headers.get("mcp-session-id").and_then(|v| v.to_str().ok()) {
         Some(sid) => {
@@ -578,10 +599,27 @@ pub struct AuthConfig {
     pub iss: String,
 }
 
+/// Reads `JWT_PUBKEY_PEM` as either the PEM text itself or a path to a `.pem` file.
+///
+/// Both spellings occur in the wild — a Kubernetes secret mounts a file, a `.env` inlines the text —
+/// and `MCP_SSLROOTCERT` already accepts a path, so accepting only one here was a trap that cost a
+/// startup failure with a message that looked like a corrupt key.
+pub(crate) fn jwt_pubkey_pem() -> Option<Vec<u8>> {
+    let raw = std::env::var("JWT_PUBKEY_PEM").ok()?;
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    if raw.contains("-----BEGIN") {
+        return Some(raw.as_bytes().to_vec());
+    }
+    std::fs::read(raw).ok()
+}
+
 pub(crate) static AUTH_CONFIG: Lazy<Option<AuthConfig>> = Lazy::new(|| {
-    let pem = std::env::var("JWT_PUBKEY_PEM").ok()?;
+    let pem = jwt_pubkey_pem()?;
     Some(AuthConfig {
-        pubkey: pem.into_bytes(),
+        pubkey: pem,
         aud: std::env::var("JWT_AUD").unwrap_or_default(),
         iss: std::env::var("JWT_ISS").unwrap_or_default(),
     })
@@ -610,11 +648,17 @@ pub(crate) fn enforce_auth(
                 .zip(expected.as_bytes())
                 .fold(0u8, |acc, (a, b)| acc | (a ^ b))
                 == 0;
-        if !equal {
-            return Err((401, "invalid or missing bearer token".into(), None));
-        }
-        if AUTH_CONFIG.is_none() {
+        if equal {
+            // Sufficient on its own: the two mechanisms are alternatives, not layers. Returning here
+            // is what makes "either one" true — previously a correct shared token still fell through
+            // to the JWT path, where the same header failed to parse as a JWT and the request was
+            // refused, so configuring both silently meant "both required".
             return Ok(None);
+        }
+        // A wrong or absent shared token is only fatal when it is the ONLY mechanism; with OAuth also
+        // configured the caller may legitimately be presenting a JWT instead.
+        if AUTH_CONFIG.is_none() {
+            return Err((401, "invalid or missing bearer token".into(), None));
         }
     }
     let cfg = match &*AUTH_CONFIG {

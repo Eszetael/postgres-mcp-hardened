@@ -380,13 +380,35 @@ pub(crate) fn redact_rows(rows: &mut [Value]) {
         return;
     }
     for row in rows.iter_mut() {
-        if let Some(obj) = row.as_object_mut() {
-            for (k, v) in obj.iter_mut() {
+        redact_value(row, pats);
+    }
+}
+
+/// Masks matching keys at EVERY depth, in objects and inside arrays.
+///
+/// Masking only the top level was bypassable by one reformulation: `row_to_json(t)`,
+/// `to_jsonb(t.*)` or `json_agg(t)` turn the whole row into a single nested value, so the column
+/// name never appears at the top and never appears as an identifier the validator could refuse —
+/// and `json_agg` returned every row at once. Walking the tree closes the whole class of
+/// row-serialising functions, including ones PostgreSQL has not shipped yet, instead of listing
+/// them one by one.
+fn redact_value(v: &mut Value, pats: &[String]) {
+    match v {
+        Value::Object(map) => {
+            for (k, val) in map.iter_mut() {
                 if pats.iter().any(|p| p == &k.to_lowercase()) {
-                    *v = Value::String("[redacted]".into());
+                    *val = Value::String("[redacted]".into());
+                } else {
+                    redact_value(val, pats);
                 }
             }
         }
+        Value::Array(items) => {
+            for item in items.iter_mut() {
+                redact_value(item, pats);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -618,4 +640,40 @@ pub(crate) fn query_catalog(
     }
     let _ = client.batch_execute("ROLLBACK");
     Ok(json!({ "rowCount": out.len(), "rows": out }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The redaction guarantee has to survive a row being serialised into a single value.
+    /// `row_to_json(t)`, `to_jsonb(t.*)` and `json_agg(t)` all hide the column name from the
+    /// validator and put the value one level down, where top-level masking never reached it —
+    /// `json_agg` returned every row at once. Masking by key at any depth closes the class.
+    #[test]
+    fn redaction_reaches_nested_and_arrayed_rows() {
+        // The patterns are passed in rather than read from the environment: `redact_patterns` is a
+        // `Lazy` static, so a test that set the variable would pass or fail depending on which test
+        // happened to touch it first.
+        let pats = vec!["password".to_string(), "secret".to_string()];
+        let mut rows = vec![
+            json!({"row_to_json": {"id": 1, "password": "hash", "name": "ada"}}),
+            json!({"json_agg": [
+                {"id": 1, "password": "hash1"},
+                {"id": 2, "password": "hash2", "nested": {"secret": "deep"}}
+            ]}),
+            json!({"id": 3, "PassWord": "case-insensitive"}),
+        ];
+        for row in rows.iter_mut() {
+            redact_value(row, &pats);
+        }
+        let dump = serde_json::to_string(&rows).unwrap();
+        assert!(
+            !dump.contains("hash") && !dump.contains("deep") && !dump.contains("case-insensitive"),
+            "a redacted value survived somewhere: {dump}"
+        );
+        assert_eq!(dump.matches("[redacted]").count(), 5);
+        // untouched columns stay readable — redaction must not blank the whole row
+        assert!(dump.contains("\"ada\"") && dump.contains("\"id\":2"));
+    }
 }
