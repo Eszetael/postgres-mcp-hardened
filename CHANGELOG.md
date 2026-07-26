@@ -19,6 +19,12 @@ alternative to the deprecated `@modelcontextprotocol/server-postgres`.
 - **Signed releases:** every artefact is signed with Sigstore keyless signing, verifiable with
   `cosign verify-blob` against the workflow identity; public releases additionally carry SLSA
   build provenance. Release actions are pinned to commit hashes, not moving tags.
+- **Nothing hidden in a statement:** characters that are invisible, or that look like a space
+  without being one, are refused outside string literals — `setval\u{2060}(...)` reads as `setval(`
+  to a person and parses as something else, which is how a write function walks past a rule that
+  names it. Inside a literal they are left alone, because a zero-width joiner is how emoji are
+  built and honest queries contain them. Refused rather than stripped: editing the statement would
+  mean validating one text and executing another.
 - **Read-only, enforced three ways:** every query runs inside an explicit
   `BEGIN TRANSACTION READ ONLY` that is always rolled back, so nothing this server does
   can ever be committed — on top of the AST validation and the session flag.

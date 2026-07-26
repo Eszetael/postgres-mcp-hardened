@@ -83,6 +83,7 @@ server checks each one rather than assuming it.
 | Control | Where | What defeats it |
 |---|---|---|
 | AST read-only validation | `validate.rs` | a construct the parser models differently than PostgreSQL executes it — this is the class that has been defeated before |
+| Hidden-character refusal | `validate.rs` | nothing known, but it is a rule about *rendering*, and rendering is a moving target: it asks the standard library's Unicode tables rather than listing characters, because two earlier attempts each missed the next character along |
 | Deny-listed function families | `validate.rs` | a function that takes SQL as text and is not in a denied family (this is why `*_to_xml*` is denied wholesale) |
 | `BEGIN TRANSACTION READ ONLY` + rollback | `db.rs` | functions that write outside transactional control (`pg_import_system_collations` and relatives — hence the family denial above) |
 | Column redaction | `validate.rs`, `db.rs` | **name-based filtering, defeated four ways in review. Depth, not a boundary.** The boundary is the column privilege. |
@@ -97,6 +98,13 @@ server checks each one rather than assuming it.
 | Origin refusal | `http.rs` | a non-browser client, which never sends `Origin` — this defends against a page in someone's browser reaching a loopback server, not against a program |
 
 ## Residual risks, unfixed and named
+
+- **A parse failure is not a control, and we relied on one without knowing.** Upgrading `sqlparser`
+  from 0.49 to 0.62 showed that several writes were being refused because the old library could not
+  parse them, not because any rule here rejected them. The rules have since been fixed, but the
+  lesson generalises: anywhere this validator's safety depends on the parser *failing*, a better
+  parser removes the protection. The fuzz harness is the only thing that finds these, and it finds
+  them only for constructs someone thought to mutate.
 
 - **A gateway that authorises on headers, on an older revision.** `Mcp-Method`/`Mcp-Name` only
   exist from `2026-07-28`. If you put an authorising proxy in front of this server on `2025-11-25`

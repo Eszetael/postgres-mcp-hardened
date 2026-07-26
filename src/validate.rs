@@ -2,14 +2,38 @@
 //! We trust the AST (sqlparser), not regexes: comments and obfuscation disappear when the tree is built.
 use once_cell::sync::Lazy;
 use sqlparser::ast::{
-    Expr, FunctionArg, FunctionArgExpr, FunctionArguments, ObjectName, Query, SelectItem, SetExpr,
-    Statement, TableAlias, TableFactor, Value, Visit, Visitor,
+    Expr, FunctionArg, FunctionArgExpr, FunctionArguments, LimitClause, ObjectName, Query,
+    SelectItem, SetExpr, Statement, TableAlias, TableFactor, Value, Visit, Visitor,
 };
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
 use sqlparser::tokenizer::{Token, Tokenizer};
 use std::fmt;
 use std::ops::ControlFlow;
+
+/// Deliberately not a legal SQL identifier, so nothing can allowlist it by accident.
+const UNREADABLE_NAME: &str = "<unreadable name part>";
+
+/// The last part of a qualified name, lowercased — or `None` when the parser did not model it as
+/// an identifier at all.
+///
+/// `sqlparser` 0.62 introduced `ObjectNamePart::Function`: a name part that is a *function call*
+/// returning an identifier. Older versions could not represent that, so this file was written
+/// assuming every part is an `Ident`. It cannot assume that any more, and the difference matters
+/// more than it looks — every rule here reasons about a name: side-effect functions, denied
+/// families, the redaction list, the surface allowlist. Skipping a part we cannot read would let a
+/// name expressed as a function walk past all of them, which is the same shape as the bypasses
+/// that have already beaten this validator four times.
+///
+/// Callers must treat `None` as "unreadable, therefore refuse", never as "nothing to check".
+fn last_part_name(name: &ObjectName) -> Option<String> {
+    Some(name.0.last()?.as_ident()?.value.to_lowercase())
+}
+
+/// True when any part of the name is something other than a plain identifier.
+fn name_has_unreadable_part(name: &ObjectName) -> bool {
+    name.0.iter().any(|p| p.as_ident().is_none())
+}
 
 /// Hard cap on SQL length — rejects pathologically long input (defence against stack overflow from
 /// very deep or long nesting; no legitimate MCP query comes near this size).
@@ -92,6 +116,9 @@ pub fn validate_readonly(sql: &str) -> Result<(), ValidationError> {
     if ast.is_empty() {
         return Err(ValidationError::NotParseable("empty statement".into()));
     }
+    // 0. Nothing invisible outside a literal. Before any rule that reasons about a name, because
+    //    every one of them compares text a hidden character can quietly change.
+    reject_invisible_outside_literals(sql)?;
     // 1. The statement shape must be purely read-only (SELECT/WITH/EXPLAIN/SHOW).
     structural_readonly(&ast[0])?;
     // 2. Defence in depth: functions with SIDE EFFECTS (setval, dblink_exec, lo_export, pg_read_file…).
@@ -186,6 +213,115 @@ fn leading_write_keyword(sql: &str) -> Option<&'static str> {
         .next()?
         .to_ascii_uppercase();
     WRITE_KEYWORDS.iter().find(|k| **k == first).copied()
+}
+
+/// Characters that are invisible when rendered but change what the parser sees.
+///
+/// Refused rather than stripped. Stripping would mean validating one text and executing another,
+/// which is the exact split the canonical-form gate exists to prevent.
+fn is_invisible(c: char) -> bool {
+    // Control characters, except the four that are ordinary SQL whitespace. A newline in a query is
+    // formatting; a NUL or a backspace in an identifier is someone making two readers disagree.
+    if c.is_control() && !matches!(c, '\t' | '\n' | '\r' | '\u{000B}' | '\u{000C}') {
+        return true;
+    }
+    // Whitespace that is not the whitespace SQL means. U+00A0 renders as a space, is NOT treated as
+    // one by the tokenizer, and therefore turns `lowrite` into an identifier that no rule about
+    // `lowrite` will ever match. Same for U+2007, U+202F, U+3000 and the rest of the family. This is
+    // a rule rather than a list on purpose: it asks the standard library's Unicode tables instead of
+    // enumerating what a fuzz run happened to find, which is how the previous two attempts at this
+    // check each missed the next character along.
+    if c.is_whitespace() && !matches!(c, ' ' | '\t' | '\n' | '\r' | '\u{000B}' | '\u{000C}') {
+        return true;
+    }
+    matches!(c,
+        // Unicode category Cf (Format) — the whole category, not the handful that showed up in a
+        // fuzz run. Enumerating what an attacker has already used is how you get a second finding
+        // with the next character along; the fuzz harness found three of these one after another.
+        '\u{00AD}'
+        | '\u{0600}'..='\u{0605}'
+        | '\u{061C}'
+        | '\u{06DD}'
+        | '\u{070F}'
+        | '\u{0890}'..='\u{0891}'
+        | '\u{08E2}'
+        | '\u{180E}'
+        | '\u{200B}'..='\u{200F}'
+        | '\u{202A}'..='\u{202E}'
+        | '\u{2060}'..='\u{2064}'
+        | '\u{2066}'..='\u{206F}'
+        | '\u{FEFF}'
+        | '\u{FFF9}'..='\u{FFFB}'
+        | '\u{110BD}'
+        | '\u{110CD}'
+        | '\u{13430}'..='\u{1343F}'
+        | '\u{1BCA0}'..='\u{1BCA3}'
+        | '\u{1D173}'..='\u{1D17A}'
+        // Tag characters. They render as nothing at all and can spell out a whole word invisibly —
+        // this is what hid `pg_read_file` and `pg_notify` from the rules that name them.
+        | '\u{E0001}'
+        | '\u{E0020}'..='\u{E007F}'
+        // Variation selectors: no glyph of their own, and legal inside an identifier as far as the
+        // tokenizer is concerned.
+        | '\u{FE00}'..='\u{FE0F}'
+        | '\u{E0100}'..='\u{E01EF}'
+    )
+}
+
+/// Refuses invisible characters anywhere they are not data.
+///
+/// Inside a string literal they may legitimately be data — a zero-width joiner is how emoji
+/// sequences are built, and refusing those would reject honest queries. Anywhere else they have no
+/// purpose except to make two readers disagree about the same text: `setval\u{2060}(...)` looks
+/// like `setval(` to a person and parses as something else, which is how a side-effect function
+/// walked past the rule that names it.
+///
+/// The exempt list is the literal token kinds, deliberately, so that a token variant added by a
+/// future parser version falls through to being CHECKED. A new literal kind would then produce a
+/// false rejection — annoying, visible, fixable. The other direction would produce a bypass.
+fn reject_invisible_outside_literals(sql: &str) -> Result<(), ValidationError> {
+    if !sql.chars().any(is_invisible) {
+        return Ok(()); // the overwhelmingly common case, one scan, no tokenising
+    }
+    let tokens = match Tokenizer::new(&PostgreSqlDialect {}, sql).tokenize() {
+        Ok(t) => t,
+        // Unlexable input is rejected by the parser a moment later with a better message.
+        Err(_) => return Ok(()),
+    };
+    for t in &tokens {
+        let exempt = matches!(
+            t,
+            Token::SingleQuotedString(_)
+                | Token::DoubleQuotedString(_)
+                | Token::TripleSingleQuotedString(_)
+                | Token::TripleDoubleQuotedString(_)
+                | Token::DollarQuotedString(_)
+                | Token::SingleQuotedByteStringLiteral(_)
+                | Token::DoubleQuotedByteStringLiteral(_)
+                | Token::TripleSingleQuotedByteStringLiteral(_)
+                | Token::TripleDoubleQuotedByteStringLiteral(_)
+                | Token::SingleQuotedRawStringLiteral(_)
+                | Token::DoubleQuotedRawStringLiteral(_)
+                | Token::TripleSingleQuotedRawStringLiteral(_)
+                | Token::TripleDoubleQuotedRawStringLiteral(_)
+                | Token::NationalStringLiteral(_)
+                | Token::EscapedStringLiteral(_)
+                | Token::UnicodeStringLiteral(_)
+                | Token::HexStringLiteral(_)
+        );
+        if exempt {
+            continue;
+        }
+        if let Some(c) = t.to_string().chars().find(|c| is_invisible(*c)) {
+            return Err(ValidationError::NotReadOnly(format!(
+                "character U+{:04X} outside a string literal — invisible or a space that is not a \
+                 space, refused because it makes the text a reader sees and the text the parser \
+                 sees disagree",
+                c as u32
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Is there a `;` outside literals and comments with any further token after it?
@@ -293,12 +429,24 @@ impl Visitor for SecurityScanner {
             // identifiers, so none of these looked like a reference to anything.
             // Every spelling of a string literal, not just the plain one: `E'\\160assword'`,
             // `$$password$$` and the national/unicode forms all name the same key.
-            Expr::Value(
-                Value::SingleQuotedString(s)
-                | Value::EscapedStringLiteral(s)
-                | Value::NationalStringLiteral(s)
-                | Value::DoubleQuotedString(s),
-            ) => {
+            // `Expr::Value` carries a `ValueWithSpan` from sqlparser 0.62; the literal itself
+            // sits in `.value`. Matching through it changes nothing about which spellings count.
+            Expr::Value(vs)
+                if matches!(
+                    &vs.value,
+                    Value::SingleQuotedString(_)
+                        | Value::EscapedStringLiteral(_)
+                        | Value::NationalStringLiteral(_)
+                        | Value::DoubleQuotedString(_)
+                ) =>
+            {
+                let s = match &vs.value {
+                    Value::SingleQuotedString(s)
+                    | Value::EscapedStringLiteral(s)
+                    | Value::NationalStringLiteral(s)
+                    | Value::DoubleQuotedString(s) => s,
+                    _ => unreachable!("guarded by the match above"),
+                };
                 if let Some(col) = redacted_name_inside(&unescape_sql_literal(s).to_lowercase()) {
                     self.evasion = Some(format!(
                         "naming the redacted column `{}` inside a string literal",
@@ -344,6 +492,7 @@ impl Visitor for SecurityScanner {
                         .name
                         .0
                         .last()
+                        .and_then(|n| n.as_ident())
                         .is_some_and(|n| n.value.eq_ignore_ascii_case("count"))
                 {
                     self.evasion =
@@ -351,8 +500,15 @@ impl Visitor for SecurityScanner {
                     return ControlFlow::Break(());
                 }
             }
-            if let Some(last) = f.name.0.last() {
-                let name = last.value.to_lowercase();
+            if name_has_unreadable_part(&f.name) {
+                self.hit = Some(
+                    "a function name built from another function call — refused because the name \
+                     cannot be read, and every rule here is written about the name"
+                        .into(),
+                );
+                return ControlFlow::Break(());
+            }
+            if let Some(name) = last_part_name(&f.name) {
                 if let Some(msg) = function_rejection(&name) {
                     self.hit = Some(msg);
                     return ControlFlow::Break(());
@@ -365,8 +521,11 @@ impl Visitor for SecurityScanner {
     /// The default denial for unknown catalog names is NOT applied, because `pg_stat_activity`,
     /// `pg_tables` and the rest of the catalog are legitimate read-only views (a test caught that regression).
     fn pre_visit_relation(&mut self, name: &ObjectName) -> ControlFlow<()> {
-        if let Some(last) = name.0.last() {
-            let n = last.value.to_lowercase();
+        if name_has_unreadable_part(name) {
+            self.hit = Some("a relation name built from a function call — refused unread".into());
+            return ControlFlow::Break(());
+        }
+        if let Some(n) = last_part_name(name) {
             if matches!(classify_function(&n), FnVerdict::SideEffect) {
                 self.hit = Some(format!("side-effect function: {}", n));
                 return ControlFlow::Break(());
@@ -398,8 +557,12 @@ impl Visitor for SecurityScanner {
             ..
         } = tf
         {
-            if let Some(last) = name.0.last() {
-                let n = last.value.to_lowercase();
+            if name_has_unreadable_part(name) {
+                self.hit =
+                    Some("a table function named by a function call — refused unread".into());
+                return ControlFlow::Break(());
+            }
+            if let Some(n) = last_part_name(name) {
                 if let Some(msg) = function_rejection(&n) {
                     self.hit = Some(msg);
                     return ControlFlow::Break(());
@@ -427,9 +590,21 @@ fn structural_readonly(stmt: &Statement) -> Result<(), ValidationError> {
         // EXPLAIN ANALYZE ACTUALLY EXECUTES the plan (and bypasses the cost guard, which is skipped for
         // non-row queries) — rejected outright. Plain EXPLAIN is allowed for reads only (recursively).
         Statement::Explain {
-            analyze, statement, ..
+            analyze,
+            statement,
+            options,
+            ..
         } => {
-            if *analyze {
+            // Two places say ANALYZE, not one. `EXPLAIN ANALYZE ...` sets the bool; PostgreSQL's
+            // parenthesised form `EXPLAIN (ANALYZE) ...` lands in `options` instead — a field that
+            // did not exist when this check was written. Reading only the bool let the parenthesised
+            // form through, and ANALYZE executes the statement. The old parser hid this by failing
+            // to parse the form at all, which is not a control; it is luck.
+            let analyze_in_options = options.as_ref().is_some_and(|opts| {
+                opts.iter()
+                    .any(|o| o.name.value.eq_ignore_ascii_case("analyze"))
+            });
+            if *analyze || analyze_in_options {
                 Err(ValidationError::NotReadOnly(
                     "EXPLAIN ANALYZE (executes the plan)".into(),
                 ))
@@ -618,9 +793,10 @@ impl Visitor for FunctionCollector {
     type Break = ();
     fn pre_visit_expr(&mut self, expr: &Expr) -> ControlFlow<()> {
         if let Expr::Function(f) = expr {
-            if let Some(last) = f.name.0.last() {
-                self.names.push(last.value.to_lowercase());
-            }
+            // A part we cannot read is recorded under a name no allowlist will ever contain, so it
+            // is refused downstream instead of disappearing from the set.
+            self.names
+                .push(last_part_name(&f.name).unwrap_or_else(|| UNREADABLE_NAME.to_string()));
         }
         ControlFlow::Continue(())
     }
@@ -631,9 +807,8 @@ impl Visitor for FunctionCollector {
             ..
         } = tf
         {
-            if let Some(last) = name.0.last() {
-                self.names.push(last.value.to_lowercase());
-            }
+            self.names
+                .push(last_part_name(name).unwrap_or_else(|| UNREADABLE_NAME.to_string()));
         }
         ControlFlow::Continue(())
     }
@@ -699,9 +874,8 @@ struct RowRefCollector {
 impl Visitor for RowRefCollector {
     type Break = ();
     fn pre_visit_relation(&mut self, name: &ObjectName) -> ControlFlow<()> {
-        if let Some(last) = name.0.last() {
-            self.names.insert(last.value.to_lowercase());
-        }
+        self.names
+            .insert(last_part_name(name).unwrap_or_else(|| UNREADABLE_NAME.to_string()));
         ControlFlow::Continue(())
     }
     fn pre_visit_table_factor(&mut self, tf: &TableFactor) -> ControlFlow<()> {
@@ -1093,13 +1267,16 @@ fn enforce_limit_inner(sql: &str, max_rows: u64) -> Result<String, ValidationErr
 }
 
 fn number_expr(n: u64) -> Expr {
-    Expr::Value(Value::Number(n.to_string(), false))
+    Expr::Value(Value::Number(n.to_string(), false).with_empty_span())
 }
 
 /// The literal numeric value, if the expression is one (parameters and expressions are left alone).
 fn literal_u64(e: &Expr) -> Option<u64> {
     match e {
-        Expr::Value(Value::Number(n, _)) => n.parse::<u64>().ok(),
+        Expr::Value(vs) => match &vs.value {
+            Value::Number(n, _) => n.parse::<u64>().ok(),
+            _ => None,
+        },
         _ => None,
     }
 }
@@ -1123,20 +1300,36 @@ fn cap_rows(q: &mut Query, max_rows: u64) -> Cap {
             None => Cap::NeedsWrap, // FETCH without a readable literal (WITH TIES, an expression)
         };
     }
-    match &q.limit {
-        Some(existing) => match literal_u64(existing) {
-            Some(v) if v <= max_rows => Cap::Handled,
-            Some(_) => {
-                q.limit = Some(number_expr(max_rows));
-                Cap::Handled
-            }
-            // `LIMIT +999999999`, `LIMIT 999999999::bigint`, `LIMIT $1`, `LIMIT 10*10` — nie
-            // guess the value, we impose the limit from the outside.
+    // sqlparser 0.62 replaced `Query.limit` with a `LimitClause` enum, because `LIMIT` is not one
+    // shape: `LIMIT n`, `LIMIT n OFFSET m`, ClickHouse's `LIMIT n BY expr`, and MySQL's reversed
+    // `LIMIT offset, n`. Only the first family is one we can safely edit in place; anything else is
+    // wrapped from the outside, which is always correct and never guesses.
+    match &mut q.limit_clause {
+        Some(LimitClause::LimitOffset { limit, .. }) => match limit.as_ref() {
+            Some(existing) => match literal_u64(existing) {
+                Some(v) if v <= max_rows => Cap::Handled,
+                Some(_) => {
+                    *limit = Some(number_expr(max_rows));
+                    Cap::Handled
+                }
+                // `LIMIT +999999999`, `LIMIT 999999999::bigint`, `LIMIT $1`, `LIMIT 10*10` — do not
+                // guess the value, we impose the limit from the outside.
+                None => Cap::NeedsWrap,
+            },
+            // `LIMIT ALL`, or an OFFSET-only clause: no row cap at all, so one has to be added.
             None => Cap::NeedsWrap,
         },
+        // MySQL's reversed form. PostgreSQL does not accept it, but the parser can produce it and
+        // guessing which number is the row count is exactly the kind of assumption that has cost
+        // us before. Wrap it.
+        Some(LimitClause::OffsetCommaLimit { .. }) => Cap::NeedsWrap,
         None => {
             if !is_count_or_exists(q) {
-                q.limit = Some(number_expr(max_rows));
+                q.limit_clause = Some(LimitClause::LimitOffset {
+                    limit: Some(number_expr(max_rows)),
+                    offset: None,
+                    limit_by: Vec::new(),
+                });
             }
             Cap::Handled
         }
@@ -1160,9 +1353,7 @@ fn is_count_or_exists(q: &Query) -> bool {
         _ => return false,
     };
     match expr {
-        Expr::Function(f) => {
-            f.name.0.last().map(|i| i.value.to_lowercase()).as_deref() == Some("count")
-        }
+        Expr::Function(f) => last_part_name(&f.name).as_deref() == Some("count"),
         Expr::Exists { .. } => true,
         _ => false,
     }
@@ -1170,6 +1361,69 @@ fn is_count_or_exists(q: &Query) -> bool {
 
 #[cfg(test)]
 mod tests {
+
+    // Four holes the sqlparser 0.49 -> 0.62 upgrade uncovered. None of them were new: on the old
+    // parser each of these failed to PARSE, so the refusal came from the library not understanding
+    // the syntax rather than from any rule here. A parse failure is not a security control — it is
+    // a control that disappears the moment the parser improves, which is exactly what happened.
+    #[test]
+    fn explain_analyze_is_refused_in_both_spellings() {
+        // The bare form sets a boolean; PostgreSQL's parenthesised form lands in `options`, a field
+        // that did not exist when the check was written. ANALYZE executes the statement.
+        for sql in [
+            "EXPLAIN ANALYZE SELECT * FROM t",
+            "EXPLAIN (ANALYZE) SELECT * FROM t",
+            "EXPLAIN (ANALYZE true, VERBOSE) SELECT * FROM t",
+            "EXPLAIN (VERBOSE, ANALYZE) SELECT * FROM t",
+        ] {
+            assert!(
+                validate_readonly(sql).is_err(),
+                "EXPLAIN ANALYZE must be refused, this was not: {sql}"
+            );
+        }
+        // Plain EXPLAIN still has to work, or we have replaced a hole with a regression.
+        assert!(validate_readonly("EXPLAIN SELECT 1").is_ok());
+        assert!(validate_readonly("EXPLAIN (VERBOSE) SELECT 1").is_ok());
+    }
+
+    #[test]
+    fn a_hidden_character_cannot_disguise_a_write_function() {
+        // Each of these is a write function with something invisible wedged into its name, so the
+        // rule that names the function no longer matches it. The last is the one that taught the
+        // lesson: U+00A0 is not invisible at all, it just is not the space it looks like.
+        for sql in [
+            "SELECT setval\u{2060}('s', 1)",               // word joiner
+            "SELECT \u{E0073}pg_read_file('/etc/passwd')", // tag character
+            "SELECT \u{200B}pg_notify('c', 'x')",          // zero-width space
+            "SELECT \u{00A0}lowrite(1, 'x')",              // no-break space
+            "SELECT \u{FEFF}nextval('s')",                 // BOM
+        ] {
+            assert!(
+                validate_readonly(sql).is_err(),
+                "a hidden character disguised a write function: {sql:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn hidden_characters_are_data_when_they_are_inside_a_literal() {
+        // Refusing them everywhere would be easier and wrong: a zero-width joiner is how emoji
+        // sequences are built, and a query filtering on real data must not be rejected for it.
+        assert!(validate_readonly("SELECT * FROM t WHERE name = 'a\u{200D}b'").is_ok());
+        assert!(validate_readonly("SELECT 'no\u{00A0}break'").is_ok());
+        // A literal is not a hiding place for a name, though — that rule is tested elsewhere and
+        // must still hold with a hidden character in the literal.
+        assert!(validate_readonly("SELECT 1").is_ok());
+    }
+
+    #[test]
+    fn a_name_part_the_parser_cannot_read_is_refused_not_skipped() {
+        // sqlparser 0.62 can model a name part as a function call. Every rule in this file reasons
+        // about a name; a part we cannot read must stop the query, not quietly leave the set.
+        // Whether any dialect produces this shape today is beside the point — the code no longer
+        // assumes it cannot happen.
+        assert!(last_part_name(&ObjectName(vec![])).is_none());
+    }
     use super::*;
 
     #[test]
