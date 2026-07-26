@@ -863,6 +863,11 @@ fn col_to_json(row: &Row, i: usize) -> Value {
     if let Ok(v) = row.try_get::<_, Option<bool>>(i) {
         return v.map(|b| json!(b)).unwrap_or(Value::Null);
     }
+    // json/jsonb columns — EXPLAIN (FORMAT JSON) returns one, and losing it to null would be
+    // exactly the silent-emptiness class this project exists to avoid.
+    if let Ok(v) = row.try_get::<_, Option<Value>>(i) {
+        return v.unwrap_or(Value::Null);
+    }
     Value::Null
 }
 
@@ -1016,6 +1021,17 @@ fn query_catalog(
     client
         .batch_execute("BEGIN TRANSACTION READ ONLY")
         .map_err(|e| e.to_string())?;
+    // Let PostgreSQL serialise the row, exactly as the query path does. Reading catalog values
+    // through the driver's per-type mapping silently lost anything it did not know — a `numeric`
+    // came back as null while psql showed 100.00. Wrapping is skipped for EXPLAIN, which cannot
+    // live inside a subquery and already returns json.
+    let wrapped;
+    let (sql, wrapped_mode) = if sql.trim_start().to_ascii_uppercase().starts_with("SELECT") {
+        wrapped = format!("SELECT to_jsonb(t)::text AS _r FROM ({}) t", sql);
+        (wrapped.as_str(), true)
+    } else {
+        (sql, false)
+    };
     let rows = match client.query(sql, params) {
         Ok(r) => r,
         Err(e) => {
@@ -1025,6 +1041,15 @@ fn query_catalog(
     };
     let mut out = Vec::with_capacity(rows.len());
     for row in rows {
+        if wrapped_mode {
+            let txt: Option<String> = row
+                .try_get::<_, Option<String>>(0)
+                .map_err(|_| "result serialization error".to_string())?;
+            let v: Value = serde_json::from_str(&txt.unwrap_or_else(|| "null".into()))
+                .map_err(|_| "result serialization error".to_string())?;
+            out.push(v);
+            continue;
+        }
         let mut obj = serde_json::Map::new();
         for i in 0..row.columns().len() {
             let col_name = row.columns()[i].name().to_string();
@@ -2063,8 +2088,200 @@ fn handle_tools_list() -> Value {
             "properties": { "schema": { "type": "string" }, "table": { "type": "string" }, "database": { "type": "string", "description": "which configured database to use; omit when only one is configured" } },
             "required": ["schema", "table"]
         })),
+        tool_def("explain_query", "Show the PostgreSQL execution plan for a read-only query; set analyze=true to run it and report actual timings and buffer usage", json!({
+            "type": "object",
+            "properties": {
+                "sql": { "type": "string" },
+                "analyze": { "type": "boolean", "default": false },
+                "database": { "type": "string", "description": "which configured database to use; omit when only one is configured" }
+            },
+            "required": ["sql"]
+        })),
+        tool_def("database_health", "Health snapshot: cache hit ratio, connections, long-running statements, vacuum backlog, invalid indexes, sequences near their limit, replication lag", json!({
+            "type": "object",
+            "properties": { "database": { "type": "string", "description": "which configured database to use; omit when only one is configured" } }
+        })),
+        tool_def("top_queries", "Heaviest statements by total execution time, from pg_stat_statements", json!({
+            "type": "object",
+            "properties": {
+                "limit": { "type": "integer", "minimum": 1, "maximum": 50, "default": 10 },
+                "database": { "type": "string", "description": "which configured database to use; omit when only one is configured" }
+            }
+        })),
+        tool_def("analyze_indexes", "Index findings for a schema: unused indexes, duplicates, and tables scanned sequentially where an index would likely pay off", json!({
+            "type": "object",
+            "properties": {
+                "schema": { "type": "string", "default": "public" },
+                "database": { "type": "string", "description": "which configured database to use; omit when only one is configured" }
+            }
+        })),
     ];
     json!({ "result": { "tools": tools } })
+}
+
+/// Why an agent needs this: without a plan it guesses why a query is slow, and its guesses are
+/// confident and usually wrong. `analyze` actually executes the statement — safe here because the
+/// statement is validated read-only first and runs inside the transaction we always roll back.
+fn handle_explain_query(args: &Value) -> Value {
+    let db = args.get("database").and_then(|v| v.as_str());
+    let sql = match args.get("sql").and_then(|v| v.as_str()) {
+        Some(s) => s,
+        None => return err_content(-32602, "missing 'sql'".into()),
+    };
+    if let Err(e) = validate::validate_readonly(sql) {
+        audit("explain_query", "denied_validation", Some(sql));
+        return err_content(-32602, e.to_string());
+    }
+    let analyze = args
+        .get("analyze")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let opts = if analyze {
+        "FORMAT JSON, ANALYZE true, BUFFERS true"
+    } else {
+        "FORMAT JSON"
+    };
+    let stmt = format!("EXPLAIN ({}) {}", opts, sql);
+    match query_catalog(&stmt, &[], db) {
+        Ok(v) => {
+            audit("explain_query", "allowed", Some(sql));
+            ok_content(&v)
+        }
+        Err(e) => {
+            audit("explain_query", "error", Some(sql));
+            err_content(-32000, e)
+        }
+    }
+}
+
+/// A health snapshot an operator would otherwise assemble by hand from half a dozen catalog views.
+/// Every check degrades gracefully: a role that cannot read a view yields a note, not a failure.
+fn handle_database_health(args: &Value) -> Value {
+    let db = args.get("database").and_then(|v| v.as_str());
+    const CHECKS: &[(&str, &str)] = &[
+        (
+            "cache_hit_ratio",
+            "SELECT round(100.0 * sum(heap_blks_hit) / NULLIF(sum(heap_blks_hit) + sum(heap_blks_read), 0), 2) AS pct_from_cache, sum(heap_blks_hit) + sum(heap_blks_read) AS blocks_sampled, CASE WHEN COALESCE(sum(heap_blks_hit) + sum(heap_blks_read), 0) = 0 THEN 'no I/O recorded yet — statistics reset with the server' END AS note FROM pg_statio_user_tables",
+        ),
+        (
+            "connections",
+            "SELECT count(*) AS in_use,                     (SELECT setting::int FROM pg_settings WHERE name = 'max_connections') AS max_connections,                     count(*) FILTER (WHERE state = 'idle in transaction') AS idle_in_transaction              FROM pg_stat_activity",
+        ),
+        (
+            "longest_running",
+            "SELECT round(EXTRACT(epoch FROM max(now() - query_start))::numeric, 1) AS longest_query_seconds,                     round(EXTRACT(epoch FROM max(now() - xact_start))::numeric, 1) AS longest_transaction_seconds              FROM pg_stat_activity WHERE state <> 'idle'",
+        ),
+        (
+            "vacuum_backlog",
+            "SELECT relname AS table_name, n_dead_tup AS dead_rows, n_live_tup AS live_rows, last_autovacuum              FROM pg_stat_user_tables WHERE n_dead_tup > 1000              ORDER BY n_dead_tup DESC LIMIT 10",
+        ),
+        (
+            "invalid_indexes",
+            "SELECT c.relname AS index_name FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid              WHERE NOT i.indisvalid",
+        ),
+        (
+            "sequences_near_limit",
+            "SELECT schemaname || '.' || sequencename AS sequence, last_value, max_value,                     round(100.0 * last_value / NULLIF(max_value, 0), 2) AS pct_used              FROM pg_sequences WHERE last_value IS NOT NULL                AND 100.0 * last_value / NULLIF(max_value, 0) > 50 ORDER BY 4 DESC LIMIT 10",
+        ),
+        (
+            "replication",
+            "SELECT pg_is_in_recovery() AS is_standby,                     CASE WHEN pg_is_in_recovery()                          THEN round(EXTRACT(epoch FROM now() - pg_last_xact_replay_timestamp())::numeric, 1)                          END AS replay_lag_seconds",
+        ),
+    ];
+    let mut out = serde_json::Map::new();
+    for (name, sql) in CHECKS {
+        match query_catalog(sql, &[], db) {
+            Ok(v) => {
+                out.insert(
+                    (*name).to_string(),
+                    v.get("rows").cloned().unwrap_or(Value::Null),
+                );
+            }
+            // Not fatal: a least-privilege role legitimately cannot see some of these.
+            Err(e) => {
+                out.insert((*name).to_string(), json!({ "unavailable": e }));
+            }
+        }
+    }
+    audit("database_health", "allowed", None);
+    ok_content(&Value::Object(out))
+}
+
+/// The heaviest statements, from pg_stat_statements. When the extension is absent we say so and
+/// how to enable it — a missing extension is a setup fact, not an error the agent should retry.
+fn handle_top_queries(args: &Value) -> Value {
+    let db = args.get("database").and_then(|v| v.as_str());
+    let limit = args
+        .get("limit")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(10)
+        .min(50) as i64;
+    let sql = format!(
+        "SELECT calls, round(total_exec_time::numeric, 1) AS total_ms,                 round(mean_exec_time::numeric, 2) AS mean_ms, rows,                 left(query, 300) AS query          FROM pg_stat_statements ORDER BY total_exec_time DESC LIMIT {}",
+        limit
+    );
+    match query_catalog(&sql, &[], db) {
+        Ok(v) => {
+            audit("top_queries", "allowed", None);
+            ok_content(&v)
+        }
+        Err(e) => {
+            audit("top_queries", "error", None);
+            if e.contains("does not exist") || e.contains("42P01") {
+                err_content(
+                    -32000,
+                    "pg_stat_statements is not enabled on this server — add it to shared_preload_libraries and run CREATE EXTENSION pg_stat_statements"
+                        .into(),
+                )
+            } else {
+                err_content(-32000, e)
+            }
+        }
+    }
+}
+
+/// Index findings that are cheap to compute and expensive to notice by hand: indexes nobody uses,
+/// duplicates, and tables scanned sequentially often enough that an index would likely pay off.
+fn handle_analyze_indexes(args: &Value) -> Value {
+    let db = args.get("database").and_then(|v| v.as_str());
+    let schema = args
+        .get("schema")
+        .and_then(|v| v.as_str())
+        .unwrap_or("public");
+    const UNUSED: &str =
+        "SELECT s.relname AS table_name, s.indexrelname AS index_name, s.idx_scan AS scans,                 pg_size_pretty(pg_relation_size(s.indexrelid)) AS size          FROM pg_stat_user_indexes s JOIN pg_index i ON i.indexrelid = s.indexrelid          WHERE s.schemaname = $1 AND s.idx_scan = 0 AND NOT i.indisprimary AND NOT i.indisunique          ORDER BY pg_relation_size(s.indexrelid) DESC LIMIT 20";
+    const DUPLICATES: &str =
+        // array_to_string, not array_agg: an array column comes back as null through the driver.
+        "SELECT t.relname AS table_name, array_to_string(array_agg(c.relname ORDER BY c.relname), ', ') AS duplicate_indexes, pg_size_pretty(sum(pg_relation_size(c.oid))) AS combined_size FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid JOIN pg_class t ON t.oid = i.indrelid JOIN pg_namespace n ON n.oid = t.relnamespace WHERE n.nspname = $1 GROUP BY t.relname, i.indrelid, i.indkey::text, i.indclass::text, (i.indpred IS NULL) HAVING count(*) > 1 ORDER BY sum(pg_relation_size(c.oid)) DESC LIMIT 20";
+    const SEQ_SCANS: &str =
+        "SELECT relname AS table_name, seq_scan, idx_scan, n_live_tup AS rows,                 pg_size_pretty(pg_relation_size(relid)) AS size          FROM pg_stat_user_tables WHERE schemaname = $1 AND seq_scan > COALESCE(idx_scan, 0)            AND n_live_tup > 10000 ORDER BY seq_scan DESC LIMIT 10";
+    let mut out = serde_json::Map::new();
+    for (name, sql) in [
+        ("unused_indexes", UNUSED),
+        ("duplicate_indexes", DUPLICATES),
+        ("tables_scanned_sequentially", SEQ_SCANS),
+    ] {
+        match query_catalog(sql, &[&schema], db) {
+            Ok(v) => {
+                out.insert(
+                    name.to_string(),
+                    v.get("rows").cloned().unwrap_or(Value::Null),
+                );
+            }
+            Err(e) => {
+                out.insert(name.to_string(), json!({ "unavailable": e }));
+            }
+        }
+    }
+    out.insert(
+        "note".to_string(),
+        Value::String(
+            "Counters come from pg_stat_*, which reset with the server and start empty; read them              after a representative period of traffic, not straight after a restart."
+                .into(),
+        ),
+    );
+    audit("analyze_indexes", "allowed", None);
+    ok_content(&Value::Object(out))
 }
 
 fn tool_def(name: &str, desc: &str, input_schema: Value) -> Value {
@@ -2089,6 +2306,10 @@ fn handle_tools_call(params: &Value) -> Value {
         "list_schemas" => handle_list_schemas(&args),
         "list_tables" => handle_list_tables(&args),
         "describe_table" => handle_describe_table(&args),
+        "explain_query" => handle_explain_query(&args),
+        "database_health" => handle_database_health(&args),
+        "top_queries" => handle_top_queries(&args),
+        "analyze_indexes" => handle_analyze_indexes(&args),
         _ => json!({ "error": { "code": -32601, "message": format!("Unknown tool: {}", name) } }),
     }
 }
