@@ -12,6 +12,8 @@ use serde_json::Value;
 use std::sync::RwLock;
 
 use crate::query_catalog;
+use crate::validate;
+use serde_json::json;
 
 /// What the connected role can do, as the database reports it.
 #[derive(Clone, Debug, Default)]
@@ -287,6 +289,254 @@ pub(crate) fn serving_blocked() -> Option<&'static str> {
     } else {
         None
     }
+}
+
+
+/// How bad a finding is. The grade is the worst one present — never an average, because averaging
+/// lets nine good answers hide one fatal one, and a report that does that teaches operators to skim.
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub(crate) enum Severity {
+    Ok,
+    Note,
+    Warn,
+    Critical,
+}
+
+impl Severity {
+    fn grade(self) -> &'static str {
+        match self {
+            Severity::Ok => "A",
+            Severity::Note => "B",
+            Severity::Warn => "C",
+            Severity::Critical => "F",
+        }
+    }
+}
+
+pub(crate) struct Finding {
+    pub(crate) id: &'static str,
+    pub(crate) severity: Severity,
+    pub(crate) fact: String,
+    /// What to run. A finding without one is a complaint.
+    pub(crate) fix: Option<String>,
+}
+
+fn env_set(name: &str) -> bool {
+    std::env::var(name).is_ok_and(|v| !v.trim().is_empty())
+}
+
+/// Whether the connection to PostgreSQL is actually encrypted — asked of the server, not inferred
+/// from our own configuration. `pg_stat_ssl` shows a role its own backend, so this works unprivileged.
+fn tls_fact(db: Option<&str>) -> Option<bool> {
+    let v = query_catalog(
+        "SELECT ssl FROM pg_stat_ssl WHERE pid = pg_backend_pid()",
+        &[],
+        db,
+    )
+    .ok()?;
+    v.get("rows")?
+        .as_array()?
+        .first()?
+        .get("ssl")?
+        .as_bool()
+        .into()
+}
+
+/// The whole posture: what the role may do, how the transport is exposed, and what to do about it.
+pub(crate) fn report(db: Option<&str>) -> Value {
+    let mut findings: Vec<Finding> = Vec::new();
+    let addr = crate::listen_addr();
+    let exposed = !is_loopback(&addr);
+
+    let facts = evaluate(db).ok();
+    match &facts {
+        Some(f) => {
+            for problem in f.excessive() {
+                findings.push(Finding {
+                    id: "role.excessive",
+                    severity: Severity::Critical,
+                    fact: format!("the role {} {}", f.user, problem),
+                    fix: Some("postgres-mcp-hardened --print-setup-sql > setup.sql".into()),
+                });
+            }
+            if f.excessive().is_empty() {
+                findings.push(Finding {
+                    id: "role.reader",
+                    severity: Severity::Ok,
+                    fact: format!(
+                        "the role {} cannot write to any of the {} tables examined",
+                        f.user, f.scanned
+                    ),
+                    fix: None,
+                });
+            }
+            if f.sampled {
+                findings.push(Finding {
+                    id: "role.sampled",
+                    severity: Severity::Note,
+                    fact: "the write check stopped at 5000 relations; there may be more".into(),
+                    fix: None,
+                });
+            }
+        }
+        None => findings.push(Finding {
+            id: "role.unknown",
+            severity: Severity::Warn,
+            fact: "the database has not answered, so what the role may do is unknown".into(),
+            fix: None,
+        }),
+    }
+
+    let authed = env_set("MCP_BEARER_TOKEN") || env_set("JWT_PUBKEY_PEM");
+    if exposed && !authed {
+        findings.push(Finding {
+            id: "transport.anonymous",
+            severity: Severity::Critical,
+            fact: format!("{} is reachable from the network and requires no authentication", addr),
+            fix: Some("set MCP_BEARER_TOKEN, or JWT_PUBKEY_PEM with JWT_AUD and JWT_ISS".into()),
+        });
+    }
+    if !env_set("MCP_AUDIT_LOG") {
+        findings.push(Finding {
+            id: "audit.stderr_only",
+            severity: Severity::Note,
+            fact: "the audit goes to stderr only, so it does not survive the process".into(),
+            fix: Some("set MCP_AUDIT_LOG to a file".into()),
+        });
+    } else if !env_set("MCP_AUDIT_HMAC_KEY") && !env_set("MCP_AUDIT_HMAC_KEY_FILE") {
+        findings.push(Finding {
+            id: "audit.unkeyed",
+            severity: Severity::Note,
+            fact: "the audit chain is hashed but not keyed: anyone who can write the file can \
+                   recompute it and the result still verifies"
+                .into(),
+            fix: Some("set MCP_AUDIT_HMAC_KEY_FILE, with the key held off this host".into()),
+        });
+    }
+    if validate::redaction_configured() {
+        findings.push(Finding {
+            id: "redaction.depth_only",
+            severity: Severity::Note,
+            fact: "column redaction is configured; it is defence in depth, not a boundary — the \
+                   startup check reports where the role can still read those columns"
+                .into(),
+            fix: Some("postgres-mcp-hardened --print-setup-sql --redact <columns>".into()),
+        });
+    }
+    match tls_fact(db) {
+        Some(true) => findings.push(Finding {
+            id: "tls.on",
+            severity: Severity::Ok,
+            fact: "the connection to PostgreSQL is encrypted (measured, not assumed)".into(),
+            fix: None,
+        }),
+        Some(false) => findings.push(Finding {
+            id: "tls.off",
+            severity: if exposed { Severity::Warn } else { Severity::Note },
+            fact: "the connection to PostgreSQL is NOT encrypted".into(),
+            fix: Some("add ?sslmode=verify-full to the connection string".into()),
+        }),
+        None => {}
+    }
+
+    let worst = findings
+        .iter()
+        .map(|f| f.severity)
+        .max()
+        .unwrap_or(Severity::Ok);
+    let items: Vec<Value> = findings
+        .iter()
+        .map(|f| {
+            let mut o = serde_json::Map::new();
+            o.insert("id".into(), json!(f.id));
+            o.insert("severity".into(), json!(format!("{:?}", f.severity).to_lowercase()));
+            o.insert("fact".into(), json!(f.fact));
+            if let Some(fix) = &f.fix {
+                o.insert("fix".into(), json!(fix));
+            }
+            Value::Object(o)
+        })
+        .collect();
+
+    json!({
+        "grade": worst.grade(),
+        "listening": addr,
+        "exposedToNetwork": exposed,
+        "authentication": if env_set("JWT_PUBKEY_PEM") { "oauth" }
+                          else if env_set("MCP_BEARER_TOKEN") { "shared token" }
+                          else { "none" },
+        "findings": items,
+        "note": "The grade is the worst finding, not an average. A is: a role that cannot write, \
+                 authentication where it is exposed, a keyed audit, and an encrypted connection."
+    })
+}
+
+/// The MCP tool. Wrapped as untrusted output like everything else: it carries table names that came
+/// from the database, and a name is content.
+pub(crate) fn handle_security_posture(args: &Value) -> Value {
+    let db = args.get("database").and_then(|v| v.as_str());
+    let v = report(db);
+    crate::audit("security_posture", "allowed", None);
+    crate::wrap_untrusted(&v, "security_posture")
+}
+
+/// Two or three sentences for `initialize`, because in stdio nobody sees stderr and the agent is the
+/// only messenger the operator has.
+pub(crate) fn instructions() -> String {
+    let v = report(None);
+    let grade = v.get("grade").and_then(|g| g.as_str()).unwrap_or("?");
+    let worst: Vec<String> = v
+        .get("findings")
+        .and_then(|f| f.as_array())
+        .map(|a| {
+            a.iter()
+                .filter(|f| {
+                    matches!(
+                        f.get("severity").and_then(|s| s.as_str()),
+                        Some("critical") | Some("warn")
+                    )
+                })
+                .filter_map(|f| f.get("fact").and_then(|x| x.as_str()).map(String::from))
+                .take(2)
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut s = format!("Security posture of this deployment: {}.", grade);
+    if !worst.is_empty() {
+        s.push(' ');
+        s.push_str(&worst.join("; "));
+        s.push('.');
+    }
+    s.push_str(" Call the security_posture tool for the detail and the commands that fix it.");
+    s.chars().take(600).collect()
+}
+
+/// Records the posture in the audit chain, right after the configuration record.
+pub(crate) fn audit_posture() {
+    let v = report(None);
+    let mut extra = serde_json::Map::new();
+    for k in ["grade", "authentication", "exposedToNetwork"] {
+        if let Some(x) = v.get(k) {
+            extra.insert(k.to_string(), x.clone());
+        }
+    }
+    let worst: Vec<&str> = v
+        .get("findings")
+        .and_then(|f| f.as_array())
+        .map(|a| {
+            a.iter()
+                .filter(|f| f.get("severity").and_then(|s| s.as_str()) == Some("critical"))
+                .filter_map(|f| f.get("id").and_then(|x| x.as_str()))
+                .collect()
+        })
+        .unwrap_or_default();
+    // Deduplicated: thirteen repetitions of role.excessive say no more than one, and a log entry
+    // that scrolls is a log entry nobody reads.
+    let mut uniq: Vec<&str> = worst;
+    uniq.sort_unstable();
+    uniq.dedup();
+    extra.insert("critical".into(), json!(uniq));
+    crate::audit_extra("server", "posture", None, extra);
 }
 
 #[cfg(test)]

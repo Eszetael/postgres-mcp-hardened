@@ -92,6 +92,10 @@
       "description": "Slowest statements server-wide"
     },
     {
+      "name": "security_posture",
+      "description": "What this server can and cannot do"
+    },
+    {
       "name": "analyze_indexes",
       "description": "Index findings"
     }

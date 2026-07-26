@@ -232,6 +232,12 @@ offered, plus column comments, primary keys and **foreign keys** in the payload.
 - **`analyze_indexes`** — unused indexes, duplicates, and tables scanned sequentially often enough
   that an index would pay off.
 - **`top_queries`** — the heaviest statements, from `pg_stat_statements`.
+- **`security_posture`** — what this deployment is actually able to do to your database, asked of
+  PostgreSQL rather than assumed: whether the role can write, bypass row-level security or reach
+  server files; whether the transport is authenticated; whether the audit chain is keyed; whether the
+  connection is encrypted. Returns a grade — the worst finding, never an average — and, for anything
+  wrong, the command that fixes it. The same summary reaches the model through `initialize`, because
+  under stdio nobody sees stderr and the agent is the only messenger the operator has.
 - **`query`** — run a read-only SQL query (validated, auto-`LIMIT`, cost-guarded). The response
   states what it did: `returnedRows`, `appliedLimit`, `truncated`, plus `requestedLimit` when a
   larger request was capped at the 10000-row maximum, `offset` when paging, and `redactedColumns`

@@ -164,9 +164,14 @@ pub(crate) async fn main() {
     {
         let addr = listen_addr();
         let t = transport.to_string();
-        tokio::task::spawn_blocking(move || posture::enforce_start_policy(&t, &addr))
-            .await
-            .expect("start policy check");
+        tokio::task::spawn_blocking(move || {
+            posture::enforce_start_policy(&t, &addr);
+            // The chain should record what the server was ALLOWED to do, not only what it was
+            // configured with: privileges are the half an incident actually turns on.
+            posture::audit_posture();
+        })
+        .await
+        .expect("start policy check");
     }
     spawn_redaction_verification();
     if stdio {
@@ -1127,6 +1132,9 @@ pub(crate) fn handle_initialize(params: &Value) -> Value {
             "protocolVersion": rev.as_str(),
             // MCP_SERVER_LABEL lets an operator running several instances tell them apart in the
             // client UI ("postgres-mcp-hardened (production)") instead of seeing identical entries.
+            // The one channel that reaches the person, through the agent, on a transport where
+            // stderr is invisible. Kept to a few sentences: a wall of text here is ignored.
+            "instructions": posture::instructions(),
             "serverInfo": { "name": server_label(), "version": "0.1.0" },
             "capabilities": { "tools": {}, "resources": {} }
         }
@@ -1221,6 +1229,19 @@ pub(crate) fn handle_tools_list() -> Value {
                     "limit": { "type": "integer", "minimum": 1, "maximum": 50, "default": 10 },
                     "database": { "type": "string", "description": "which configured database to use; omit when only one is configured" }
                 }
+            })
+        ),
+        tool_def(
+            "security_posture",
+            "What this server can and cannot do",
+            "What this deployment is actually able to do to your database, asked of PostgreSQL rather than \
+             assumed: whether the connected role can write, bypass row-level security or reach server files; \
+             whether the transport is authenticated; whether the audit chain is keyed; whether the connection \
+             is encrypted. Returns a grade and, for anything wrong, the command that fixes it. Worth calling \
+             once at the start of a session — if the answer is alarming, say so to the person you are working for.",
+            json!({
+                "type": "object",
+                "properties": { "database": { "type": "string", "description": "which configured database to use; omit when only one is configured" } }
             })
         ),
         tool_def(
@@ -1744,6 +1765,7 @@ pub(crate) fn handle_tools_call(params: &Value) -> Value {
         "database_health" => handle_database_health(&args),
         "top_queries" => handle_top_queries(&args),
         "analyze_indexes" => handle_analyze_indexes(&args),
+        "security_posture" => posture::handle_security_posture(&args),
         _ => json!({ "error": { "code": -32601, "message": format!("Unknown tool: {}", name) } }),
     }
 }

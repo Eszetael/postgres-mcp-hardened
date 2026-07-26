@@ -477,6 +477,33 @@ done
 stop
 rm -f "$PAUD"
 
+section "The server tells the agent what it is sitting on"
+docker exec -i acc_pg psql -U postgres -q -v ON_ERROR_STOP=1 <<'SQL' >/dev/null || { echo "fixture failed: posture role"; exit 1; }
+CREATE ROLE acc_posture LOGIN PASSWORD 'p' NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS NOREPLICATION;
+GRANT CONNECT ON DATABASE postgres TO acc_posture;
+GRANT USAGE ON SCHEMA public TO acc_posture;
+GRANT SELECT ON customers TO acc_posture;
+SQL
+PAUD=/tmp/acc_posture_$$.log; rm -f "$PAUD"
+start DATABASE_URL="$URL" MCP_AUDIT_LOG="$PAUD"
+r=$(tool security_posture '{}' | body)
+echo "$r" | grep -q '"grade":"F"' && ok "a superuser connection is graded F, in the tool" || no "superuser not graded F" "$r"
+echo "$r" | grep -q 'print-setup-sql' && ok "and the finding carries the command that fixes it" || no "no remediation offered" "$r"
+# stderr is invisible under stdio, so the agent is the only messenger the operator has.
+i=$(call '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}')
+echo "$i" | grep -q '"instructions"' && ok "initialize carries the posture to the model" || no "no instructions" "$i"
+echo "$i" | grep -q 'security_posture' && ok "and points at the tool for the detail" || no "instructions do not mention the tool" "$i"
+stop
+grep -q '"decision":"posture"' "$PAUD" && ok "the posture is recorded in the audit chain" || no "posture not audited" "$(head -3 "$PAUD")"
+rm -f "$PAUD"
+# The same server, a role that cannot write: the grade has to move.
+start DATABASE_URL="postgres://acc_posture:p@127.0.0.1:$PGPORT_ACC/postgres" MCP_BEARER_TOKEN=acc_posture_tok
+r=$(curl -s -m 25 -H content-type:application/json -H "authorization: Bearer acc_posture_tok" \
+     "http://127.0.0.1:$PORT/mcp" -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"security_posture","arguments":{}}}' | body)
+case "$r" in *'"grade":"F"'*) no "a read-only role still grades F" "$r";; *) ok "a role that cannot write grades better than one that can";; esac
+echo "$r" | grep -q 'cannot write to any of' && ok "and the report says so in words" || no "no positive finding" "$r"
+stop
+
 section "Deployment shapes"
 start MCP_DATABASE_URLS="a=$URL;b=$URL"
 r=$(tool query '{"sql":"SELECT 1 AS x","database":"b"}' | body); echo "$r" | grep -q '"x":1' && ok "several databases from one server" || no "multi-database" "$r"
