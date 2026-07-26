@@ -278,6 +278,10 @@ will tell you what the role can do the moment you point it at the database.
 
 ## Security model
 
+The full statement of what this server guarantees, what it does not, and which control enforces
+which promise is in [THREAT_MODEL.md](THREAT_MODEL.md) — including the controls that have been
+defeated in review and are therefore described as depth rather than as boundaries.
+
 - **Encrypted transport:** TLS to PostgreSQL via rustls (no OpenSSL in the image), certificate
   verification always on, private CAs via `MCP_SSLROOTCERT`.
 - **Read-only, two ways:** every statement is parsed with `sqlparser` and rejected unless it's a `SELECT`/`WITH`/`EXPLAIN`/`SHOW`; the DB session is additionally set `default_transaction_read_only = on`.

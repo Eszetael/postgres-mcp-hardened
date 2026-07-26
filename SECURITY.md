@@ -2,6 +2,10 @@
 
 This project *is* a security tool — reports are taken seriously.
 
+Before reporting, [THREAT_MODEL.md](THREAT_MODEL.md) says what is in scope: it names the adversaries
+we design against, the assumptions the operator has to make true, and the controls we already
+describe as depth rather than as boundaries.
+
 ## Reporting a vulnerability
 
 Please report suspected vulnerabilities privately by email to
