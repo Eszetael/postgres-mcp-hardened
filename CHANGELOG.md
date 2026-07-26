@@ -34,10 +34,23 @@ alternative to the deprecated `@modelcontextprotocol/server-postgres`.
   server certificate, and accepts a private CA bundle via `MCP_SSLROOTCERT`.
 - **Fair-use limits:** per-client request rate *and* a cap on concurrent in-flight
   requests, so one client cannot occupy the whole connection pool with slow queries.
-- **Honest results:** `truncated` / `rowLimit` are reported, `numeric` keeps full
+- **Honest results:** `truncated` / `appliedLimit` are reported, `numeric` keeps full
   precision, and the untrusted-output block is escaped without altering the data.
 - **Prompt-injection aware:** row data wrapped in a `trusted="false"` provenance
-  block with delimiters escaped.
+  block with delimiters escaped. Optional MCP `structuredContent`
+  (`MCP_STRUCTURED_CONTENT=1`) carries the same provenance marker inside the object,
+  because a client reading structured output never sees the text block.
+- **Written for agent callers:** every tool has a `title`, the full 2025-06-18 annotation
+  set, and a description that states its limits up front — the row cap, the `offset`
+  needed to page past it, that `description` is null until somebody writes a
+  `COMMENT ON`, and which of `top_queries`/`explain_query` answers which question.
+- **Diagnostics that mean what they say:** index duplicates are grouped by the actual
+  partial-index predicate and uniqueness (indexes over disjoint rows are no longer
+  called duplicates, and a `UNIQUE` index is never offered up as a redundant copy);
+  connection counts are scoped to the current database; an abandoned transaction is
+  reported as idle-in-transaction rather than as a multi-hour running query; every check
+  respects the caller's table privileges; and sequences the role cannot read are declared
+  instead of silently dropped from the results.
 - **No schema leaks:** database errors mapped to structured, non-leaking messages.
 - **OAuth 2.1** (RS256 JWT: signature + `exp` + `aud` + `iss` + scope), optional.
 - **Tamper-evident audit log** (hash-chained), **Prometheus `/metrics`**,

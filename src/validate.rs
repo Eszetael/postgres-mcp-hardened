@@ -685,6 +685,40 @@ fn stmt_kind(s: &Statement) -> String {
 /// **clamps it downwards** (a hand-written `LIMIT 999999999` used to bypass the declared hard cap
 /// entirely). Returns canonical AST text that itself passes the validator (the round-trip gate).
 pub fn enforce_limit(sql: &str, max_rows: u64) -> Result<String, ValidationError> {
+    enforce_limit_offset(sql, max_rows, 0)
+}
+
+/// As `enforce_limit`, plus a row offset for paging.
+///
+/// A non-zero offset ALWAYS wraps the query from the outside instead of editing its own LIMIT/OFFSET:
+/// the caller's paging must not be silently merged with paging the query already had.
+pub fn enforce_limit_offset(
+    sql: &str,
+    max_rows: u64,
+    offset: u64,
+) -> Result<String, ValidationError> {
+    if offset > 0 {
+        let ast = parse(sql)?;
+        if ast.is_empty() {
+            return Ok(sql.to_string());
+        }
+        let rendered = format!(
+            "SELECT * FROM ({}) AS _mcp_page LIMIT {} OFFSET {}",
+            ast[0], max_rows, offset
+        );
+        // Same round-trip gate as below: what reaches the database must pass the validator that
+        // accepted the original, or we would be validating one statement and executing another.
+        if validate_readonly(&rendered).is_ok() {
+            return Ok(rendered);
+        }
+        return Err(ValidationError::NotParseable(
+            "this query cannot be paged safely (its canonical form does not re-validate)".into(),
+        ));
+    }
+    enforce_limit_inner(sql, max_rows)
+}
+
+fn enforce_limit_inner(sql: &str, max_rows: u64) -> Result<String, ValidationError> {
     let mut ast = parse(sql)?;
     if ast.is_empty() {
         return Ok(sql.to_string());

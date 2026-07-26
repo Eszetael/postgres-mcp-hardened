@@ -772,62 +772,109 @@ pub(crate) fn handle_initialize() -> Value {
 }
 
 pub(crate) fn handle_tools_list() -> Value {
+    // Descriptions are written for the caller that actually reads them — a model choosing between
+    // eight tools with no other context. Each says what the tool answers, what it costs, and where
+    // it will disappoint: a cap that applies silently, a column that is null unless someone wrote a
+    // COMMENT, an extension that has to be installed. An agent told the limit in advance does not
+    // have to discover it by mistaking a truncated page for the whole table.
     let tools = vec![
         tool_def(
             "query",
-            "Execute a read-only SQL query",
+            "Run SQL (read-only)",
+            "Run a read-only SQL query and return rows. Writes, DDL and administrative functions are refused before the statement reaches the database. \
+             At most 1000 rows come back unless you pass `limit` (server maximum 10000); `truncated: true` in the response means there is more data — \
+             page through it with `offset`, and give the query an ORDER BY when you do, or the rows you get on page two depend on the planner's mood.",
             json!({
                 "type": "object",
                 "properties": {
-                    "sql": { "type": "string" },
+                    "sql": { "type": "string", "description": "a single read-only statement: SELECT, WITH, VALUES, TABLE, EXPLAIN or SHOW" },
                     "database": { "type": "string", "description": "which configured database to use; omit when only one is configured" },
-                    "limit": { "type": "integer", "minimum": 1, "default": 1000 }
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 10000, "default": 1000, "description": "maximum rows to return; larger values are capped at 10000 and the response says so" },
+                    "offset": { "type": "integer", "minimum": 0, "default": 0, "description": "rows to skip, for paging; pair it with ORDER BY for stable pages" }
                 },
                 "required": ["sql"]
             })
         ),
         tool_def(
             "list_schemas",
-            "List all schemas",
+            "List schemas",
+            "List the schemas in the database, excluding PostgreSQL's own catalogs. Start here when you do not know the layout yet.",
             json!({"type": "object", "properties": { "database": { "type": "string", "description": "which configured database to use; omit when only one is configured" } }}),
         ),
-        tool_def("list_tables", "List tables, views and materialized views in a schema", json!({
-            "type": "object",
-            "properties": { "schema": { "type": "string" }, "database": { "type": "string", "description": "which configured database to use; omit when only one is configured" } },
-            "required": ["schema"]
-        })),
-        tool_def("describe_table", "Describe table columns: type, nullability, default, primary key, and the schema comment documenting what the column means", json!({
-            "type": "object",
-            "properties": { "schema": { "type": "string" }, "table": { "type": "string" }, "database": { "type": "string", "description": "which configured database to use; omit when only one is configured" } },
-            "required": ["schema", "table"]
-        })),
-        tool_def("explain_query", "Show the PostgreSQL execution plan for a read-only query; set analyze=true to run it and report actual timings and buffer usage", json!({
-            "type": "object",
-            "properties": {
-                "sql": { "type": "string" },
-                "analyze": { "type": "boolean", "default": false },
-                "database": { "type": "string", "description": "which configured database to use; omit when only one is configured" }
-            },
-            "required": ["sql"]
-        })),
-        tool_def("database_health", "Health snapshot: cache hit ratio, connections, long-running statements, vacuum backlog, invalid indexes, sequences near their limit, replication lag", json!({
-            "type": "object",
-            "properties": { "database": { "type": "string", "description": "which configured database to use; omit when only one is configured" } }
-        })),
-        tool_def("top_queries", "Heaviest statements by total execution time, from pg_stat_statements", json!({
-            "type": "object",
-            "properties": {
-                "limit": { "type": "integer", "minimum": 1, "maximum": 50, "default": 10 },
-                "database": { "type": "string", "description": "which configured database to use; omit when only one is configured" }
-            }
-        })),
-        tool_def("analyze_indexes", "Index findings for a schema: unused indexes, duplicates, and tables scanned sequentially where an index would likely pay off", json!({
-            "type": "object",
-            "properties": {
-                "schema": { "type": "string", "default": "public" },
-                "database": { "type": "string", "description": "which configured database to use; omit when only one is configured" }
-            }
-        })),
+        tool_def(
+            "list_tables",
+            "List tables in a schema",
+            "List tables, views and materialized views in one schema, with their comments. Only objects the connected role may read are shown.",
+            json!({
+                "type": "object",
+                "properties": { "schema": { "type": "string" }, "database": { "type": "string", "description": "which configured database to use; omit when only one is configured" } },
+                "required": ["schema"]
+            })
+        ),
+        tool_def(
+            "describe_table",
+            "Describe a table",
+            "Column names, types, nullability, defaults and primary key for one table, plus each column's comment. \
+             `description` is null unless somebody ran COMMENT ON — that means undocumented, not unused, so do not infer a column is dead from it.",
+            json!({
+                "type": "object",
+                "properties": { "schema": { "type": "string" }, "table": { "type": "string" }, "database": { "type": "string", "description": "which configured database to use; omit when only one is configured" } },
+                "required": ["schema", "table"]
+            })
+        ),
+        tool_def(
+            "explain_query",
+            "Explain one query",
+            "Why THIS statement is slow: the PostgreSQL execution plan for a query you provide. With analyze=true it actually runs the query and reports \
+             measured timings and buffer usage (still read-only, still rolled back). Use it on a specific statement; use top_queries to find out which statement to look at.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "sql": { "type": "string" },
+                    "analyze": { "type": "boolean", "default": false, "description": "run the query and report real timings instead of estimates" },
+                    "database": { "type": "string", "description": "which configured database to use; omit when only one is configured" }
+                },
+                "required": ["sql"]
+            })
+        ),
+        tool_def(
+            "database_health",
+            "Health snapshot",
+            "One snapshot of the things an operator would otherwise assemble by hand: cache hit ratio, connections, long-running statements and abandoned \
+             transactions, vacuum backlog, invalid indexes, sequences near their ceiling, replication lag. Scoped to the current database; anything the \
+             connected role cannot read is reported as unavailable rather than left out.",
+            json!({
+                "type": "object",
+                "properties": { "database": { "type": "string", "description": "which configured database to use; omit when only one is configured" } }
+            })
+        ),
+        tool_def(
+            "top_queries",
+            "Slowest statements server-wide",
+            "WHICH statements cost the most, ranked by total execution time across the whole server. Requires the pg_stat_statements extension; if it is \
+             missing the answer says how to enable it. Take the statement you find here to explain_query for the plan.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 50, "default": 10 },
+                    "database": { "type": "string", "description": "which configured database to use; omit when only one is configured" }
+                }
+            })
+        ),
+        tool_def(
+            "analyze_indexes",
+            "Index findings",
+            "Indexes nobody uses, genuine duplicates, and tables scanned sequentially often enough that an index would likely pay off. Counters come from \
+             pg_stat_*, which reset with the server — read them after real traffic, not after a restart. Primary-key and unique indexes are excluded from \
+             the unused list on purpose: they earn their keep by enforcing a constraint.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "schema": { "type": "string", "default": "public" },
+                    "database": { "type": "string", "description": "which configured database to use; omit when only one is configured" }
+                }
+            })
+        ),
     ];
     json!({ "result": { "tools": tools } })
 }
@@ -1073,12 +1120,26 @@ pub(crate) fn handle_analyze_indexes(args: &Value) -> Value {
     ok_content(&Value::Object(out))
 }
 
-pub(crate) fn tool_def(name: &str, desc: &str, input_schema: Value) -> Value {
+/// `title` is what a user sees in a client's tool list; `name` is what the model calls. Both matter:
+/// agents pick tools from the description, humans approve them from the title.
+///
+/// The annotations are the full set from the 2025-06-18 specification rather than `readOnlyHint`
+/// alone. `openWorldHint: false` because the domain is closed — the configured databases and nothing
+/// else; `idempotentHint: true` because a repeated call changes nothing (the DATA may have changed
+/// underneath, which is a different property and not what this hint describes).
+pub(crate) fn tool_def(name: &str, title: &str, desc: &str, input_schema: Value) -> Value {
     json!({
         "name": name,
+        "title": title,
         "description": desc,
         "inputSchema": input_schema,
-        "annotations": { "readOnlyHint": true }
+        "annotations": {
+            "title": title,
+            "readOnlyHint": true,
+            "destructiveHint": false,
+            "idempotentHint": true,
+            "openWorldHint": false
+        }
     })
 }
 
@@ -1119,13 +1180,11 @@ pub(crate) fn handle_query_tool(args: &Value) -> Value {
 
     // 2. Limit (1000 by default). We ask the database for ONE row MORE than we return — the extra row
     //    is proof that the data was cut, so we can TELL the agent instead of quietly presenting a
-    //    fragment as the whole (`rowCount: 1000` was indistinguishable from a complete result).
-    let limit = args
-        .get("limit")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(1000)
-        .min(MAX_LIMIT);
-    let final_sql = match validate::enforce_limit(sql, limit.saturating_add(1)) {
+    //    fragment as the whole (`returnedRows: 1000` was indistinguishable from a complete result).
+    let requested_limit = args.get("limit").and_then(|v| v.as_u64());
+    let limit = requested_limit.unwrap_or(1000).min(MAX_LIMIT);
+    let offset = args.get("offset").and_then(|v| v.as_u64()).unwrap_or(0);
+    let final_sql = match validate::enforce_limit_offset(sql, limit.saturating_add(1), offset) {
         Ok(s) => s,
         Err(e) => return json!({ "error": { "code": -32602, "message": e.to_string() } }),
     };
@@ -1155,6 +1214,23 @@ pub(crate) fn handle_query_tool(args: &Value) -> Value {
     match execute_readonly(&final_sql, db) {
         Ok(mut data) => {
             mark_truncation(&mut data, limit);
+            // Say what was actually applied. A request for 50000 rows silently became 10000, and the
+            // response looked identical to one that had asked for 10000 — the agent had no way to
+            // tell a server cap from the end of the data.
+            if requested_limit.is_some_and(|r| r > MAX_LIMIT) {
+                data["requestedLimit"] = json!(requested_limit);
+                data["limitNote"] = json!(format!(
+                    "requested limit exceeds the server maximum of {}; {} was applied",
+                    MAX_LIMIT, limit
+                ));
+            }
+            if offset > 0 {
+                data["offset"] = json!(offset);
+            }
+            let redacted = redacted_columns();
+            if !redacted.is_empty() {
+                data["redactedColumns"] = json!(redacted);
+            }
             audit("query", "allowed", Some(sql));
             METRICS.query_allowed.fetch_add(1, Ordering::Relaxed);
             wrap_untrusted(&data, "query")
@@ -1183,10 +1259,10 @@ pub(crate) fn mark_truncation(data: &mut Value, limit: u64) {
         if let Some(arr) = data.get_mut("rows").and_then(|r| r.as_array_mut()) {
             arr.truncate(limit as usize);
         }
-        data["rowCount"] = json!(limit);
+        data["returnedRows"] = json!(limit);
     }
     data["truncated"] = json!(truncated);
-    data["rowLimit"] = json!(limit);
+    data["appliedLimit"] = json!(limit);
 }
 
 #[cfg(test)]
@@ -1245,20 +1321,20 @@ mod tests {
         );
     }
 
-    /// Truncation MUST be explicit in the response (and must not overstate rowCount).
+    /// Truncation MUST be explicit in the response (and must not overstate returnedRows).
     #[test]
     fn truncation_is_reported() {
-        let mut full = json!({"rowCount": 3, "rows": [{"a":1},{"a":2},{"a":3}]});
+        let mut full = json!({"returnedRows": 3, "rows": [{"a":1},{"a":2},{"a":3}]});
         mark_truncation(&mut full, 2);
         assert_eq!(full["truncated"], json!(true));
-        assert_eq!(full["rowCount"], json!(2));
+        assert_eq!(full["returnedRows"], json!(2));
         assert_eq!(full["rows"].as_array().unwrap().len(), 2);
-        assert_eq!(full["rowLimit"], json!(2));
+        assert_eq!(full["appliedLimit"], json!(2));
 
-        let mut partial = json!({"rowCount": 2, "rows": [{"a":1},{"a":2}]});
+        let mut partial = json!({"returnedRows": 2, "rows": [{"a":1},{"a":2}]});
         mark_truncation(&mut partial, 5);
         assert_eq!(partial["truncated"], json!(false));
-        assert_eq!(partial["rowCount"], json!(2));
+        assert_eq!(partial["returnedRows"], json!(2));
     }
 
     #[test]

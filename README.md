@@ -192,7 +192,10 @@ offered, plus column comments, primary keys and **foreign keys** in the payload.
 - **`analyze_indexes`** — unused indexes, duplicates, and tables scanned sequentially often enough
   that an index would pay off.
 - **`top_queries`** — the heaviest statements, from `pg_stat_statements`.
-- **`query`** — run a read-only SQL query (validated, auto-`LIMIT`, cost-guarded).
+- **`query`** — run a read-only SQL query (validated, auto-`LIMIT`, cost-guarded). The response
+  states what it did: `returnedRows`, `appliedLimit`, `truncated`, plus `requestedLimit` when a
+  larger request was capped at the 10000-row maximum, `offset` when paging, and `redactedColumns`
+  when masking is configured — so an agent never has to guess whether it received the whole answer.
 - **`list_schemas`**, **`list_tables`**, **`describe_table`** — progressive schema discovery
   (parameterized, injection-safe). `describe_table` returns the **schema comments**
   (`COMMENT ON TABLE/COLUMN`), primary keys, **foreign keys** and defaults, so the agent reads what a
@@ -208,7 +211,9 @@ offered, plus column comments, primary keys and **foreign keys** in the payload.
 - **Sensitive columns never leave the database:** list them in `MCP_REDACT_COLUMNS` and their
   values are masked in results *and* the column may not be referenced at all — renaming it
   (`SELECT password AS pw`) or wrapping it (`SELECT md5(password)`) is refused, because a filter
-  that a model can rename its way past is worse than none.
+  that a model can rename its way past is worse than none. Masking applies at every depth, so
+  serialising a whole row (`row_to_json(t)`, `to_jsonb(t.*)`, `json_agg(t)`) does not smuggle the
+  value out one level down.
 - **Prompt-injection aware:** row data is returned inside a `trusted="false"` provenance block with delimiters escaped, so a malicious cell can't hijack the agent.
 - **No schema leaks:** database errors are mapped to structured, actionable messages that never echo table/column names.
 - **OAuth 2.1:** optional RS256 bearer-token validation (signature, `exp`, `aud`, `iss`) with scope enforcement; disabled when unconfigured for local/self-host use.
@@ -241,7 +246,7 @@ left resident memory flat and file descriptors unchanged.
 | `DATABASE_URL` | PostgreSQL connection string (use a read-only role) |
 | `MCP_ADDR` | HTTP listen address (default `127.0.0.1:8080`) |
 | `MCP_MAX_COST` | reject queries whose `EXPLAIN` cost exceeds this (default 1,000,000) |
-| `JWT_PUBKEY_PEM`, `JWT_AUD`, `JWT_ISS` | enable OAuth 2.1 token validation (omit to disable auth) |
+| `JWT_PUBKEY_PEM`, `JWT_AUD`, `JWT_ISS` | enable OAuth 2.1 token validation (omit to disable auth); the key may be the PEM text or a path to a PEM file |
 | `MCP_AUDIT_LOG` | path to the append-only audit log (hash-chained); verify with `--verify-audit <file> [--expect-last <hash>]` |
 | `MCP_AUDIT_HMAC_KEY` / `MCP_AUDIT_HMAC_KEY_FILE` | key that turns the audit chain into HMAC-SHA256 — keep it off the host so the log cannot be rewritten (a trailing newline in the file is ignored) |
 | `MCP_AUDIT_HMAC_KEYS_OLD` | comma-separated previous keys, so a log that survived a key rotation still verifies |
@@ -258,7 +263,8 @@ left resident memory flat and file descriptors unchanged.
 | `MCP_MAX_INFLIGHT_PER_CLIENT` | max concurrent requests from one client (default 4; `0` disables) |
 | `MCP_RATE_RPM` | per-client request rate limit (default 120/min; `0` disables) |
 | `MCP_RATE_BURST` | burst allowance for that limit (default `MCP_RATE_RPM / 4`, min 5) |
-| `MCP_METRICS_TOKEN` | require this token on `/metrics` (open by default, for scraping from a private network) |
+| `MCP_METRICS_TOKEN` | require this token on `/metrics` (open by default, for scraping from a private network; when `MCP_BEARER_TOKEN` is set and this is not, the bearer token is required instead) |
+| `MCP_STRUCTURED_CONTENT` | `1` to also return MCP `structuredContent`; off by default because a client that ignores it pays for every result twice |
 | `MCP_RESERVED_AUTH_SLOTS` | database slots kept for authenticated traffic so an anonymous flood cannot take the pool (default: a quarter) |
 | `MCP_PUBLIC_URL` | this server's public base URL, used in the OAuth discovery metadata |
 | `MCP_AUTH_SERVERS` | authorization server URLs advertised in that metadata |

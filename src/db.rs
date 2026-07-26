@@ -374,6 +374,15 @@ pub(crate) fn redact_patterns() -> &'static [String] {
     &P
 }
 
+/// The column patterns redaction is configured with, for the response to declare.
+///
+/// An agent that receives `[redacted]` in a value can see it; an agent that receives a row where
+/// the column was never selected cannot tell configuration from absence. Saying so up front is the
+/// difference between a masked field and a silent one.
+pub(crate) fn redacted_columns() -> Vec<String> {
+    redact_patterns().to_vec()
+}
+
 pub(crate) fn redact_rows(rows: &mut [Value]) {
     let pats = redact_patterns();
     if pats.is_empty() {
@@ -577,7 +586,7 @@ pub(crate) fn execute_readonly(final_sql: &str, db: Option<&str>) -> Result<Valu
     redact_rows(&mut out);
     // ROLLBACK on EVERY exit path — including success (we never commit anything).
     let _ = client.batch_execute("ROLLBACK");
-    Ok(json!({ "rowCount": out.len(), "rows": out }))
+    Ok(json!({ "returnedRows": out.len(), "rows": out }))
 }
 
 use postgres::types::ToSql;
@@ -639,7 +648,7 @@ pub(crate) fn query_catalog(
         out.push(Value::Object(obj));
     }
     let _ = client.batch_execute("ROLLBACK");
-    Ok(json!({ "rowCount": out.len(), "rows": out }))
+    Ok(json!({ "returnedRows": out.len(), "rows": out }))
 }
 
 #[cfg(test)]
