@@ -341,6 +341,39 @@ grep -q 'acc_secret_token' "$AUD" && no "THE BEARER TOKEN IS IN THE AUDIT LOG" "
 "$BIN" --verify-audit "$AUD" >/dev/null 2>&1 && ok "the chain still verifies with the new fields" || no "chain broken by extra fields" ""
 rm -f "$AUD"
 
+section "It will not expose a role that can write"
+docker exec -i acc_pg psql -U postgres -q -v ON_ERROR_STOP=1 <<'SQL' >/dev/null || { echo "fixture failed: gate roles"; exit 1; }
+CREATE ROLE acc_reader LOGIN PASSWORD 'r' NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS NOREPLICATION;
+GRANT CONNECT ON DATABASE postgres TO acc_reader;
+GRANT USAGE ON SCHEMA public TO acc_reader;
+GRANT SELECT ON customers TO acc_reader;
+CREATE ROLE acc_writer LOGIN PASSWORD 'w' NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS NOREPLICATION;
+GRANT CONNECT ON DATABASE postgres TO acc_writer;
+GRANT USAGE ON SCHEMA public TO acc_writer;
+GRANT SELECT, INSERT ON customers TO acc_writer;
+SQL
+RURL="postgres://acc_reader:r@127.0.0.1:$PGPORT_ACC/postgres"
+WURL="postgres://acc_writer:w@127.0.0.1:$PGPORT_ACC/postgres"
+gate(){ env DATABASE_URL="$1" MCP_ADDR="0.0.0.0:$((PORT+900))" ${3:+$3} MCP_BEARER_TOKEN=gate_tok "$BIN" 2>&1; echo "rc=$?"; }
+r=$(gate "$WURL")
+case "$r" in *"rc=3"*) ok "a role that can write is refused a network listener";; *) no "writable role was allowed to listen" "$r";; esac
+case "$r" in *"can write to"*) ok "and the refusal names which tables it can write to";; *) no "refusal is vague" "$r";; esac
+r=$(env DATABASE_URL="$WURL" MCP_ADDR="0.0.0.0:$((PORT+901))" MCP_BEARER_TOKEN=gate_tok MCP_ALLOW_EXCESSIVE_ROLE=1 "$BIN" 2>&1; echo "rc=$?")
+case "$r" in *"rc=3"*) ok "the override cannot be switched on by a typo";; *) no "MCP_ALLOW_EXCESSIVE_ROLE=1 worked" "$r";; esac
+r=$(env DATABASE_URL="$RURL" MCP_ADDR="0.0.0.0:$((PORT+902))" "$BIN" 2>&1; echo "rc=$?")
+case "$r" in *"rc=3"*) ok "an unauthenticated network listener is refused too";; *) no "anonymous network listener allowed" "$r";; esac
+# A reader on the network is the configuration we want people to reach: it must start cleanly.
+env DATABASE_URL="$RURL" MCP_ADDR="0.0.0.0:$((PORT+903))" MCP_BEARER_TOKEN=gate_tok "$BIN" >/tmp/acc_gate_$$.log 2>&1 &
+GATEPID=$!; sleep 3
+grep -q "read-only as far as the database is concerned" /tmp/acc_gate_$$.log && ok "a read-only role starts, and is told so" || no "reader refused" "$(cat /tmp/acc_gate_$$.log)"
+kill -9 $GATEPID 2>/dev/null; rm -f /tmp/acc_gate_$$.log
+# The same excessive role on loopback is the operator's own laptop: it works, no gate.
+env DATABASE_URL="postgres://postgres:$PGPW@127.0.0.1:$PGPORT_ACC/postgres" MCP_ADDR="127.0.0.1:$((PORT+904))" "$BIN" >/tmp/acc_loop_$$.log 2>&1 &
+LOOPPID=$!; sleep 3
+grep -q "listening" /tmp/acc_loop_$$.log && ok "loopback is left alone — the caller there is the operator" || no "loopback blocked" "$(cat /tmp/acc_loop_$$.log)"
+kill -9 $LOOPPID 2>/dev/null; rm -f /tmp/acc_loop_$$.log
+PORT=$((PORT+910))
+
 section "Deployment shapes"
 start MCP_DATABASE_URLS="a=$URL;b=$URL"
 r=$(tool query '{"sql":"SELECT 1 AS x","database":"b"}' | body); echo "$r" | grep -q '"x":1' && ok "several databases from one server" || no "multi-database" "$r"

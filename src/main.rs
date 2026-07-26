@@ -24,6 +24,7 @@ pub(crate) use audit_log::*;
 pub(crate) use db::*;
 pub(crate) use http::*;
 pub(crate) use tools::*;
+mod posture;
 mod ratelimit;
 mod validate;
 
@@ -142,7 +143,18 @@ pub(crate) async fn main() {
     // Configuration is checked BEFORE we serve anyone — see `preflight_config`.
     preflight_config();
     let stdio = args.contains(&"--stdio".to_string());
-    audit_startup(if stdio { "stdio" } else { "http" });
+    let transport = if stdio { "stdio" } else { "http" };
+    audit_startup(transport);
+    // Before the listener exists: a server that would refuse to serve should never have accepted a
+    // connection in the first place. On the blocking pool, because the PostgreSQL driver is
+    // synchronous and blocking inside a runtime thread panics.
+    {
+        let addr = listen_addr();
+        let t = transport.to_string();
+        tokio::task::spawn_blocking(move || posture::enforce_start_policy(&t, &addr))
+            .await
+            .expect("start policy check");
+    }
     spawn_redaction_verification();
     if stdio {
         // stdio: run the synchronous loop on a blocking task so the runtime stays free
@@ -671,6 +683,11 @@ pub(crate) async fn mcp_handler(
         METRICS.denied_origin.fetch_add(1, Ordering::Relaxed);
         audit("http", "denied_origin", None);
         return (StatusCode::FORBIDDEN, msg).into_response();
+    }
+    if let Some(why) = posture::serving_blocked() {
+        let body = json!({ "jsonrpc": "2.0", "id": req.get("id").cloned().unwrap_or(Value::Null),
+            "error": { "code": -32000, "message": why } });
+        return (StatusCode::SERVICE_UNAVAILABLE, Json(body)).into_response();
     }
     // Rate limit BEFORE auth: verifying an RS256 signature costs CPU, so a flood of junk tokens must
     // bounce earlier. DB_SEM caps concurrency; this caps rate.

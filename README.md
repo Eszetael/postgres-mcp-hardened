@@ -266,6 +266,16 @@ offered, plus column comments, primary keys and **foreign keys** in the payload.
   PostgreSQL then refuses `SELECT *` on that table, so callers name columns instead; `describe_table`
   lists them and marks the redacted one.
 - **Prompt-injection aware:** row data is returned inside a `trusted="false"` provenance block with delimiters escaped, so a malicious cell can't hijack the agent.
+- **It will not expose a role that can write:** when the listen address is reachable from the
+  network, the server asks PostgreSQL what the connected role is actually allowed to do — superuser,
+  `BYPASSRLS`, membership of `pg_write_all_data` and friends, and write privileges on a bounded sample
+  of tables — and refuses to start if the answer is more than "reader", naming each reason and
+  pointing at `--print-setup-sql`. It refuses an unauthenticated network listener for the same reason.
+  Loopback and stdio are left alone: there the caller is the operator. The overrides
+  (`MCP_ALLOW_EXCESSIVE_ROLE`, `MCP_ALLOW_ANONYMOUS_NETWORK`) take the literal value
+  `i-accept-the-risk` so they cannot be switched on by a typo, and they are recorded in the audit log.
+  This server enforces read-only itself, but that enforcement is code, and code has been wrong before;
+  a role that cannot write is the part no bug of ours can undo.
 - **A browser cannot reach it:** a request carrying an `Origin` is refused with 403 unless the
   operator listed that origin, and on a loopback listener a `Host` that is not localhost is refused
   too — the shape a DNS-rebinding attack takes when it aims at a database server on your laptop.
@@ -330,6 +340,8 @@ left resident memory flat and file descriptors unchanged.
 | `MCP_RESERVED_AUTH_SLOTS` | database slots kept for authenticated traffic so an anonymous flood cannot take the pool (default: a quarter) |
 | `MCP_PUBLIC_URL` | this server's public base URL, used in the OAuth discovery metadata |
 | `MCP_AUTH_SERVERS` | authorization server URLs advertised in that metadata |
+| `MCP_ALLOW_EXCESSIVE_ROLE` | set to `i-accept-the-risk` to serve a network listener with a role that can write |
+| `MCP_ALLOW_ANONYMOUS_NETWORK` | set to `i-accept-the-risk` to serve a network listener with no authentication |
 | `MCP_ALLOWED_ORIGINS` | browser origins permitted to call this server, e.g. `https://my-client.example`. Empty means no browser page may reach it: a page the user is merely visiting can make their browser POST to `localhost`, which is DNS rebinding's whole trick |
 | `MCP_ALLOWED_HOSTS` | extra `Host` values accepted when listening on loopback (localhost and 127.0.0.1 always are) |
 | `MCP_TRUST_PROXY` | set to `1` only behind a reverse proxy — then the rate limiter keys on `X-Forwarded-For` instead of the peer address |

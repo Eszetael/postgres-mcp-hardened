@@ -65,6 +65,18 @@ Verify a log with `postgres-mcp-hardened --verify-audit <file>`. Be precise abou
   old keys go in `MCP_AUDIT_HMAC_KEYS_OLD`, so a rotated log still verifies end to end instead of
   looking like sabotage.
 
+## The server checks its own role before exposing itself
+
+Pointing `DATABASE_URL` at a superuser and binding to `0.0.0.0` is the configuration that turns every
+other control into a single point of failure. The server now asks PostgreSQL what the role may do —
+`rolsuper`, `rolbypassrls`, `REPLICATION`, membership of the predefined write roles, and write
+privileges over a bounded sample of tables — and refuses to start when the listener is reachable from
+the network and the answer is more than "reader". `--print-setup-sql` generates the role to use.
+
+Membership is tested with `pg_has_role(..., 'MEMBER')`, not `'USAGE'`: a role with `NOINHERIT` does
+not hold its groups' privileges until it runs `SET ROLE`, but it can run `SET ROLE` — so a `USAGE`
+test reports "safe" about a role that is one statement away from being unsafe.
+
 ## What `MCP_REDACT_COLUMNS` is, and is not
 
 It masks matching columns at every depth of the result and refuses a query that references them —
