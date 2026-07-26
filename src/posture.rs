@@ -203,7 +203,9 @@ pub(crate) fn enforce_start_policy(transport: &str, addr: &str) {
         );
     } else {
         eprintln!("REFUSING TO START — {} is reachable from the network and this server requires no authentication.", addr);
-        eprintln!("  Anyone who can reach that address can read everything the database role can read.");
+        eprintln!(
+            "  Anyone who can reach that address can read everything the database role can read."
+        );
         eprintln!("  Set MCP_BEARER_TOKEN (a shared secret) or JWT_PUBKEY_PEM + JWT_AUD + JWT_ISS (OAuth 2.1),");
         eprintln!("  bind to 127.0.0.1 instead, or set MCP_ALLOW_ANONYMOUS_NETWORK=i-accept-the-risk to override.");
         std::process::exit(3);
@@ -237,11 +239,17 @@ pub(crate) fn enforce_start_policy(transport: &str, addr: &str) {
                 eprintln!("  - it {}", p);
             }
             if facts.sampled {
-                eprintln!("  (the write check examined the first 5000 relations; there may be more)");
+                eprintln!(
+                    "  (the write check examined the first 5000 relations; there may be more)"
+                );
             }
             eprintln!();
-            eprintln!("This server enforces read-only itself, but that enforcement is code, and code has");
-            eprintln!("been wrong before. A role that cannot write is the part no bug of ours can undo.");
+            eprintln!(
+                "This server enforces read-only itself, but that enforcement is code, and code has"
+            );
+            eprintln!(
+                "been wrong before. A role that cannot write is the part no bug of ours can undo."
+            );
             eprintln!();
             eprintln!("  postgres-mcp-hardened --print-setup-sql > setup.sql   # generates the role to use");
             eprintln!();
@@ -290,7 +298,6 @@ pub(crate) fn serving_blocked() -> Option<&'static str> {
         None
     }
 }
-
 
 /// How bad a finding is. The grade is the worst one present — never an average, because averaging
 /// lets nine good answers hide one fatal one, and a report that does that teaches operators to skim.
@@ -387,7 +394,10 @@ pub(crate) fn report(db: Option<&str>) -> Value {
         findings.push(Finding {
             id: "transport.anonymous",
             severity: Severity::Critical,
-            fact: format!("{} is reachable from the network and requires no authentication", addr),
+            fact: format!(
+                "{} is reachable from the network and requires no authentication",
+                addr
+            ),
             fix: Some("set MCP_BEARER_TOKEN, or JWT_PUBKEY_PEM with JWT_AUD and JWT_ISS".into()),
         });
     }
@@ -427,7 +437,11 @@ pub(crate) fn report(db: Option<&str>) -> Value {
         }),
         Some(false) => findings.push(Finding {
             id: "tls.off",
-            severity: if exposed { Severity::Warn } else { Severity::Note },
+            severity: if exposed {
+                Severity::Warn
+            } else {
+                Severity::Note
+            },
             fact: "the connection to PostgreSQL is NOT encrypted".into(),
             fix: Some("add ?sslmode=verify-full to the connection string".into()),
         }),
@@ -444,7 +458,10 @@ pub(crate) fn report(db: Option<&str>) -> Value {
         .map(|f| {
             let mut o = serde_json::Map::new();
             o.insert("id".into(), json!(f.id));
-            o.insert("severity".into(), json!(format!("{:?}", f.severity).to_lowercase()));
+            o.insert(
+                "severity".into(),
+                json!(format!("{:?}", f.severity).to_lowercase()),
+            );
             o.insert("fact".into(), json!(f.fact));
             if let Some(fix) = &f.fix {
                 o.insert("fix".into(), json!(fix));
@@ -540,10 +557,20 @@ mod tests {
 
     #[test]
     fn loopback_is_recognised_in_every_spelling() {
-        for a in ["127.0.0.1:8080", "localhost:8080", "[::1]:8080", "127.9.9.9:1"] {
+        for a in [
+            "127.0.0.1:8080",
+            "localhost:8080",
+            "[::1]:8080",
+            "127.9.9.9:1",
+        ] {
             assert!(is_loopback(a), "{a} should count as loopback");
         }
-        for a in ["0.0.0.0:8080", "[::]:8080", "10.0.0.5:8080", "example.com:80"] {
+        for a in [
+            "0.0.0.0:8080",
+            "[::]:8080",
+            "10.0.0.5:8080",
+            "example.com:80",
+        ] {
             assert!(!is_loopback(a), "{a} should not count as loopback");
         }
     }

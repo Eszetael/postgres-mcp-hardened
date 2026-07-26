@@ -41,7 +41,7 @@ jobs:
 
       - name: Install Rust toolchain
         # a pinned version, not a moving "stable" - otherwise "reproducibly built" is just a slogan
-        uses: dtolnay/rust-toolchain@1.83.0
+        uses: dtolnay/rust-toolchain@master
         with:
           targets: ${{ matrix.target }}
 
@@ -141,7 +141,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.83.0
+      - uses: dtolnay/rust-toolchain@master
       - run: cargo install cargo-cyclonedx --locked
       - run: cargo cyclonedx --format json --all
       - name: Attach the SBOM to the release

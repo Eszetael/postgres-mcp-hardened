@@ -28,7 +28,10 @@ fn sane_ident(name: &str) -> Result<&str, String> {
         ));
     }
     if name.contains(['\0', '\n', '\r', '"']) {
-        return Err(format!("{:?} contains characters an identifier may not", name));
+        return Err(format!(
+            "{:?} contains characters an identifier may not",
+            name
+        ));
     }
     Ok(name)
 }
@@ -54,7 +57,9 @@ fn csv(v: Option<&String>) -> Vec<String> {
 }
 
 fn flag<'a>(args: &'a [String], name: &str) -> Option<&'a String> {
-    args.iter().position(|a| a == name).and_then(|i| args.get(i + 1))
+    args.iter()
+        .position(|a| a == name)
+        .and_then(|i| args.get(i + 1))
 }
 
 /// One relation the role should be able to read, with the columns it may see.
@@ -68,7 +73,9 @@ struct Grant {
 
 pub(crate) fn run(args: &[String]) -> i32 {
     let opts = Opts {
-        role: flag(args, "--role").cloned().unwrap_or_else(|| "mcp_reader".into()),
+        role: flag(args, "--role")
+            .cloned()
+            .unwrap_or_else(|| "mcp_reader".into()),
         schemas: {
             let s = csv(flag(args, "--schemas"));
             if s.is_empty() {
@@ -87,14 +94,19 @@ pub(crate) fn run(args: &[String]) -> i32 {
             }
         },
         database: flag(args, "--database").cloned(),
-        owner: flag(args, "--owner").cloned().unwrap_or_else(|| "postgres".into()),
+        owner: flag(args, "--owner")
+            .cloned()
+            .unwrap_or_else(|| "postgres".into()),
     };
     let schemas = if opts.schemas.is_empty() {
         vec!["public".to_string()]
     } else {
         opts.schemas.clone()
     };
-    for name in std::iter::once(&opts.role).chain(schemas.iter()).chain(std::iter::once(&opts.owner)) {
+    for name in std::iter::once(&opts.role)
+        .chain(schemas.iter())
+        .chain(std::iter::once(&opts.owner))
+    {
         if let Err(e) = sane_ident(name) {
             eprintln!("{}", e);
             return 2;
@@ -112,7 +124,10 @@ pub(crate) fn run(args: &[String]) -> i32 {
         ),
     };
 
-    print!("{}", render(&opts, &schemas, &grants, &db_name, note.as_deref()));
+    print!(
+        "{}",
+        render(&opts, &schemas, &grants, &db_name, note.as_deref())
+    );
     0
 }
 
@@ -142,13 +157,22 @@ fn discover(schemas: &[String], opts: &Opts) -> Result<(Vec<Grant>, String), Str
     let redacted: Vec<String> = opts.redact.iter().map(|s| s.to_lowercase()).collect();
     let mut out = Vec::new();
     for r in rows {
-        let schema = r.get("schema").and_then(|x| x.as_str()).unwrap_or("").to_string();
-        let table = r.get("rel").and_then(|x| x.as_str()).unwrap_or("").to_string();
+        let schema = r
+            .get("schema")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_string();
+        let table = r
+            .get("rel")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_string();
         let qualified = format!("{}.{}", schema, table);
         // An explicit --tables list narrows the schemas; `schema.*` keeps the whole schema.
         if !opts.tables.is_empty()
             && !opts.tables.iter().any(|t| {
-                t.eq_ignore_ascii_case(&qualified) || t.eq_ignore_ascii_case(&format!("{}.*", schema))
+                t.eq_ignore_ascii_case(&qualified)
+                    || t.eq_ignore_ascii_case(&format!("{}.*", schema))
             })
         {
             continue;
@@ -156,7 +180,11 @@ fn discover(schemas: &[String], opts: &Opts) -> Result<(Vec<Grant>, String), Str
         let cols: Vec<String> = r
             .get("cols")
             .and_then(|x| x.as_array())
-            .map(|a| a.iter().filter_map(|c| c.as_str().map(String::from)).collect())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|c| c.as_str().map(String::from))
+                    .collect()
+            })
             .unwrap_or_default();
         let hidden: Vec<String> = cols
             .iter()
@@ -187,7 +215,9 @@ fn render(
 ) -> String {
     let role = quote_ident(&opts.role);
     let mut s = String::new();
-    s.push_str("-- Role for postgres-mcp-hardened. READ THIS BEFORE RUNNING IT: it changes privileges.\n");
+    s.push_str(
+        "-- Role for postgres-mcp-hardened. READ THIS BEFORE RUNNING IT: it changes privileges.\n",
+    );
     s.push_str("--   psql -v pw=\"$(openssl rand -base64 24)\" -f setup.sql\n");
     if let Some(why) = offline {
         s.push_str(&format!(
@@ -233,7 +263,9 @@ fn render(
     }
 
     s.push_str("\n-- 4. The surface, named one relation at a time.\n");
-    s.push_str("--    Deliberately not `GRANT SELECT ON ALL TABLES`: that grants whatever exists at the\n");
+    s.push_str(
+        "--    Deliberately not `GRANT SELECT ON ALL TABLES`: that grants whatever exists at the\n",
+    );
     s.push_str("--    moment you run it, which is not the same as what you meant.\n");
     if grants.is_empty() {
         s.push_str(&format!(
@@ -260,7 +292,12 @@ fn render(
         let keep = g
             .columns
             .as_ref()
-            .map(|c| c.iter().map(|x| quote_ident(x)).collect::<Vec<_>>().join(", "))
+            .map(|c| {
+                c.iter()
+                    .map(|x| quote_ident(x))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
             .unwrap_or_default();
         s.push_str(&format!(
             "REVOKE SELECT ON {0}.{1} FROM {role};\n",
@@ -358,9 +395,16 @@ mod tests {
             hidden: vec!["ssn".into()],
         }];
         let out = render(&opts, &opts.schemas.clone(), &grants, "db", None);
-        let revoke = out.find("REVOKE SELECT ON \"public\".\"people\"").expect("revoke");
-        let grant = out.find("GRANT SELECT (\"id\", \"name\")").expect("column grant");
+        let revoke = out
+            .find("REVOKE SELECT ON \"public\".\"people\"")
+            .expect("revoke");
+        let grant = out
+            .find("GRANT SELECT (\"id\", \"name\")")
+            .expect("column grant");
         assert!(revoke < grant, "the table REVOKE must come first:\n{out}");
-        assert!(!out.contains("\"ssn\""), "the hidden column is never granted");
+        assert!(
+            !out.contains("\"ssn\""),
+            "the hidden column is never granted"
+        );
     }
 }

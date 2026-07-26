@@ -413,17 +413,25 @@ mod tests {
     }
 
     fn write(name: &str, content: &str) -> String {
-        let p = std::env::temp_dir().join(format!("audit_test_{}_{}.log", name, std::process::id()));
+        let p =
+            std::env::temp_dir().join(format!("audit_test_{}_{}.log", name, std::process::id()));
         std::fs::write(&p, content).unwrap();
         p.to_string_lossy().into_owned()
     }
 
     #[test]
     fn a_well_formed_chain_verifies_and_returns_its_last_hash() {
-        let c = chain(&[entry(1, "query"), entry(2, "list_tables"), entry(3, "query")]);
+        let c = chain(&[
+            entry(1, "query"),
+            entry(2, "list_tables"),
+            entry(3, "query"),
+        ]);
         let p = write("ok", &c);
         let (summary, last) = verify_audit_file(&p, None).expect("chain should verify");
-        assert!(c.contains(&last), "the reported last hash must be the one in the file");
+        assert!(
+            c.contains(&last),
+            "the reported last hash must be the one in the file"
+        );
         assert!(summary.contains("3 entries"), "{summary}");
         std::fs::remove_file(p).ok();
     }
@@ -433,10 +441,17 @@ mod tests {
     #[test]
     fn a_modified_entry_is_caught_and_located() {
         let c = chain(&[entry(1, "query"), entry(2, "query"), entry(3, "query")]);
-        let tampered = c.replacen("\"decision\":\"allowed\"", "\"decision\":\"denied_rate\"", 1);
+        let tampered = c.replacen(
+            "\"decision\":\"allowed\"",
+            "\"decision\":\"denied_rate\"",
+            1,
+        );
         let p = write("modified", &tampered);
         let err = verify_audit_file(&p, None).expect_err("a modified entry must not verify");
-        assert!(err.contains("line 1"), "the failure must name the line: {err}");
+        assert!(
+            err.contains("line 1"),
+            "the failure must name the line: {err}"
+        );
         std::fs::remove_file(p).ok();
     }
 
@@ -460,10 +475,14 @@ mod tests {
         let lines: Vec<&str> = c.lines().collect();
         let cut = format!("{}\n{}\n", lines[0], lines[1]);
         let p = write("truncated", &cut);
-        verify_audit_file(&p, None).expect("a truncated log still verifies — this is the known limit");
+        verify_audit_file(&p, None)
+            .expect("a truncated log still verifies — this is the known limit");
         let err = verify_audit_file(&p, Some(&real_last))
             .expect_err("with an external anchor, truncation must be caught");
-        assert!(err.to_lowercase().contains("last") || err.contains(&real_last[..8]), "{err}");
+        assert!(
+            err.to_lowercase().contains("last") || err.contains(&real_last[..8]),
+            "{err}"
+        );
         std::fs::remove_file(p).ok();
     }
 
@@ -519,7 +538,10 @@ mod tests {
         assert_eq!(fp.len(), 16);
         for window in secret.as_bytes().windows(8) {
             let piece = String::from_utf8_lossy(window);
-            assert!(!fp.contains(piece.as_ref()), "the fingerprint leaked {piece:?}");
+            assert!(
+                !fp.contains(piece.as_ref()),
+                "the fingerprint leaked {piece:?}"
+            );
         }
         assert_ne!(fp, sql_fingerprint("SELECT 1"));
     }

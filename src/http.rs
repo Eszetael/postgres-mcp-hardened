@@ -102,7 +102,9 @@ pub(crate) fn check_origin(headers: &HeaderMap, listen: &str) -> Result<(), Stri
             ));
         }
     }
-    let on_loopback = listen.starts_with("127.") || listen.starts_with("[::1]") || listen.starts_with("localhost");
+    let on_loopback = listen.starts_with("127.")
+        || listen.starts_with("[::1]")
+        || listen.starts_with("localhost");
     if on_loopback {
         if let Some(host) = headers.get("host").and_then(|v| v.to_str().ok()) {
             let bare = host.split(':').next().unwrap_or(host);

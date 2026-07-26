@@ -339,7 +339,12 @@ impl Visitor for SecurityScanner {
                             }
                     )
                 });
-                if whole_row && !f.name.0.last().is_some_and(|n| n.value.eq_ignore_ascii_case("count"))
+                if whole_row
+                    && !f
+                        .name
+                        .0
+                        .last()
+                        .is_some_and(|n| n.value.eq_ignore_ascii_case("count"))
                 {
                     self.evasion =
                         Some("serialising a whole row through a wildcard argument".into());
@@ -653,7 +658,12 @@ fn unescape_sql_literal(s: &str) -> String {
         if b[i] == '\\' && i + 1 < b.len() {
             let rest: String = b[i + 1..].iter().take(3).collect();
             if b[i + 1] == 'x' {
-                let hex: String = rest.chars().skip(1).take(2).filter(|c| c.is_ascii_hexdigit()).collect();
+                let hex: String = rest
+                    .chars()
+                    .skip(1)
+                    .take(2)
+                    .filter(|c| c.is_ascii_hexdigit())
+                    .collect();
                 if let Ok(n) = u32::from_str_radix(&hex, 16) {
                     if let Some(c) = char::from_u32(n) {
                         out.push(c);
@@ -662,7 +672,10 @@ fn unescape_sql_literal(s: &str) -> String {
                     }
                 }
             }
-            let oct: String = rest.chars().take_while(|c| ('0'..='7').contains(c)).collect();
+            let oct: String = rest
+                .chars()
+                .take_while(|c| ('0'..='7').contains(c))
+                .collect();
             if !oct.is_empty() {
                 if let Ok(n) = u32::from_str_radix(&oct, 8) {
                     if let Some(c) = char::from_u32(n) {

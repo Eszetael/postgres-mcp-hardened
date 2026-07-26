@@ -1,0 +1,9 @@
+# One toolchain for everyone: this file is what CI, the container build and a contributor's laptop
+# all read, so "works on my machine" stops being possible to say by accident.
+#
+# The pin used to live in three places and had drifted: CI and the Dockerfile said 1.83 while the
+# dependency tree had moved to a crate requiring 1.85 (edition 2024). Everything passed locally on a
+# newer toolchain and every job failed on the first real CI run.
+[toolchain]
+channel = "1.97.1"
+components = ["clippy", "rustfmt"]

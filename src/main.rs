@@ -25,11 +25,11 @@ pub(crate) use db::*;
 pub(crate) use http::*;
 pub(crate) use tools::*;
 mod pipeline;
-mod protocol;
 mod posture;
+mod protocol;
+mod ratelimit;
 mod setup_sql;
 mod surface;
-mod ratelimit;
 mod validate;
 
 use axum::routing::get;
@@ -389,7 +389,9 @@ const SECRET_VARS: &[&str] = &[
 fn config_snapshot() -> serde_json::Map<String, Value> {
     let mut out = serde_json::Map::new();
     for name in KNOWN_VARS {
-        let Ok(raw) = std::env::var(name) else { continue };
+        let Ok(raw) = std::env::var(name) else {
+            continue;
+        };
         let rendered = if SECRET_VARS.contains(name) {
             format!(
                 "sha256:{}",
@@ -546,7 +548,11 @@ pub(crate) fn preflight_config() {
     // An audit file we cannot write is an audit that does not exist, discovered at the moment it was
     // supposed to record something. We open it now, in the mode we will use.
     if let Ok(p) = std::env::var("MCP_AUDIT_LOG") {
-        if let Err(e) = std::fs::OpenOptions::new().create(true).append(true).open(&p) {
+        if let Err(e) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&p)
+        {
             fatal.push(format!("MCP_AUDIT_LOG {} cannot be written: {}", p, e));
         }
     }
@@ -569,8 +575,12 @@ pub(crate) fn preflight_config() {
             if !url.contains("sslmode=disable") {
                 continue;
             }
-            let remote = !(url.contains("@localhost") || url.contains("@127.0.0.1") || url.contains("@[::1]"));
-            if remote && !std::env::var("MCP_ALLOW_PLAINTEXT_DB").is_ok_and(|v| v == "i-accept-the-risk") {
+            let remote = !(url.contains("@localhost")
+                || url.contains("@127.0.0.1")
+                || url.contains("@[::1]"));
+            if remote
+                && !std::env::var("MCP_ALLOW_PLAINTEXT_DB").is_ok_and(|v| v == "i-accept-the-risk")
+            {
                 fatal.push(format!(
                     "{} disables TLS to a host that is not loopback: every query and every row \
                      would cross the network in the clear. Use sslmode=verify-full, or set \
@@ -597,7 +607,11 @@ pub(crate) fn preflight_config() {
     }
 
     // Booleans and small integers: a value nobody parses is a setting nobody applied.
-    for var in ["MCP_TRUST_PROXY", "MCP_SHOW_PARTITIONS", "MCP_STRUCTURED_CONTENT"] {
+    for var in [
+        "MCP_TRUST_PROXY",
+        "MCP_SHOW_PARTITIONS",
+        "MCP_STRUCTURED_CONTENT",
+    ] {
         if let Ok(v) = std::env::var(var) {
             if !matches!(v.trim(), "0" | "1" | "true" | "false" | "") {
                 fatal.push(format!(
@@ -635,7 +649,8 @@ pub(crate) fn preflight_config() {
 
     // The public URL goes into OAuth discovery metadata, where a client follows it.
     if let Ok(v) = std::env::var("MCP_PUBLIC_URL") {
-        if !v.trim().is_empty() && !v.starts_with("https://") && !v.starts_with("http://localhost") {
+        if !v.trim().is_empty() && !v.starts_with("https://") && !v.starts_with("http://localhost")
+        {
             fatal.push(format!(
                 "MCP_PUBLIC_URL must be an https:// URL (or http://localhost for development): {:?}",
                 v
@@ -849,7 +864,8 @@ pub(crate) async fn mcp_handler(
         headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()),
     );
     if let Err(rej) = pipeline::gate_rate(&key, "http") {
-        let body = pipeline::rejection_response(&rej, req.get("id").cloned().unwrap_or(Value::Null));
+        let body =
+            pipeline::rejection_response(&rej, req.get("id").cloned().unwrap_or(Value::Null));
         let mut hdrs = HeaderMap::new();
         hdrs.insert("Retry-After", HeaderValue::from_static("1"));
         return (StatusCode::TOO_MANY_REQUESTS, hdrs, Json(body)).into_response();
@@ -1226,7 +1242,9 @@ pub(crate) fn handle_request(req: &Value) -> Value {
         // reason and rewrites the query, instead of the client seeing a broken call. The audit
         // record was already written by the code that refused — reshaping happens after, never
         // instead.
-        "tools/call" => protocol::shape_tool_result(handle_tools_call(&params), protocol::current()),
+        "tools/call" => {
+            protocol::shape_tool_result(handle_tools_call(&params), protocol::current())
+        }
         // `ping` is part of MCP utilities — clients use it as a keepalive. The answer is an empty object;
         // not handling it made us look like a server that does not know the protocol.
         "ping" => json!({ "result": {} }),
@@ -2118,7 +2136,10 @@ mod tests {
         let resp = handle_request(&req);
         assert_eq!(resp["error"]["code"], -32602);
         assert!(
-            resp["error"]["message"].as_str().unwrap().contains("read-only"),
+            resp["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("read-only"),
             "the reason belongs in the message: {resp}"
         );
         drop(old);

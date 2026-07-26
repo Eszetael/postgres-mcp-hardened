@@ -1,7 +1,7 @@
 # ── builder ──
 # Pinned, not floating: `rust:1-slim` moves, so the image could be built from a different compiler
 # and different dependencies than the binaries CI tested.
-FROM rust:1.83-slim AS builder
+FROM rust:1.97-slim AS builder
 WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src

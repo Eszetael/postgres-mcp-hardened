@@ -142,7 +142,10 @@ fn refused_in<'a>(
 /// The message a refusal carries. It names what was reached and what is configured, because an agent
 /// that is told only "denied" will try the same thing with a different alias.
 pub(crate) fn refusal_message(refused: &[&(String, String)]) -> String {
-    let names: Vec<String> = refused.iter().map(|(s, r)| format!("{}.{}", s, r)).collect();
+    let names: Vec<String> = refused
+        .iter()
+        .map(|(s, r)| format!("{}.{}", s, r))
+        .collect();
     format!(
         "outside the configured surface: {}. This server is limited to {} — ask the operator to \
          extend MCP_ALLOW_SCHEMAS or MCP_ALLOW_TABLES if you need it",
