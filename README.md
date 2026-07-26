@@ -258,6 +258,10 @@ left resident memory flat and file descriptors unchanged.
 | `MCP_MAX_INFLIGHT_PER_CLIENT` | max concurrent requests from one client (default 4; `0` disables) |
 | `MCP_RATE_RPM` | per-client request rate limit (default 120/min; `0` disables) |
 | `MCP_RATE_BURST` | burst allowance for that limit (default `MCP_RATE_RPM / 4`, min 5) |
+| `MCP_METRICS_TOKEN` | require this token on `/metrics` (open by default, for scraping from a private network) |
+| `MCP_RESERVED_AUTH_SLOTS` | database slots kept for authenticated traffic so an anonymous flood cannot take the pool (default: a quarter) |
+| `MCP_PUBLIC_URL` | this server's public base URL, used in the OAuth discovery metadata |
+| `MCP_AUTH_SERVERS` | authorization server URLs advertised in that metadata |
 | `MCP_TRUST_PROXY` | set to `1` only behind a reverse proxy — then the rate limiter keys on `X-Forwarded-For` instead of the peer address |
 
 ## License
