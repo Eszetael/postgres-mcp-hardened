@@ -299,7 +299,7 @@ pub(crate) fn cost_guard(sql: &str, max_cost: f64, db: Option<&str>) -> Result<(
     let pool = pool_for(db).map_err(CostErr::QueryError)?;
     let mut client = pool
         .get()
-        .map_err(|_| CostErr::QueryError(pool_error_detail()))?;
+        .map_err(|_| CostErr::QueryError(pool_error_detail(db)))?;
     client
         .batch_execute("DISCARD ALL")
         .map_err(|e| CostErr::QueryError(e.to_string()))?;

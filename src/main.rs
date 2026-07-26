@@ -230,6 +230,28 @@ pub(crate) fn preflight_config() {
         }
     }
 
+    // Honest about what redaction is. It refuses references and masks values, and the panel that
+    // spent an afternoon on it got past the first version fourteen different ways — the last of them
+    // by asking for the column under a name the check could not match. Name-based filtering cannot
+    // be a boundary against the full SQL language; the boundary is a privilege the role does not have.
+    if std::env::var("MCP_BEARER_TOKEN").is_ok_and(|t| !t.trim().is_empty())
+        && std::env::var("JWT_PUBKEY_PEM").is_ok_and(|t| !t.trim().is_empty())
+    {
+        eprintln!(
+            "NOTE: MCP_BEARER_TOKEN is ignored because OAuth is configured — a valid JWT is required. \
+             Accepting the shared token as an alternative would give its holder full scope and leave \
+             the audit without an identity. Remove one of the two."
+        );
+    }
+
+    if validate::redaction_configured() {
+        eprintln!(
+            "NOTE: MCP_REDACT_COLUMNS is defence in depth, not a boundary — the database role can \
+             still read those columns. For a guarantee the server cannot undo, revoke the privilege: \
+             REVOKE SELECT (password) ON staff FROM your_mcp_role;"
+        );
+    }
+
     if !fatal.is_empty() {
         eprintln!("CONFIGURATION ERROR — the server will not start:");
         for f in &fatal {
@@ -626,6 +648,31 @@ pub(crate) static AUTH_CONFIG: Lazy<Option<AuthConfig>> = Lazy::new(|| {
     })
 });
 
+/// Compares two secrets without revealing the length of the expected one.
+///
+/// The previous version short-circuited on `len() != len()`, which answers "how long is the token"
+/// to anyone who can time it, and then compared only over that length. Hashing both sides first makes
+/// every comparison the same fixed width regardless of what was supplied.
+pub(crate) fn secret_eq(given: &str, expected: &str) -> bool {
+    let key = SECRET_CMP_KEY.clone();
+    let a = hmac_sha256_hex(key.clone(), given.as_bytes());
+    let b = hmac_sha256_hex(key, expected.as_bytes());
+    a.as_bytes()
+        .iter()
+        .zip(b.as_bytes())
+        .fold(0u8, |acc, (x, y)| acc | (x ^ y))
+        == 0
+        && a.len() == b.len()
+}
+
+/// A per-process key, so the digests compared above cannot be precomputed off-line.
+static SECRET_CMP_KEY: Lazy<Vec<u8>> = Lazy::new(|| {
+    let mut k = Vec::with_capacity(32);
+    k.extend_from_slice(uuid::Uuid::new_v4().as_bytes());
+    k.extend_from_slice(uuid::Uuid::new_v4().as_bytes());
+    k
+});
+
 pub(crate) fn enforce_auth(
     headers: &HeaderMap,
     req: &Value,
@@ -633,35 +680,28 @@ pub(crate) fn enforce_auth(
     // A shared bearer token: the simplest possible protection for people who do not run an identity
     // provider. Both alternatives have an open request for exactly this. Checked before OAuth so a
     // deployment can use either, and compared in constant time.
-    if let Some(expected) = std::env::var("MCP_BEARER_TOKEN")
-        .ok()
-        .filter(|t| !t.is_empty())
-    {
-        let given = headers
-            .get("authorization")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|s| s.strip_prefix("Bearer "))
-            .unwrap_or("");
-        let equal = given.len() == expected.len()
-            && given
-                .as_bytes()
-                .iter()
-                .zip(expected.as_bytes())
-                .fold(0u8, |acc, (a, b)| acc | (a ^ b))
-                == 0;
-        if equal {
-            // Sufficient on its own: the two mechanisms are alternatives, not layers. Returning here
-            // is what makes "either one" true — previously a correct shared token still fell through
-            // to the JWT path, where the same header failed to parse as a JWT and the request was
-            // refused, so configuring both silently meant "both required".
+    // The shared token is the mechanism for deployments WITHOUT an identity provider. When OAuth is
+    // configured it is ignored, and deliberately so: accepting it as an alternative let any holder of
+    // the shared secret act with full scope while the audit recorded no identity at all. A caller
+    // could opt out of being identified by presenting the shared token instead of their JWT — the
+    // exact opposite of what the log exists for. Preflight says so at startup when both are set.
+    if AUTH_CONFIG.is_none() {
+        if let Some(expected) = std::env::var("MCP_BEARER_TOKEN")
+            .ok()
+            .filter(|t| !t.is_empty())
+        {
+            let given = headers
+                .get("authorization")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.strip_prefix("Bearer "))
+                .unwrap_or("");
+            if !secret_eq(given, &expected) {
+                return Err((401, "invalid or missing bearer token".into(), None));
+            }
             return Ok(None);
         }
-        // A wrong or absent shared token is only fatal when it is the ONLY mechanism; with OAuth also
-        // configured the caller may legitimately be presenting a JWT instead.
-        if AUTH_CONFIG.is_none() {
-            return Err((401, "invalid or missing bearer token".into(), None));
-        }
     }
+
     let cfg = match &*AUTH_CONFIG {
         Some(c) => c,
         None => return Ok(None),
@@ -942,7 +982,8 @@ pub(crate) fn handle_database_health(args: &Value) -> Value {
             "SELECT count(*) FILTER (WHERE datname = current_database()) AS in_use, \
                     count(*) AS in_use_cluster_wide, \
                     (SELECT setting::int FROM pg_settings WHERE name = 'max_connections') AS max_connections, \
-                    count(*) FILTER (WHERE datname = current_database() AND state = 'idle in transaction') AS idle_in_transaction \
+                    count(*) FILTER (WHERE datname = current_database() AND state = 'idle in transaction') AS idle_in_transaction, \
+                    count(*) FILTER (WHERE state IS NULL AND pid <> pg_backend_pid() AND backend_type = 'client backend') AS sessions_not_visible \
              FROM pg_stat_activity",
         ),
         (
@@ -953,7 +994,11 @@ pub(crate) fn handle_database_health(args: &Value) -> Value {
             "longest_running",
             "SELECT round(EXTRACT(epoch FROM max(now() - query_start) FILTER (WHERE state = 'active'))::numeric, 1) AS longest_active_query_seconds, \
                     round(EXTRACT(epoch FROM max(now() - xact_start))::numeric, 1) AS longest_transaction_seconds, \
-                    round(EXTRACT(epoch FROM max(now() - state_change) FILTER (WHERE state = 'idle in transaction'))::numeric, 1) AS longest_idle_in_transaction_seconds \
+                    round(EXTRACT(epoch FROM max(now() - state_change) FILTER (WHERE state = 'idle in transaction'))::numeric, 1) AS longest_idle_in_transaction_seconds, \
+                    CASE WHEN count(*) FILTER (WHERE state IS NULL AND pid <> pg_backend_pid() AND backend_type = 'client backend') > 0 \
+                         THEN 'this role cannot see other sessions (grant pg_read_all_stats or pg_monitor); \
+                               the figures above describe its own connections only, so a zero here does NOT mean the database is idle' \
+                         END AS note \
              FROM pg_stat_activity WHERE datname = current_database()",
         ),
         (
@@ -979,10 +1024,38 @@ pub(crate) fn handle_database_health(args: &Value) -> Value {
             // Without this, a sequence at 95% of its ceiling was indistinguishable from no risk at
             // all: PostgreSQL returns last_value as NULL when the role lacks USAGE/SELECT, the filter
             // above drops the row, and an empty list reads as "nothing to worry about".
+            // last_value is NULL for two unrelated reasons — no privilege, or never used. Reporting
+            // both as "cannot read" sent a superuser hunting for a permission problem that did not
+            // exist: a lie in the opposite direction, with instructions attached.
             "sequences_unreadable",
             "SELECT count(*) AS count, \
                     'this role cannot read these sequences (needs USAGE or SELECT); their headroom was NOT checked' AS note \
-             FROM pg_sequences WHERE last_value IS NULL HAVING count(*) > 0",
+             FROM pg_sequences WHERE last_value IS NULL \
+               AND NOT has_sequence_privilege(quote_ident(schemaname) || '.' || quote_ident(sequencename), 'SELECT,USAGE') \
+             HAVING count(*) > 0",
+        ),
+        (
+            // The check that was missing entirely. A database whose tables have never been analysed
+            // has no planner statistics at all — the usual reason "everything looks healthy" and the
+            // queries are still slow. vacuum_backlog cannot see it: n_dead_tup is 0 precisely because
+            // nothing has collected statistics.
+            "tables_never_analyzed",
+            "SELECT relname AS table_name, n_live_tup AS estimated_rows, \
+                    pg_size_pretty(pg_relation_size(relid)) AS size, \
+                    count(*) OVER () AS tables_in_this_state \
+             FROM pg_stat_user_tables \
+             WHERE has_table_privilege(relid, 'SELECT') \
+               AND last_analyze IS NULL AND last_autoanalyze IS NULL \
+             ORDER BY pg_relation_size(relid) DESC LIMIT 10",
+        ),
+        (
+            // Every counter above is meaningless without the window it was collected over.
+            "statistics_window",
+            "SELECT stats_reset AS counters_since, \
+                    CASE WHEN stats_reset IS NULL \
+                         THEN 'counters have never been reset — they cover the whole life of this database' \
+                         END AS note \
+             FROM pg_stat_database WHERE datname = current_database()",
         ),
         (
             "replication",
@@ -1072,14 +1145,28 @@ pub(crate) fn handle_analyze_indexes(args: &Value) -> Value {
     // reported as duplicates. It also ignored uniqueness, so a UNIQUE index landed in a cluster with
     // ordinary ones and "drop the redundant copy" could remove the only thing enforcing uniqueness.
     // Grouping on the predicate text and on indisunique makes the claim mean what it says.
+    // The grouping key has to be everything that makes two indexes interchangeable. Adding the
+    // predicate was not enough: expression indexes all share indkey='0', so `lower(a)` and `upper(b)`
+    // grouped together and the tool advised dropping a working index. Sort order (indoption) and
+    // collation belong there for the same reason.
+    //
+    // Uniqueness is REPORTED, not grouped on. Grouping by it removed the most common real duplicate
+    // in production — an ordinary index sitting next to an existing UNIQUE on the same column — which
+    // is exactly the one worth dropping. The unique index is listed first and marked, so the answer
+    // says which of the pair earns its keep instead of hiding the pair.
     const DUPLICATES: &str =
         // array_to_string, not array_agg: an array column comes back as null through the driver.
-        "SELECT t.relname AS table_name, array_to_string(array_agg(c.relname ORDER BY c.relname), ', ') AS duplicate_indexes, \
-                i.indisunique AS unique_index, pg_size_pretty(sum(pg_relation_size(c.oid))) AS combined_size \
+        "SELECT t.relname AS table_name, \
+                array_to_string(array_agg(c.relname || CASE WHEN i.indisunique THEN ' [unique — keep this one]' ELSE '' END \
+                                          ORDER BY i.indisunique DESC, c.relname), ', ') AS duplicate_indexes, \
+                count(*) FILTER (WHERE i.indisunique) AS unique_in_group, \
+                pg_size_pretty(sum(pg_relation_size(c.oid))) AS combined_size \
          FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid JOIN pg_class t ON t.oid = i.indrelid \
               JOIN pg_namespace n ON n.oid = t.relnamespace \
          WHERE n.nspname = $1 AND has_table_privilege(i.indrelid, 'SELECT') \
-         GROUP BY t.relname, i.indrelid, i.indkey::text, i.indclass::text, i.indisunique, \
+         GROUP BY t.relname, i.indrelid, i.indkey::text, i.indclass::text, i.indoption::text, \
+                  i.indcollation::text, \
+                  COALESCE(pg_get_expr(i.indexprs, i.indrelid), ''), \
                   COALESCE(pg_get_expr(i.indpred, i.indrelid), '') \
          HAVING count(*) > 1 ORDER BY sum(pg_relation_size(c.oid)) DESC LIMIT 20";
     const SEQ_SCANS: &str =

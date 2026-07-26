@@ -279,8 +279,10 @@ fn provider_hint(url: &str) -> Option<&'static str> {
     } else if h.contains("cloudsql") || h.contains(".gcp.") {
         Some("Google Cloud SQL: Connections → Security → download server-ca.pem")
     } else if h.contains(".azure.com") {
-        Some("Azure Database for PostgreSQL uses a public CA — if verification still fails, check \
-              that the host name matches the certificate rather than supplying a bundle")
+        Some(
+            "Azure Database for PostgreSQL uses a public CA — if verification still fails, check \
+              that the host name matches the certificate rather than supplying a bundle",
+        )
     } else {
         None
     }
@@ -291,16 +293,42 @@ fn provider_hint(url: &str) -> Option<&'static str> {
 fn reachability_hint(url: &str) -> Option<&'static str> {
     let h = url.to_ascii_lowercase();
     if h.contains(".supabase.co") && h.contains("db.") {
-        Some("note: Supabase's direct host is IPv6-only — from an IPv4-only network use the \
-              Supavisor pooler connection string (port 6543) instead")
+        Some(
+            "note: Supabase's direct host is IPv6-only — from an IPv4-only network use the \
+              Supavisor pooler connection string (port 6543) instead",
+        )
     } else {
         None
     }
 }
 
-pub(crate) fn pool_error_detail() -> String {
-    let Some(url) = database_url() else {
-        return "no connection string: set DATABASE_URL or pass it as the first argument"
+/// Resolves the connection string behind a configured name, so diagnostics describe the connection
+/// that actually failed.
+///
+/// Reading `DATABASE_URL` alone made every TLS diagnosis dead code under `MCP_DATABASE_URLS` — the
+/// multi-database mode this server exists for. Worse, the fallback message told the operator to set
+/// `DATABASE_URL` on a server that was configured correctly.
+fn url_for(name: Option<&str>) -> Option<String> {
+    if let Ok(spec) = std::env::var("MCP_DATABASE_URLS") {
+        let entries: Vec<(String, String)> = spec
+            .split(';')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .filter_map(|e| e.split_once('=').map(|(k, v)| (k.trim().to_string(), v.trim().to_string())))
+            .collect();
+        return match name {
+            Some(n) => entries.iter().find(|(k, _)| k == n).map(|(_, u)| u.clone()),
+            None if entries.len() == 1 => Some(entries[0].1.clone()),
+            None => None,
+        };
+    }
+    database_url()
+}
+
+pub(crate) fn pool_error_detail(db: Option<&str>) -> String {
+    let Some(url) = url_for(db) else {
+        return "no connection string: set DATABASE_URL, MCP_DATABASE_URLS, or pass it as the first \
+                argument"
             .to_string();
     };
     // the same normalisation as when building the pool — otherwise the ERROR path reports a false
@@ -510,7 +538,7 @@ pub(crate) fn is_row_query(sql: &str) -> bool {
 
 pub(crate) fn execute_readonly(final_sql: &str, db: Option<&str>) -> Result<Value, String> {
     let pool = pool_for(db)?;
-    let mut client = pool.get().map_err(|_| pool_error_detail())?;
+    let mut client = pool.get().map_err(|_| pool_error_detail(db))?;
     // Session-level defence in depth: timeouts + read-only (the database refuses a write even if the
     // validator let something through). DISCARD ALL resets pooled session state (Session Pollution).
     // It MUST be its own statement — a multi-statement batch is an implicit transaction, and
@@ -639,7 +667,7 @@ pub(crate) fn query_catalog(
     db: Option<&str>,
 ) -> Result<Value, String> {
     let pool = pool_for(db)?;
-    let mut client = pool.get().map_err(|_| pool_error_detail())?;
+    let mut client = pool.get().map_err(|_| pool_error_detail(db))?;
     client
         .batch_execute("DISCARD ALL")
         .map_err(|e| e.to_string())?;

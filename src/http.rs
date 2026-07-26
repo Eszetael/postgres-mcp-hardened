@@ -69,12 +69,16 @@ pub(crate) fn render_metrics() -> String {
 }
 
 pub(crate) async fn metrics_handler(headers: HeaderMap) -> impl IntoResponse {
-    // Open by default (scraped from a private network). When `MCP_METRICS_TOKEN` is set we require it —
-    // otherwise a public deployment lets anyone watch traffic and how well auth denials are working.
-    // When `MCP_METRICS_TOKEN` is unset but `MCP_BEARER_TOKEN` is, the bearer token is inherited:
-    // an operator who protects the server expects the whole HTTP surface to be protected, and this
-    // endpoint reveals traffic volume and how often auth denials fire.
-    let configured = std::env::var("MCP_METRICS_TOKEN")
+    // This endpoint reports traffic volume and how often authentication denials fire, so who may read
+    // it follows what the server itself requires:
+    //   MCP_METRICS_TOKEN set      → that token (a scraper does not have to hold a database credential)
+    //   otherwise, bearer auth     → the bearer token
+    //   otherwise, OAuth           → refused: a JWT is the wrong shape for a scraper, and leaving the
+    //                                endpoint open on an authenticated server was the earlier bug —
+    //                                inheriting only from MCP_BEARER_TOKEN protected the weaker setup
+    //                                and left the stronger one public.
+    //   otherwise (no auth at all) → open, for scraping from a private network
+    let expected = std::env::var("MCP_METRICS_TOKEN")
         .ok()
         .filter(|t| !t.is_empty())
         .or_else(|| {
@@ -82,26 +86,29 @@ pub(crate) async fn metrics_handler(headers: HeaderMap) -> impl IntoResponse {
                 .ok()
                 .filter(|t| !t.is_empty())
         });
-    if let Some(expected) = configured {
-        {
+    let deny = |msg: &str| {
+        (
+            StatusCode::UNAUTHORIZED,
+            [(CONTENT_TYPE, "text/plain")],
+            format!("{}\n", msg),
+        )
+    };
+    match expected {
+        Some(expected) => {
             let given = headers
                 .get("authorization")
                 .and_then(|v| v.to_str().ok())
                 .and_then(|s| s.strip_prefix("Bearer "))
                 .unwrap_or("");
-            // constant-time comparison — the token must not leak through response timing
-            let eq = given.len() == expected.len()
-                && given
-                    .as_bytes()
-                    .iter()
-                    .zip(expected.as_bytes())
-                    .fold(0u8, |acc, (a, b)| acc | (a ^ b))
-                    == 0;
-            if !eq {
-                return (
-                    StatusCode::UNAUTHORIZED,
-                    [(CONTENT_TYPE, "text/plain")],
-                    "unauthorized\n".to_string(),
+            if !crate::secret_eq(given, &expected) {
+                return deny("unauthorized");
+            }
+        }
+        None => {
+            if AUTH_CONFIG.is_some() {
+                return deny(
+                    "unauthorized: this server requires authentication, so /metrics is closed — set \
+                     MCP_METRICS_TOKEN to a token your scraper can present",
                 );
             }
         }

@@ -23,6 +23,8 @@ pub enum ValidationError {
     NotReadOnly(String),
     /// A column the operator declared sensitive was referenced.
     Redacted(String),
+    /// A construct that would carry a redacted column past the name-based checks.
+    RedactionEvasion(String),
 }
 
 impl fmt::Display for ValidationError {
@@ -35,6 +37,13 @@ impl fmt::Display for ValidationError {
                 f,
                 "column {} is redacted by configuration and cannot be referenced",
                 c
+            ),
+            Self::RedactionEvasion(what) => write!(
+                f,
+                "{} — while MCP_REDACT_COLUMNS is configured this is refused, because it would carry \
+                 a redacted value past a check that matches on column names. Select the columns you \
+                 need explicitly",
+                what
             ),
         }
     }
@@ -93,13 +102,28 @@ pub fn validate_readonly(sql: &str) -> Result<(), ValidationError> {
     //    node in the tree (derived tables, subqueries in WHERE, CTEs inside subqueries). Checking only
     //    the top level let `SELECT * FROM (SELECT ... FOR UPDATE) t` and writable CTEs hidden one level
     //    down slip through.
+    // The whole-row check needs the names in FROM before the projection is examined, and the visitor
+    // walks the projection first — hence a separate collecting pass. It runs only when redaction is
+    // configured, so the common path is unchanged.
+    let row_refs = if redaction_configured() {
+        let mut c = RowRefCollector::default();
+        let _ = ast[0].visit(&mut c);
+        c.names
+    } else {
+        std::collections::HashSet::new()
+    };
     let mut scanner = SecurityScanner {
         hit: None,
         redacted: None,
+        row_refs,
+        evasion: None,
     };
     let _ = ast[0].visit(&mut scanner);
     if let Some(c) = scanner.redacted {
         return Err(ValidationError::Redacted(c));
+    }
+    if let Some(e) = scanner.evasion {
+        return Err(ValidationError::RedactionEvasion(e));
     }
     if let Some(f) = scanner.hit {
         return Err(ValidationError::NotReadOnly(f));
@@ -193,6 +217,9 @@ pub fn is_query_stmt(sql: &str) -> bool {
 struct SecurityScanner {
     hit: Option<String>,
     redacted: Option<String>,
+    /// Table names and aliases in this statement, lower-cased. Only collected when redaction is on.
+    row_refs: std::collections::HashSet<String>,
+    evasion: Option<String>,
 }
 impl Visitor for SecurityScanner {
     type Break = ();
@@ -217,6 +244,30 @@ impl Visitor for SecurityScanner {
             Expr::Identifier(id) => {
                 if is_redacted(&id.value.to_lowercase()) {
                     self.redacted = Some(id.value.clone());
+                    return ControlFlow::Break(());
+                }
+                // A bare table name or alias used as a VALUE is the whole row. `t::text` flattens it
+                // to a single string, `row_to_json(t)` and `json_agg(t)` nest it — in every case the
+                // redacted column travels inside a value whose key is not its name, so neither the
+                // name check above nor masking in the result can see it. One call returned the entire
+                // password column this way.
+                if !self.row_refs.is_empty() && self.row_refs.contains(&id.value.to_lowercase()) {
+                    self.evasion = Some(format!(
+                        "referencing the whole row `{}` as a value",
+                        id.value
+                    ));
+                    return ControlFlow::Break(());
+                }
+            }
+            // The column name as a STRING, not an identifier: `to_jsonb(t) ->> 'password'`,
+            // `#>> '{password}'`, `jsonb_path_query(…, '$.password')`. The scanner matches
+            // identifiers, so none of these looked like a reference to anything.
+            Expr::Value(Value::SingleQuotedString(s)) => {
+                if let Some(col) = redacted_name_inside(&s.to_lowercase()) {
+                    self.evasion = Some(format!(
+                        "naming the redacted column `{}` inside a string literal",
+                        col
+                    ));
                     return ControlFlow::Break(());
                 }
             }
@@ -460,7 +511,40 @@ fn is_known_read(name: &str) -> bool {
 
 /// Columns the operator declared sensitive (`MCP_REDACT_COLUMNS`). Values are masked in results,
 /// and — because renaming would defeat masking — the column may not be referenced at all.
-fn is_redacted(name: &str) -> bool {
+/// Every table name and alias in the statement — the set a bare identifier must not match when it is
+/// used as a value.
+#[derive(Default)]
+struct RowRefCollector {
+    names: std::collections::HashSet<String>,
+}
+impl Visitor for RowRefCollector {
+    type Break = ();
+    fn pre_visit_relation(&mut self, name: &ObjectName) -> ControlFlow<()> {
+        if let Some(last) = name.0.last() {
+            self.names.insert(last.value.to_lowercase());
+        }
+        ControlFlow::Continue(())
+    }
+    fn pre_visit_table_factor(&mut self, tf: &TableFactor) -> ControlFlow<()> {
+        let alias = match tf {
+            TableFactor::Table { alias, .. }
+            | TableFactor::Derived { alias, .. }
+            | TableFactor::TableFunction { alias, .. }
+            | TableFactor::NestedJoin { alias, .. } => alias.as_ref(),
+            _ => None,
+        };
+        if let Some(a) = alias {
+            self.names.insert(a.name.value.to_lowercase());
+        }
+        ControlFlow::Continue(())
+    }
+}
+
+pub(crate) fn redaction_configured() -> bool {
+    !redacted_names().is_empty()
+}
+
+fn redacted_names() -> &'static [String] {
     static R: Lazy<Vec<String>> = Lazy::new(|| {
         std::env::var("MCP_REDACT_COLUMNS")
             .map(|v| {
@@ -472,7 +556,20 @@ fn is_redacted(name: &str) -> bool {
             })
             .unwrap_or_default()
     });
-    R.iter().any(|p| p == name)
+    &R
+}
+
+/// A redacted column name appearing anywhere inside a string literal. Substring, not equality:
+/// `'{password}'` and `'$.password'` are how JSON path and array-path syntax name a key.
+fn redacted_name_inside(lit: &str) -> Option<&'static str> {
+    redacted_names()
+        .iter()
+        .find(|n| lit.contains(n.as_str()))
+        .map(|n| n.as_str())
+}
+
+fn is_redacted(name: &str) -> bool {
+    redacted_names().iter().any(|p| p == name)
 }
 
 /// Operator escape hatch: `MCP_ALLOW_FUNCTIONS=name1,name2`. A deliberate human decision that a given
@@ -521,6 +618,16 @@ const DENY_FAMILIES: &[&str] = &[
     "brin_summarize",
     "brin_desummarize", // index maintenance (writes despite read-only)
     "dblink",           // a bridge to another database = a way around everything
+    // Functions that take SQL, or a relation to dump, AS TEXT. The AST cannot see inside a string
+    // literal, so every rule this validator enforces is invisible to them: query_to_xml('SELECT
+    // pg_read_file(...)') read server files, listed the data directory, ran a catalog-writing
+    // function, and returned two statements from one call. Whole families, because the variants
+    // (…_to_xmlschema, …_to_xml_and_xmlschema, cursor_/schema_/database_) all take the same argument.
+    "query_to_",
+    "table_to_",
+    "cursor_to_",
+    "schema_to_",
+    "database_to_",
     "lo_",
     "lowrite",
     "loread", // large objects: zapis przez deskryptor
@@ -962,6 +1069,17 @@ mod adversarial {
 
     // Attack vectors: EVERY one must return Err(ValidationError)
     const MUST_REJECT: &[&str] = &[
+        // SQL passed as TEXT: the AST cannot see inside a string literal, so nothing this validator
+        // enforces applies to what these run. Live proof before the fix: server files read, the data
+        // directory listed, a catalog-writing function executed, two statements from one call.
+        r#"SELECT query_to_xml('SELECT pg_read_file(''postgresql.conf'')', true, false, '')"#,
+        r#"SELECT query_to_xml('SELECT 1; SELECT 2', true, false, '')"#,
+        r#"SELECT query_to_xmlschema('SELECT 1', true, false, '')"#,
+        r#"SELECT query_to_xml_and_xmlschema('SELECT 1', true, false, '')"#,
+        r#"SELECT table_to_xml('staff'::regclass, true, false, '')"#,
+        r#"SELECT cursor_to_xml('c', 1, true, false, '')"#,
+        r#"SELECT schema_to_xml('public', true, false, '')"#,
+        r#"SELECT database_to_xml(true, false, '')"#,
         // Data-modifying CTEs (sqlparser parses them as a Query; the validator must descend into the CTE)
         r#"WITH d AS (DELETE FROM users RETURNING *) SELECT * FROM d"#,
         r#"WITH u AS (UPDATE t SET x=1 RETURNING *) SELECT * FROM u"#,
