@@ -1088,6 +1088,11 @@ const SIDE_EFFECT_FUNCS: &[&str] = &[
     // filesystem I/O / server configuration
     "pg_read_file",
     "pg_read_binary_file",
+    // Lists the shared libraries loaded into the server. Not a write, but the same kind of
+    // reconnaissance the SHOW policy already refuses: it describes the host rather than the data.
+    // New in PostgreSQL 18, found by diffing its catalogue against 17's rather than by reading
+    // release notes.
+    "pg_get_loaded_modules",
     "pg_ls_dir",
     "pg_stat_file",
     "pg_reload_conf",

@@ -21,7 +21,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        pg: ["13", "14", "15", "16", "17"]
+        pg: ["13", "14", "15", "16", "17", "18"]
     runs-on: ubuntu-latest
     services:
       postgres:
@@ -76,7 +76,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        pg: ["13", "17"]  # the extremes; 16 is covered by the unit matrix above
+        pg: ["13", "18"]  # the extremes; 16 is covered by the unit matrix above
     runs-on: ubuntu-latest
     env:
       PG_IMAGE: postgres:${{ matrix.pg }}

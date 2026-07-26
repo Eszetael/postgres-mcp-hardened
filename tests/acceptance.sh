@@ -502,6 +502,43 @@ done
 stop
 rm -f "$PAUD"
 
+section "The denylist is checked against the database, not against my memory of it"
+# The list of side-effect functions is a snapshot of a moment. PostgreSQL 18 added seventy functions
+# to pg_catalog, five of which write. They were all refused already — the family rules caught them —
+# but that was luck confirmed after the fact, not a guarantee. This asks the SERVER WE ARE TESTING
+# AGAINST which dangerous functions it actually has, and requires the validator to refuse every one.
+# When PostgreSQL 19 adds more, this fails before anyone has read the release notes.
+DANGER=$(docker exec acc_pg psql -U postgres -At -c "
+  SELECT DISTINCT p.proname
+  FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+  WHERE n.nspname = 'pg_catalog'
+    AND (p.proname LIKE 'pg_ls\_%'      OR p.proname LIKE 'pg_stat_reset%'
+      OR p.proname LIKE 'pg_read\_%'    OR p.proname LIKE 'pg_write\_%'
+      OR p.proname LIKE 'lo\_%'         OR p.proname LIKE 'dblink%'
+      OR p.proname LIKE 'pg_terminate%' OR p.proname LIKE 'pg_cancel%'
+      OR p.proname LIKE 'pg_create\_%'  OR p.proname LIKE 'pg_drop\_%'
+      OR p.proname LIKE 'pg_import\_%'  OR p.proname LIKE 'pg_replication%'
+      OR p.proname LIKE 'pg_logical%'   OR p.proname LIKE '%restore%stats'
+      OR p.proname LIKE '%clear%stats'  OR p.proname LIKE 'pg_advisory%'
+      OR p.proname IN ('setval','nextval','pg_promote','pg_switch_wal','pg_notify','lowrite'))
+  ORDER BY 1" 2>/dev/null)
+[ -n "$DANGER" ] || no "could not read the catalogue" ""
+# Some names inside a denied family are allowed on purpose — `lo_get` reads a large object the role
+# is already entitled to read, and the boundary we trust is the privilege, not the name. The list of
+# those exceptions is read FROM THE SOURCE rather than repeated here, so the two cannot drift, and
+# every exception honoured is printed: an exception nobody can see is how a denylist quietly rots.
+EXC=$(sed -n 's/^const SAFE_DESPITE_FAMILY.*= &\[\(.*\)\];/\1/p' "$(dirname "$0")/../src/validate.rs" | tr -d '" ' | tr ',' ' ')
+[ -n "$EXC" ] && printf '       (deliberate exceptions, read from src/validate.rs: %s)\n' "$EXC"
+missed=""; n=0
+for fn in $DANGER; do
+  case " $EXC " in *" $fn "*) continue;; esac
+  n=$((n+1))
+  out=$(env -u DATABASE_URL timeout 5 "$BIN" --validate "SELECT $fn()" 2>&1)
+  [ "$out" = "ALLOW" ] && missed="$missed $fn"
+done
+if [ -z "$missed" ]; then ok "every dangerous function this PostgreSQL has ($n of them) is refused"
+else no "the database has functions the denylist does not know" "$missed"; fi
+
 section "Auth, end to end — the wiring, not the theory"
 # `validate_token` has good unit tests: forged signatures, alg confusion, `alg: none`, wrong issuer
 # and audience are all covered there. What was never tested is whether that function actually stands
