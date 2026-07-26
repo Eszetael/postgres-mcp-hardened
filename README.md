@@ -178,9 +178,19 @@ the same amount of work and leaves no doubt either way.
 | **Supabase** | Private CA. Dashboard → Project Settings → Database → SSL configuration → download the certificate, then set `MCP_SSLROOTCERT` to it. The direct host (`db.<ref>.supabase.co`) is **IPv6-only** — on an IPv4 network use the Supavisor pooler string (port 6543), which also fits serverless and short-lived connections. |
 | **Amazon RDS / Aurora** | Private CA: `https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem`. IAM authentication works — put the generated token in the password field, and remember it expires in 15 minutes. |
 | **Google Cloud SQL** | Private CA: Connections → Security → `server-ca.pem`. Through the Cloud SQL Auth Proxy, connect to the proxy on localhost and TLS is the proxy's business. |
-| **Azure Database for PostgreSQL** | Public CA (DigiCert) — no bundle needed. |
-| **Neon** | Public CA (Let's Encrypt) — no bundle needed. Pooled and direct endpoints both work. |
+| **Azure Database for PostgreSQL** | Public CA — nothing to download. Azure rotated its root to DigiCert Global Root G2 during Q1 2026; we ship the Mozilla root store, so the rotation needs nothing from you. |
+| **Neon** | Public CA (ISRG Root X1, Let's Encrypt) — nothing to download. Pooled and direct endpoints both work. |
 | **DigitalOcean** | Private CA: download the certificate from the cluster's Overview page. |
+
+Not sure which case you are in? Ask the server itself, before configuring anything:
+
+```bash
+echo | openssl s_client -starttls postgres -connect YOUR_HOST:5432 2>/dev/null \
+  | openssl x509 -noout -issuer
+```
+
+A well-known issuer (DigiCert, ISRG, Google Trust Services) means it will just work; anything
+naming your provider means you need their bundle.
 
 With a connection pooler (Supavisor, PgBouncer) in transaction mode, note that this server sets
 `statement_timeout` and `idle_in_transaction_session_timeout` per session and runs every query in an
