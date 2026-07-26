@@ -339,6 +339,17 @@ start DATABASE_URL="$URL" MCP_ALLOWED_ORIGINS="https://my-client.example"
 stop
 
 section "The server knows, and records, what it is"
+# A setting whose VALUE is wrong is as silent as one whose name is wrong, and both end with a
+# protection that is not there.
+for bad in "MCP_ADDR=nonsense" "MCP_AUDIT_LOG=/no/such/dir/a.log" "MCP_TRUST_PROXY=yes" \
+           "MCP_RESERVED_AUTH_SLOTS=lots" "MCP_PUBLIC_URL=ftp://x" "MCP_SEARCH_PATH=a\"b"; do
+  r=$(env DATABASE_URL="$URL" "$bad" "$BIN" 2>&1; echo "rc=$?")
+  case "$r" in *"rc=2"*) ok "refuses to start on ${bad%%=*} with a bad value";; *) no "bad value accepted" "$bad -> $r";; esac
+done
+r=$(env DATABASE_URL="postgres://u:p@db.example.com:5432/x?sslmode=disable" "$BIN" 2>&1; echo "rc=$?")
+case "$r" in *"in the clear"*) ok "refuses plaintext to a database that is not on this machine";; *) no "plaintext to a remote host accepted" "$r";; esac
+r=$(env DATABASE_URL="$URL" MCP_METRICS_TOKEN=same MCP_BEARER_TOKEN=same "$BIN" 2>&1; echo "rc=$?")
+case "$r" in *"same string"*) ok "refuses a metrics token that is also the database credential";; *) no "token reuse accepted" "$r";; esac
 r=$(env DATABASE_URL="$URL" MCP_REDACT_COLUMN=ssn "$BIN" 2>&1; echo "rc=$?")
 case "$r" in *"did you mean MCP_REDACT_COLUMNS"*) ok "a misspelt setting is refused, with the correct name";; *) no "typo silently ignored" "$r";; esac
 case "$r" in *"rc=2"*) ok "and the refusal is fatal, not a warning";; *) no "typo did not stop startup" "$r";; esac

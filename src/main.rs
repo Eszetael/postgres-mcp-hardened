@@ -298,6 +298,7 @@ pub(crate) const KNOWN_VARS: &[&str] = &[
     "MCP_ALLOW_ANONYMOUS_NETWORK",
     "MCP_ALLOW_EXCESSIVE_ROLE",
     "MCP_ALLOW_FUNCTIONS",
+    "MCP_ALLOW_PLAINTEXT_DB",
     "MCP_AUDIT_HMAC_KEY",
     "MCP_AUDIT_HMAC_KEYS_OLD",
     "MCP_AUDIT_HMAC_KEY_FILE",
@@ -522,6 +523,117 @@ pub(crate) fn preflight_config() {
              Accepting the shared token as an alternative would give its holder full scope and leave \
              the audit without an identity. Remove one of the two."
         );
+    }
+
+    // The listen address decides which start-up policy applies, so an unparsable one cannot be
+    // discovered later — it would mean guessing whether we are exposed.
+    if let Ok(v) = std::env::var("MCP_ADDR") {
+        if v.trim().parse::<std::net::SocketAddr>().is_err() {
+            fatal.push(format!(
+                "MCP_ADDR is not an address:port ({:?}) — e.g. 127.0.0.1:8080 or 0.0.0.0:8080",
+                v
+            ));
+        }
+    }
+
+    // An audit file we cannot write is an audit that does not exist, discovered at the moment it was
+    // supposed to record something. We open it now, in the mode we will use.
+    if let Ok(p) = std::env::var("MCP_AUDIT_LOG") {
+        if let Err(e) = std::fs::OpenOptions::new().create(true).append(true).open(&p) {
+            fatal.push(format!("MCP_AUDIT_LOG {} cannot be written: {}", p, e));
+        }
+    }
+
+    // Plaintext to a database on another machine sends every query and every row across the network
+    // in the clear, and nothing in the protocol would tell you. Loopback is exempt: there is no wire.
+    for (var, value) in [
+        ("DATABASE_URL", std::env::var("DATABASE_URL").ok()),
+        ("MCP_DATABASE_URLS", std::env::var("MCP_DATABASE_URLS").ok()),
+    ] {
+        let Some(spec) = value else { continue };
+        for part in spec.split(';').filter(|s| !s.trim().is_empty()) {
+            // `name=url` only when the part before `=` is a name. A connection string contains its
+            // own `=` (in `?sslmode=…`), so splitting on the first one turned the whole URL into the
+            // word "disable" and this check silently inspected nothing.
+            let url = match part.split_once('=') {
+                Some((name, rest)) if !name.contains("://") => rest,
+                _ => part,
+            };
+            if !url.contains("sslmode=disable") {
+                continue;
+            }
+            let remote = !(url.contains("@localhost") || url.contains("@127.0.0.1") || url.contains("@[::1]"));
+            if remote && !std::env::var("MCP_ALLOW_PLAINTEXT_DB").is_ok_and(|v| v == "i-accept-the-risk") {
+                fatal.push(format!(
+                    "{} disables TLS to a host that is not loopback: every query and every row \
+                     would cross the network in the clear. Use sslmode=verify-full, or set \
+                     MCP_ALLOW_PLAINTEXT_DB=i-accept-the-risk",
+                    var
+                ));
+            }
+        }
+    }
+
+    // A metrics token equal to the bearer token is not a second credential; it hands whoever scrapes
+    // metrics the ability to query the database.
+    if let (Ok(m), Ok(b)) = (
+        std::env::var("MCP_METRICS_TOKEN"),
+        std::env::var("MCP_BEARER_TOKEN"),
+    ) {
+        if !m.trim().is_empty() && m == b {
+            fatal.push(
+                "MCP_METRICS_TOKEN is the same string as MCP_BEARER_TOKEN — a scraper would hold a \
+                 credential that can also read the database"
+                    .to_string(),
+            );
+        }
+    }
+
+    // Booleans and small integers: a value nobody parses is a setting nobody applied.
+    for var in ["MCP_TRUST_PROXY", "MCP_SHOW_PARTITIONS", "MCP_STRUCTURED_CONTENT"] {
+        if let Ok(v) = std::env::var(var) {
+            if !matches!(v.trim(), "0" | "1" | "true" | "false" | "") {
+                fatal.push(format!(
+                    "{} must be 0, 1, true or false — {:?} would be read as false",
+                    var, v
+                ));
+            }
+        }
+    }
+    if let Ok(v) = std::env::var("MCP_RESERVED_AUTH_SLOTS") {
+        if v.trim().parse::<u32>().is_err() {
+            fatal.push(format!(
+                "MCP_RESERVED_AUTH_SLOTS is not a whole number ({:?}) — it used to fall back to a \
+                 default without saying so",
+                v
+            ));
+        }
+    }
+
+    // search_path becomes an identifier list in a SET statement. Quotes were being stripped, which
+    // silently pointed queries at a different schema than the one that was asked for.
+    if let Ok(v) = std::env::var("MCP_SEARCH_PATH") {
+        for part in v.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+            if !part
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$')
+            {
+                fatal.push(format!(
+                    "MCP_SEARCH_PATH contains {:?}, which is not a plain schema name",
+                    part
+                ));
+            }
+        }
+    }
+
+    // The public URL goes into OAuth discovery metadata, where a client follows it.
+    if let Ok(v) = std::env::var("MCP_PUBLIC_URL") {
+        if !v.trim().is_empty() && !v.starts_with("https://") && !v.starts_with("http://localhost") {
+            fatal.push(format!(
+                "MCP_PUBLIC_URL must be an https:// URL (or http://localhost for development): {:?}",
+                v
+            ));
+        }
     }
 
     fatal.extend(unknown_vars());

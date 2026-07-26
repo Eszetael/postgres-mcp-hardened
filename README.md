@@ -345,6 +345,10 @@ defeated in review and are therefore described as depth rather than as boundarie
   the transport and every setting in force, with connection passwords stripped and secrets reduced to
   fingerprints, plus a `config_fp` an operator can pin across restarts. A log that says what happened
   but not under which settings cannot answer the first question an incident asks.
+- **A wrong setting is fatal, not merely wrong:** an unparsable listen address, an audit file that
+  cannot be written, `sslmode=disable` to a database on another machine, a metrics token that is also
+  the database credential, a boolean spelt `yes` — each used to be accepted and quietly do something
+  other than what was meant. Startup now stops and names the setting.
 - **A misspelt setting is fatal:** `MCP_REDACT_COLUMN` (singular) used to start the server with
   redaction quietly switched off. Unknown `MCP_*` variables now stop startup and name the intended
   spelling; `MCP_X_*` is reserved for the operator's own use.
@@ -404,6 +408,7 @@ left resident memory flat and file descriptors unchanged.
 | `MCP_RESERVED_AUTH_SLOTS` | database slots kept for authenticated traffic so an anonymous flood cannot take the pool (default: a quarter) |
 | `MCP_PUBLIC_URL` | this server's public base URL, used in the OAuth discovery metadata |
 | `MCP_AUTH_SERVERS` | authorization server URLs advertised in that metadata |
+| `MCP_ALLOW_PLAINTEXT_DB` | set to `i-accept-the-risk` to allow `sslmode=disable` to a database that is not on this machine |
 | `MCP_ALLOW_EXCESSIVE_ROLE` | set to `i-accept-the-risk` to serve a network listener with a role that can write |
 | `MCP_ALLOW_ANONYMOUS_NETWORK` | set to `i-accept-the-risk` to serve a network listener with no authentication |
 | `MCP_ALLOWED_ORIGINS` | browser origins permitted to call this server, e.g. `https://my-client.example`. Empty means no browser page may reach it: a page the user is merely visiting can make their browser POST to `localhost`, which is DNS rebinding's whole trick |
