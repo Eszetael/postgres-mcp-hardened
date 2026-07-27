@@ -8,6 +8,13 @@ on:
     branches: [main]
   pull_request:
 
+# Najmniejsze potrzebne uprawnienia, jawnie. Bez tego klucza `GITHUB_TOKEN` dostaje
+# domyślny zestaw repozytorium — a ten przepływ chodzi przy KAŻDYM pull requeście,
+# czyli na kodzie, którego nie pisaliśmy. `release.yml` i `spec-drift.yml` miały to od
+# początku; te dwa nie, i nikt tego nie zauważył do rundy G4.
+permissions:
+  contents: read
+
 # One run per branch. Today sixty-five commits went out and every superseded push kept running to
 # completion on six PostgreSQL versions — minutes spent proving things about commits that had already
 # been replaced. Cancelling them is the single largest saving available and costs nothing: the only

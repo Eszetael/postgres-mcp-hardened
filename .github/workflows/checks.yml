@@ -10,6 +10,13 @@ name: Checks
 on:
   workflow_call:
 
+# Najmniejsze potrzebne uprawnienia, jawnie. Bez tego klucza `GITHUB_TOKEN` dostaje
+# domyślny zestaw repozytorium — a ten przepływ chodzi przy KAŻDYM pull requeście,
+# czyli na kodzie, którego nie pisaliśmy. `release.yml` i `spec-drift.yml` miały to od
+# początku; te dwa nie, i nikt tego nie zauważył do rundy G4.
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
 
