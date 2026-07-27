@@ -26,7 +26,7 @@ jobs:
         # between the oldest and newest supported version; the ones in between have never caught
         # anything the extremes did not. Six versions on every commit was a bill, not a control.
         pg: ${{ (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/')) && fromJSON('["13","14","15","16","17","18"]') || fromJSON('["13","18"]') }}
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.RUNNER_LABEL || 'ubuntu-latest' }}
     services:
       postgres:
         image: postgres:${{ matrix.pg }}
@@ -81,7 +81,7 @@ jobs:
       fail-fast: false
       matrix:
         pg: ["13", "18"]  # the extremes; 16 is covered by the unit matrix above
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.RUNNER_LABEL || 'ubuntu-latest' }}
     env:
       PG_IMAGE: postgres:${{ matrix.pg }}
     steps:
@@ -96,7 +96,7 @@ jobs:
     # The corpus is the public form of every claim this project makes about refusals. It runs here on
     # a throwaway schema, and anyone can run the same file against their own database — which is the
     # only version of a security claim that can be checked without trusting us.
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.RUNNER_LABEL || 'ubuntu-latest' }}
     services:
       postgres:
         image: postgres:16
@@ -130,7 +130,7 @@ jobs:
   tls:
     # The only cryptographic claim this project makes, and until this job existed it had no executor:
     # CI ran PostgreSQL without TLS and the acceptance suite never touched it.
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.RUNNER_LABEL || 'ubuntu-latest' }}
     steps:
       - uses: actions/checkout@v4
       # rustup honours rust-toolchain.toml, so the version stays in exactly one file.
@@ -143,13 +143,13 @@ jobs:
     # Documentation honesty as a build gate. Claims drift from code silently — a "verified" that
     # names no test, a settings table that has fallen behind — and by the time a user notices, the
     # damage is to trust, not to a feature.
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.RUNNER_LABEL || 'ubuntu-latest' }}
     steps:
       - uses: actions/checkout@v4
       - run: sh tests/docs_claims.sh
 
   audit:
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.RUNNER_LABEL || 'ubuntu-latest' }}
     steps:
       - uses: actions/checkout@v4
       # rustup honours rust-toolchain.toml, so the version stays in exactly one file.
@@ -164,7 +164,7 @@ jobs:
           cargo deny check
 
   container:
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.RUNNER_LABEL || 'ubuntu-latest' }}
     steps:
       - uses: actions/checkout@v4
       - name: Image builds, runs as nonroot, and actually serves
@@ -226,7 +226,7 @@ jobs:
     # specification, we misread it the same way in both halves and every check stays green. This job
     # drives the server with the OFFICIAL MCP SDK — the client library the ecosystem actually uses —
     # over stdio and Streamable HTTP. A protocol mistake shows up as a client that cannot talk to us.
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.RUNNER_LABEL || 'ubuntu-latest' }}
     services:
       postgres:
         image: postgres:18
@@ -245,12 +245,13 @@ jobs:
         working-directory: tests/conformance
         run: npm install --no-audit --no-fund
       - name: Seed a table to read
-        env: { PGPASSWORD: ci }  # pragma: allowlist secret
+        # Through a container rather than a psql on the host. A hosted runner happens to ship the
+        # client; a self-hosted one is whatever we installed on it, and a job that assumes tooling is
+        # a job that fails on the first machine that does not have it.
         run: |
-          psql -h 127.0.0.1 -U postgres -q -v ON_ERROR_STOP=1 <<'SQL'
-          CREATE TABLE orders(id int PRIMARY KEY, customer text);
-          INSERT INTO orders VALUES (1, 'ada');
-          SQL
+          docker run --rm --network host -e PGPASSWORD=ci postgres:18 \
+            psql -h 127.0.0.1 -U postgres -q -v ON_ERROR_STOP=1 -c \
+            "CREATE TABLE orders(id int PRIMARY KEY, customer text); INSERT INTO orders VALUES (1,'ada');"
       - name: Talk to the server as a real client would
         env:
           BIN: ${{ github.workspace }}/target/release/postgres-mcp-hardened
