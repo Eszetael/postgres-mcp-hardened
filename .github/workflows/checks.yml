@@ -21,7 +21,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        pg: ["13", "14", "15", "16", "17", "18"]
+        # The extremes on every push, the whole range on main and on a release. The version-
+        # dependent behaviour we actually have (denylist differences, catalogue additions) shows up
+        # between the oldest and newest supported version; the ones in between have never caught
+        # anything the extremes did not. Six versions on every commit was a bill, not a control.
+        pg: ${{ (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/')) && fromJSON('["13","14","15","16","17","18"]') || fromJSON('["13","18"]') }}
     runs-on: ubuntu-latest
     services:
       postgres:

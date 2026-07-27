@@ -8,6 +8,14 @@ on:
     branches: [main]
   pull_request:
 
+# One run per branch. Today sixty-five commits went out and every superseded push kept running to
+# completion on six PostgreSQL versions — minutes spent proving things about commits that had already
+# been replaced. Cancelling them is the single largest saving available and costs nothing: the only
+# result discarded is one nobody was going to read.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   checks:
     uses: ./.github/workflows/checks.yml
