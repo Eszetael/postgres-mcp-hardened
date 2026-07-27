@@ -77,14 +77,21 @@ pub(crate) fn render_metrics() -> String {
 ///
 /// A page the user is merely visiting can make its browser POST to `http://localhost:8080/mcp`.
 /// That is DNS rebinding's whole trick, and against a local database server it is the difference
-/// between reading a news site and reading `salaries`. The MCP specification requires 403 here; the
-/// default is strict because a browser has no business talking to this server until somebody says
-/// otherwise, and the people who need it (a web-based MCP client) know they need it.
+/// between reading a news site and reading `salaries`. The MCP specification requires 403 here.
+///
+/// One origin is trusted without configuration: a LOOPBACK origin, and only while we listen on
+/// loopback ourselves. That is not a hole — an attacker's page carries its own origin, never
+/// `http://localhost:<port>` — and refusing it was a real defect the official conformance suite
+/// caught: out of the box, no browser-based client on the same machine could reach this server.
+/// Everything else still has to be named in `MCP_ALLOWED_ORIGINS`.
 ///
 /// `Host` is checked only when we listen on loopback. That is precisely the rebinding case — a name
 /// the attacker controls resolving to 127.0.0.1 — while a server behind a reverse proxy legitimately
 /// sees any hostname, and refusing those would break real deployments to guard against nothing.
 pub(crate) fn check_origin(headers: &HeaderMap, listen: &str) -> Result<(), String> {
+    let on_loopback = listen.starts_with("127.")
+        || listen.starts_with("[::1]")
+        || listen.starts_with("localhost");
     if let Some(origin) = headers.get("origin").and_then(|v| v.to_str().ok()) {
         let allowed = std::env::var("MCP_ALLOWED_ORIGINS").unwrap_or_default();
         let ok = allowed
@@ -93,7 +100,14 @@ pub(crate) fn check_origin(headers: &HeaderMap, listen: &str) -> Result<(), Stri
             .filter(|s| !s.is_empty())
             // Exact match on the whole origin, never a prefix or suffix: `https://evil-localhost.com`
             // contains `localhost` and would sail through a substring test.
-            .any(|a| a.eq_ignore_ascii_case(origin.trim_end_matches('/')));
+            .any(|a| a.eq_ignore_ascii_case(origin.trim_end_matches('/')))
+            // A loopback server accepts a LOOPBACK origin with nothing configured. Found by the
+            // official conformance suite, which sends a valid `Origin: http://localhost:<port>` and
+            // requires 2xx; we answered 403 whenever `MCP_ALLOWED_ORIGINS` was unset — which is the
+            // default, so out of the box no browser-based client on the same machine could talk to
+            // us at all. The rebinding defence is untouched: an attacker's page carries its OWN
+            // origin (`http://evil.com`), never a loopback one, and that is still refused.
+            || (on_loopback && origin_is_loopback(origin));
         if !ok {
             return Err(format!(
                 "origin {:?} is not allowed — a browser page may not talk to this server unless its \
@@ -102,9 +116,6 @@ pub(crate) fn check_origin(headers: &HeaderMap, listen: &str) -> Result<(), Stri
             ));
         }
     }
-    let on_loopback = listen.starts_with("127.")
-        || listen.starts_with("[::1]")
-        || listen.starts_with("localhost");
     if on_loopback {
         if let Some(host) = headers.get("host").and_then(|v| v.to_str().ok()) {
             let bare = host.split(':').next().unwrap_or(host);
@@ -125,6 +136,25 @@ pub(crate) fn check_origin(headers: &HeaderMap, listen: &str) -> Result<(), Stri
         }
     }
     Ok(())
+}
+
+/// Whether an `Origin` names this machine — parsed, never substring-matched.
+///
+/// `https://evil-localhost.com` CONTAINS "localhost" and a substring test would wave it through,
+/// which is the whole attack this function exists to stop. So the host is taken from between the
+/// scheme and the port and compared exactly.
+fn origin_is_loopback(origin: &str) -> bool {
+    let rest = origin
+        .strip_prefix("http://")
+        .or_else(|| origin.strip_prefix("https://"))
+        .unwrap_or("");
+    let host = rest.trim_end_matches('/');
+    let host = match host.rsplit_once(':') {
+        // IPv6 in brackets keeps its colons; only a trailing :port is stripped.
+        Some((h, port)) if !h.is_empty() && port.chars().all(|c| c.is_ascii_digit()) => h,
+        _ => host,
+    };
+    matches!(host, "localhost" | "127.0.0.1" | "[::1]" | "::1")
 }
 
 pub(crate) async fn metrics_handler(headers: HeaderMap) -> impl IntoResponse {
@@ -284,6 +314,51 @@ mod tests {
         // An MCP client on the same machine (Claude Desktop, curl) sends no Origin — it is not a
         // browser. A gate that refused it would be useless in the server's primary mode.
         assert!(check_origin(&hdr(&[("host", "localhost:8080")]), "127.0.0.1:8080").is_ok());
+    }
+
+    #[test]
+    fn a_loopback_origin_is_trusted_on_a_loopback_server_without_configuration() {
+        // The official conformance suite sends `Origin: http://localhost:<port>` and requires 2xx.
+        // We answered 403 with `MCP_ALLOWED_ORIGINS` unset — the default — so out of the box no
+        // browser-based client on the same machine could talk to us. My own unit test that morning
+        // had asserted the refusal was CORRECT: I encoded our behaviour instead of the specification,
+        // which is exactly why an outside judge is worth more than another test of my own writing.
+        for origin in [
+            "http://localhost:6274",
+            "http://127.0.0.1:8080",
+            "https://localhost",
+            "http://[::1]:9000",
+        ] {
+            assert!(
+                check_origin(&hdr(&[("origin", origin)]), "127.0.0.1:8080").is_ok(),
+                "a loopback origin must reach a loopback server: {origin}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_lookalike_of_localhost_is_still_refused() {
+        // The whole point of parsing rather than substring-matching: these all CONTAIN "localhost".
+        for origin in [
+            "http://evil-localhost.com",
+            "http://localhost.evil.com",
+            "http://notlocalhost",
+            "http://localhost@evil.com",
+        ] {
+            assert!(
+                check_origin(&hdr(&[("origin", origin)]), "127.0.0.1:8080").is_err(),
+                "a lookalike must not pass as loopback: {origin}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_loopback_origin_does_not_help_against_a_network_listener() {
+        // Off loopback there is no rebinding scenario to accommodate, so the exemption does not apply
+        // and the operator's list is the only way in.
+        assert!(
+            check_origin(&hdr(&[("origin", "http://localhost:6274")]), "0.0.0.0:8080").is_err()
+        );
     }
 
     #[test]
