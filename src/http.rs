@@ -259,3 +259,115 @@ pub(crate) async fn server_card_handler() -> impl axum::response::IntoResponse {
         "tools": tools
     }))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::HeaderMap;
+
+    // `check_origin` jest jedyną obroną przed DNS rebindingiem — stroną w przeglądarce, która
+    // rozwiązuje własną nazwę na 127.0.0.1 i przez to rozmawia z serwerem stojącym na pętli
+    // zwrotnej. Do dziś nie miała ani jednego testu, mimo że jest bramą bezpieczeństwa.
+    fn hdr(pairs: &[(&str, &str)]) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        for (k, v) in pairs {
+            h.insert(
+                axum::http::HeaderName::from_bytes(k.as_bytes()).unwrap(),
+                v.parse().unwrap(),
+            );
+        }
+        h
+    }
+
+    #[test]
+    fn a_local_client_without_an_origin_is_allowed() {
+        // Klient MCP na tej samej maszynie (Claude Desktop, curl) nie wysyła Origin — to nie
+        // przeglądarka. Gdyby brama go odrzucała, byłaby bezużyteczna w głównym trybie pracy.
+        assert!(check_origin(&hdr(&[("host", "localhost:8080")]), "127.0.0.1:8080").is_ok());
+    }
+
+    #[test]
+    fn a_browser_origin_is_refused_unless_the_operator_listed_it() {
+        let e = check_origin(
+            &hdr(&[("origin", "https://evil.example")]),
+            "127.0.0.1:8080",
+        )
+        .expect_err("nieznany origin musi zostać odrzucony");
+        assert!(
+            e.contains("MCP_ALLOWED_ORIGINS"),
+            "komunikat ma mówić, co ustawić: {e}"
+        );
+    }
+
+    #[test]
+    fn a_lookalike_origin_does_not_pass_as_the_listed_one() {
+        std::env::set_var("MCP_ALLOWED_ORIGINS", "https://localhost");
+        let ok = check_origin(&hdr(&[("origin", "https://localhost")]), "127.0.0.1:8080");
+        // `https://evil-localhost.com` ZAWIERA `localhost` — test na podciąg przepuściłby to.
+        let bad = check_origin(
+            &hdr(&[("origin", "https://evil-localhost.com")]),
+            "127.0.0.1:8080",
+        );
+        std::env::remove_var("MCP_ALLOWED_ORIGINS");
+        assert!(ok.is_ok(), "wypisany origin musi przejść");
+        assert!(bad.is_err(), "podobny origin NIE jest wypisanym originem");
+    }
+
+    #[test]
+    fn a_trailing_slash_is_not_a_different_origin() {
+        std::env::set_var("MCP_ALLOWED_ORIGINS", "https://app.example");
+        let r = check_origin(
+            &hdr(&[("origin", "https://app.example/")]),
+            "127.0.0.1:8080",
+        );
+        std::env::remove_var("MCP_ALLOWED_ORIGINS");
+        assert!(r.is_ok(), "ukośnik na końcu to ten sam origin, nie inny");
+    }
+
+    #[test]
+    fn dns_rebinding_is_refused_on_a_loopback_listener() {
+        // Nazwa atakującego rozwiązana na 127.0.0.1 dociera do gniazda; jedyne, co ją odróżnia
+        // od prawdziwego localhosta, to nagłówek Host.
+        let e = check_origin(
+            &hdr(&[("host", "rebind.attacker.example")]),
+            "127.0.0.1:8080",
+        )
+        .expect_err("obcy Host na pętli zwrotnej to rebinding");
+        assert!(
+            e.contains("MCP_ALLOWED_HOSTS"),
+            "komunikat ma wskazać wyjście: {e}"
+        );
+    }
+
+    #[test]
+    fn the_operators_own_name_can_be_allowed_and_a_port_does_not_break_it() {
+        std::env::set_var("MCP_ALLOWED_HOSTS", "mcp.internal");
+        let named = check_origin(&hdr(&[("host", "mcp.internal:8080")]), "127.0.0.1:8080");
+        std::env::remove_var("MCP_ALLOWED_HOSTS");
+        assert!(
+            named.is_ok(),
+            "port w nagłówku Host nie może unieważnić dopuszczonej nazwy"
+        );
+    }
+
+    #[test]
+    fn a_network_listener_does_not_get_the_loopback_host_check() {
+        // Poza pętlą zwrotną serwer i tak stoi za bramą startową (token/OAuth), a nazwa hosta
+        // jest wtedy zwyczajnie cudza — wymuszanie „localhost" blokowałoby normalne wdrożenia.
+        assert!(check_origin(&hdr(&[("host", "mcp.example.com")]), "0.0.0.0:8080").is_ok());
+    }
+
+    #[test]
+    fn metrics_are_prometheus_shaped() {
+        let out = render_metrics();
+        assert!(
+            out.contains("# TYPE"),
+            "brak nagłówków TYPE — to nie jest format Prometheusa"
+        );
+        assert!(
+            out.lines()
+                .all(|l| l.is_empty() || l.starts_with('#') || l.contains(' ')),
+            "każda linia to komentarz albo para nazwa-wartość"
+        );
+    }
+}
