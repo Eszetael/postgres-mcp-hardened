@@ -20,7 +20,7 @@ r2d2 = "0.8"
 r2d2_postgres = "0.18"
 once_cell = "1"
 postgres = { version = "0.19", features = ["with-serde_json-1"] }
-sha2 = "0.10"
+sha2 = "0.11"
 # jsonwebtoken 11 no longer picks a crypto backend for you: without one it compiles cleanly and
 # then PANICS on the first signature verification. `rust_crypto` rather than `aws_lc_rs` because we
 # already carry rustls+ring for TLS and a second native crypto stack would be one too many, because
