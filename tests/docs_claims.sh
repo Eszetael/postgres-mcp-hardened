@@ -1,4 +1,7 @@
 #!/bin/sh
+# Reads the whole of src/, not one file. It used to grep src/main.rs, which was true only while
+# every declaration happened to live there; splitting that file made this gate report twenty
+# false failures. A check pinned to a filename tests the layout, not the claim.
 # Control A: Ensure every "verified" claim in docs references an existing acceptance test or unit test.
 # Control B: Keep documented environment variables in sync with the canonical list in source code.
 
@@ -38,7 +41,7 @@ for file in README.md SECURITY.md CHANGELOG.md docs/COMMUNITY_ISSUES.md; do
 done
 
 # CONTROL B
-sed -n '/const KNOWN_VARS/,/];/p' src/main.rs 2>/dev/null | sed -n 's/.*"\([^"]*\)".*/\1/p' | sort -u > "$tmpdir/known_vars.txt"
+cat src/*.rs 2>/dev/null | sed -n '/const KNOWN_VARS/,/];/p' | sed -n 's/.*"\([^"]*\)".*/\1/p' | sort -u > "$tmpdir/known_vars.txt"
 # Only the FIRST cell of a table row, and only tokens shaped like an environment variable. Taking
 # every backticked word in the line collected defaults, header names and example values as if they
 # were settings, and a check that cries wolf is a check people switch off.
@@ -55,26 +58,26 @@ grep '^| *`' README.md 2>/dev/null \
 
 comm -23 "$tmpdir/known_vars.txt" "$tmpdir/readme_vars.txt" > "$tmpdir/missing_in_readme.txt"
 while read var; do
-    [ -n "$var" ] && { printf "FAIL env var '%s' in src/main.rs but missing in README.md\n" "$var"; fail=1; }
+    [ -n "$var" ] && { printf "FAIL env var '%s' in the source but missing in README.md\n" "$var"; fail=1; }
 done < "$tmpdir/missing_in_readme.txt"
 
 comm -13 "$tmpdir/known_vars.txt" "$tmpdir/readme_vars.txt" > "$tmpdir/missing_in_source.txt"
 while read var; do
-    [ -n "$var" ] && { printf "FAIL env var '%s' in README.md but missing in src/main.rs\n" "$var"; fail=1; }
+    [ -n "$var" ] && { printf "FAIL env var '%s' in README.md but missing in the source\n" "$var"; fail=1; }
 done < "$tmpdir/missing_in_source.txt"
 
 # CONTROL C: the package manifest is the shop window — a client shows its tool list before anyone
 # connects. It listed four of eight tools, with descriptions from an earlier version, because nothing
 # tied it to the source.
 # tool_def( calls span several lines, so match on the flattened text rather than line by line.
-tr '\n' ' ' < src/main.rs | grep -o 'tool_def( *"[a-z_]*"' | sed 's/.*"\([a-z_]*\)"/\1/' | sort -u > "$tmpdir/src_tools.txt"
+cat src/*.rs | tr '\n' ' ' | grep -o 'tool_def( *"[a-z_]*"' | sed 's/.*"\([a-z_]*\)"/\1/' | sort -u > "$tmpdir/src_tools.txt"
 sed -n 's/.*"name": "\([a-z_]*\)".*/\1/p' mcpb/manifest.json | sort -u > "$tmpdir/manifest_tools.txt"
 comm -23 "$tmpdir/src_tools.txt" "$tmpdir/manifest_tools.txt" | while read -r t; do
-    [ -n "$t" ] && printf "FAIL tool '%s' exists in src/main.rs but is missing from mcpb/manifest.json\n" "$t"
+    [ -n "$t" ] && printf "FAIL tool '%s' exists in the source but is missing from mcpb/manifest.json\n" "$t"
 done
 if [ -n "$(comm -23 "$tmpdir/src_tools.txt" "$tmpdir/manifest_tools.txt")" ]; then fail=1; fi
 comm -13 "$tmpdir/src_tools.txt" "$tmpdir/manifest_tools.txt" | while read -r t; do
-    [ -n "$t" ] && printf "FAIL tool '%s' advertised in mcpb/manifest.json but not in src/main.rs\n" "$t"
+    [ -n "$t" ] && printf "FAIL tool '%s' advertised in mcpb/manifest.json but not in the source\n" "$t"
 done
 if [ -n "$(comm -13 "$tmpdir/src_tools.txt" "$tmpdir/manifest_tools.txt")" ]; then fail=1; fi
 
