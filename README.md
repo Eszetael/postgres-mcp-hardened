@@ -312,6 +312,32 @@ the thing that authorised and the thing that executes saw two different requests
 stating a version we do not implement is told so (`-32022`) rather than quietly served under a
 contract it never agreed to.
 
+## What the safety costs
+
+Measured, not asserted: `tests/bench/`, against the `pg` driver running the same query on the same
+machine (PostgreSQL 18 in Docker, 50k-row table, 300 sequential requests, rate limit off).
+
+| query | driver | this server | difference |
+|---|---|---|---|
+| point lookup | 0.28 ms | 3.88 ms | +3.6 ms |
+| small scan | 0.64 ms | 5.82 ms | +5.2 ms |
+| aggregate | 3.96 ms | 7.67 ms | +3.7 ms |
+
+About **4 ms per query**, and the shape of that number matters more than the size: it is nearly
+constant. If the AST validation were the cost, it would grow with the query. It does not. The time
+goes on round trips — the session is reset, the timeouts and read-only flag are set, a read-only
+transaction is opened, the cost guard plans the statement, then the query runs and the transaction
+is rolled back. Five or six exchanges where the driver has one.
+
+That is a deliberate trade and you can see exactly what it buys. For an agent making tens of calls
+it is invisible; if you are putting this in front of a latency-critical serving path, you are using
+the wrong tool, and it is not one.
+
+Under concurrency the interesting number is not throughput but what happens past the limits: at 8
+concurrent clients it served 373 requests/second and turned away 192 more with "too many requests in
+flight", which is the in-flight cap doing its job rather than a queue growing until something falls
+over.
+
 ## Would this index help? — answered without creating one
 
 The one capability the leading alternative is genuinely known for is index tuning: it can tell you
