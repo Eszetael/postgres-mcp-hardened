@@ -331,6 +331,23 @@ pub(crate) fn preflight_config() {
                 }
             }
         }
+        // Audience and issuer are what stop a token minted by the same provider FOR A DIFFERENT
+        // APPLICATION from working here — the confused-deputy shape. `validate_token` already
+        // refuses every request when they are unset, so there was never a fail-open; but the
+        // refusal arrived at the first call rather than at startup, which made this the only
+        // misconfiguration in the server that let the process come up and then reject everything.
+        // A G4 round called it a critical bypass. It was not one. It was an inconsistency, and an
+        // operator staring at a server that answers nothing deserves the same treatment as one who
+        // mistyped a timeout: told before it starts.
+        for var in ["JWT_AUD", "JWT_ISS"] {
+            if std::env::var(var).map(|v| v.trim().is_empty()) != Ok(false) {
+                fatal.push(format!(
+                    "{} is required when JWT_PUBKEY_PEM is set — without it a token issued by the \
+                     same provider for another application would be accepted here",
+                    var
+                ));
+            }
+        }
     }
 
     // Statement timeout must be a value PostgreSQL accepts; a typo would otherwise surface as a

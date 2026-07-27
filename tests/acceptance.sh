@@ -367,6 +367,24 @@ case "$r" in *panicked*) no "an occupied port still panics" "$r";;
              *) no "no clear message for an occupied port" "$r";; esac
 case "$r" in *MCP_ADDR*) ok "and it names the setting the operator can change";; *) no "the message does not say what to change" "$r";; esac
 stop
+# Audience i issuer są tym, co odróżnia token wystawiony dla NAS od tokenu wystawionego przez tego
+# samego dostawcę tożsamości dla cudzej aplikacji. Bez nich `validate_token` i tak odrzucał każde
+# żądanie, więc fail-open nie było — ale serwer wstawał i dopiero potem odmawiał wszystkiego, jako
+# jedyna misconfiguracja w całym programie. Runda G4 nazwała to krytycznym obejściem; to nie było
+# obejście, tylko niekonsekwencja, i tak jest naprawiona.
+PEMDIR=$(mktemp -d); openssl genrsa -out "$PEMDIR/k.pem" 2048 2>/dev/null
+openssl rsa -in "$PEMDIR/k.pem" -pubout -out "$PEMDIR/pub.pem" 2>/dev/null
+for miss in JWT_AUD JWT_ISS; do
+  if [ "$miss" = "JWT_AUD" ]; then A="" ; I="https://idp.example"; else A="app"; I=""; fi
+  r=$(env DATABASE_URL="$URL" JWT_PUBKEY_PEM="$PEMDIR/pub.pem" JWT_AUD="$A" JWT_ISS="$I" "$BIN" 2>&1; echo "rc=$?")
+  case "$r" in *"$miss is required"*"rc=2"*) ok "refuses to start with OAuth key but no $miss";;
+                *) no "OAuth without $miss was accepted" "$r";; esac
+done
+r=$(env DATABASE_URL="$URL" JWT_PUBKEY_PEM="$PEMDIR/pub.pem" JWT_AUD=app JWT_ISS=https://idp.example       MCP_ADDR=127.0.0.1:$((PORT+920)) timeout 3 "$BIN" 2>&1; true)
+case "$r" in *listening*) ok "starts once audience and issuer are both given";;
+             *) no "complete OAuth config still refused" "$r";; esac
+rm -rf "$PEMDIR"
+
 r=$(env DATABASE_URL="postgres://u:p@db.example.com:5432/x?sslmode=disable" "$BIN" 2>&1; echo "rc=$?")
 case "$r" in *"in the clear"*) ok "refuses plaintext to a database that is not on this machine";; *) no "plaintext to a remote host accepted" "$r";; esac
 r=$(env DATABASE_URL="$URL" MCP_METRICS_TOKEN=same MCP_BEARER_TOKEN=same "$BIN" 2>&1; echo "rc=$?")
