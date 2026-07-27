@@ -216,3 +216,45 @@ jobs:
           ignore-unfixed: true
           exit-code: '1'
           format: table
+
+  conformance:
+    # Everything else in this repository is our test harness talking to our server. If we misread the
+    # specification, we misread it the same way in both halves and every check stays green. This job
+    # drives the server with the OFFICIAL MCP SDK — the client library the ecosystem actually uses —
+    # over stdio and Streamable HTTP. A protocol mistake shows up as a client that cannot talk to us.
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_PASSWORD: ci  # pragma: allowlist secret - throwaway CI database, dies with the runner
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd pg_isready --health-interval 5s --health-timeout 5s --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup show
+      - run: cargo build --release --locked
+      - uses: actions/setup-node@v4
+        with: { node-version: "22" }
+      - name: Install the official MCP SDK
+        working-directory: tests/conformance
+        run: npm install --no-audit --no-fund
+      - name: Seed a table to read
+        env: { PGPASSWORD: ci }  # pragma: allowlist secret
+        run: |
+          psql -h 127.0.0.1 -U postgres -q -v ON_ERROR_STOP=1 <<'SQL'
+          CREATE TABLE orders(id int PRIMARY KEY, customer text);
+          INSERT INTO orders VALUES (1, 'ada');
+          SQL
+      - name: Talk to the server as a real client would
+        env:
+          BIN: ${{ github.workspace }}/target/release/postgres-mcp-hardened
+          DBURL: postgres://postgres:ci@127.0.0.1:5432/postgres  # pragma: allowlist secret
+          MCPURL: http://127.0.0.1:8123/mcp
+          TOK: conformance-token
+        working-directory: tests/conformance
+        run: |
+          DATABASE_URL="$DBURL" MCP_BEARER_TOKEN="$TOK" MCP_ADDR=127.0.0.1:8123 "$BIN" &
+          for _ in $(seq 1 30); do curl -sf -H "authorization: Bearer $TOK" http://127.0.0.1:8123/health >/dev/null && break; sleep 1; done
+          node probe.mjs

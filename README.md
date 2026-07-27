@@ -312,6 +312,15 @@ the thing that authorised and the thing that executes saw two different requests
 stating a version we do not implement is told so (`-32022`) rather than quietly served under a
 contract it never agreed to.
 
+## Conformance is checked by somebody else's client
+
+Every other test here is our harness talking to our server. If we misread the specification, we
+misread it the same way in both halves and everything passes. So CI also drives the server with the
+**official MCP SDK** — the client library the ecosystem uses — over stdio and Streamable HTTP:
+handshake, tool listing and schemas, a read, a refused write arriving as a tool execution error
+rather than a protocol one, resource listing and reading. A protocol mistake shows up as a client
+that cannot talk to us. `tests/conformance/`.
+
 ## Working on this
 
 ```bash

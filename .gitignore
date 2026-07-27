@@ -1,2 +1,4 @@
 /target
 **/*.rs.bk
+tests/conformance/node_modules/
+tests/conformance/package-lock.json

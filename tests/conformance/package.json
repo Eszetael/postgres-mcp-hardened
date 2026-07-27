@@ -1,0 +1,7 @@
+{
+  "name": "postgres-mcp-hardened-conformance",
+  "private": true,
+  "type": "module",
+  "description": "Drives the server with the official MCP SDK, so protocol conformance is asserted by an implementation we did not write.",
+  "dependencies": { "@modelcontextprotocol/sdk": "^1.29.0" }
+}
