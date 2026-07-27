@@ -2022,6 +2022,35 @@ pub(crate) fn handle_simulate_index(args: &Value) -> Value {
         .unwrap_or("btree")
         .to_lowercase();
 
+    // The surface allowlist. `simulate_index` planned the caller's query on its own connection, so
+    // it never reached `cost_guard` — and a plan is exactly what the allowlist exists to withhold:
+    // it names the table, its columns, the filter and the planner's row estimates, and repeated with
+    // different constants those estimates are an oracle for values nobody was allowed to read. The
+    // same hole was found and closed for EXPLAIN once already; a new tool reopened it.
+    if surface::active() {
+        match cost_guard(sql, f64::MAX, db) {
+            Ok(()) => {}
+            Err(CostErr::OutsideSurface(e)) => {
+                audit("simulate_index", "denied_surface", Some(sql));
+                METRICS.denied_validation.fetch_add(1, Ordering::Relaxed);
+                return err_content(-32602, e);
+            }
+            Err(CostErr::QueryError(e)) | Err(CostErr::TooExpensive(e)) => {
+                audit("simulate_index", "error", Some(sql));
+                return err_content(-32000, e);
+            }
+        }
+        // And the table we have been asked to index, separately: whether the catalogue lookup
+        // succeeds or reports "no such table" is itself an answer about a table outside the surface.
+        let asked = vec![(schema.clone(), table.clone())];
+        let refused = surface::refused(&asked, &|_, _| None);
+        if !refused.is_empty() {
+            audit("simulate_index", "denied_surface", Some(sql));
+            METRICS.denied_validation.fetch_add(1, Ordering::Relaxed);
+            return err_content(-32602, surface::refusal_message(&refused));
+        }
+    }
+
     match db::simulate_index(sql, &schema, &table, &columns, &method, db) {
         Ok(v) => {
             audit("simulate_index", "allowed", Some(sql));

@@ -107,6 +107,14 @@ server checks each one rather than assuming it.
   parser removes the protection. The fuzz harness is the only thing that finds these, and it finds
   them only for constructs someone thought to mutate.
 
+- **A new tool is a new way round every gate the old ones pass through.** `simulate_index` planned
+  the caller's query on its own connection and so never reached the cost guard, which is where the
+  surface allowlist lives — it would happily plan against a table the allowlist forbids and hand back
+  the table name, its columns, the filter and the planner's row estimates. The identical hole had
+  been found and closed for EXPLAIN months earlier. It is fixed, and the lesson is structural: the
+  controls are attached to a code path, not to the server, so anything that opens a new path has to
+  be walked against the list of them deliberately.
+
 - **A gateway that authorises on headers, on an older revision.** `Mcp-Method`/`Mcp-Name` only
   exist from `2026-07-28`. If you put an authorising proxy in front of this server on `2025-11-25`
   or `2025-06-18`, the proxy has nothing to route on but the body — and if it decides without

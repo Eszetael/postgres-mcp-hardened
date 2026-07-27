@@ -530,6 +530,18 @@ SQL
   stop
   n=$(docker exec acc_pg psql -U postgres -At -c "SELECT count(*) FROM pg_indexes WHERE tablename='idxdemo'" 2>/dev/null)
   [ "$n" = "0" ] && ok "and after all of that the table still has no indexes at all" || no "an index was really created" "count=$n"
+  # The surface allowlist. This tool planned the caller's query on its own connection, so it never
+  # reached the cost guard where the allowlist lives — and a plan names the table, its columns, the
+  # filter and the row estimates, which repeated with different constants is an oracle for values
+  # nobody was allowed to read. The same hole had already been found and closed for EXPLAIN.
+  start DATABASE_URL="$URL" MCP_ALLOW_TABLES="public.customers"
+  r=$(s '{"sql":"SELECT * FROM idxdemo WHERE id = 42","table":"public.idxdemo","columns":["id"]}')
+  case "$r" in *"outside the configured surface"*) ok "a query outside the surface is refused before it is planned";; *) no "simulate_index planned outside the surface" "$r";; esac
+  # A permitted query and a forbidden target table: the catalogue lookup alone answers whether that
+  # table exists, so the target needs checking separately from the query.
+  r=$(s '{"sql":"SELECT id FROM customers","table":"public.idxdemo","columns":["id"]}')
+  case "$r" in *"outside the configured surface"*) ok "and so is an index on a table outside it, even from a permitted query";; *) no "indexed a table outside the surface" "$r";; esac
+  stop
 else
   no "hypopg could not be installed in the fixture" "the simulation path went untested"
 fi
