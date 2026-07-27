@@ -1,10 +1,24 @@
-# cargo-audit exceptions. Every entry must state a reason and a scope.
+# cargo-audit exceptions. Every entry must state a reason and a scope, and the scope must be true
+# TODAY — an exception whose justification has quietly expired is worse than no exception, because
+# the check still passes and nobody re-reads the comment.
 [advisories]
 ignore = [
-    # RUSTSEC-2023-0071 (Marvin, a timing side-channel in RSA). No fixed release available.
-    # Scope here: [dev-dependencies] ONLY - the `rsa` crate generates an ephemeral key pair for the
-    # auth unit tests (no private key lives in the repository). It never reaches the release binary
-    # or the image: `cargo tree --edges normal` does not list it.
-    # Re-checked on every dependency change; remove this entry once an upstream fix exists.
+    # RUSTSEC-2023-0071 (Marvin: a timing side-channel in RSA). No fixed release available.
+    #
+    # Scope, corrected on 2026-07-27: `rsa` is now a NORMAL dependency and DOES ship in the release
+    # binary, pulled in by jsonwebtoken's `rust_crypto` backend. The previous note said it was
+    # dev-only and never reached the binary; enabling that backend made that false, and the ignore
+    # went on passing regardless. That is the failure this file exists to avoid.
+    #
+    # Why it is still not exploitable here: Marvin is a timing attack on RSA operations that use the
+    # PRIVATE key — decryption, and signing. This server only ever VERIFIES an RS256 signature with a
+    # public key supplied by the operator (JWT_PUBKEY_PEM). No RSA private key exists in the process,
+    # so there is no secret for the side-channel to recover.
+    #
+    # The alternative is jsonwebtoken's `aws_lc_rs` backend, which avoids the crate entirely and
+    # would leave this file empty. It was not taken because it adds a C toolchain (cmake, and NASM on
+    # Windows) to a release that cross-compiles to five targets, and a second native crypto stack
+    # alongside the rustls/ring one already in the binary. Revisit if zero exceptions becomes worth
+    # more than a simple build.
     "RUSTSEC-2023-0071",
 ]
