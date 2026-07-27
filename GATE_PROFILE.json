@@ -1,8 +1,0 @@
-{
-  "_dlaczego": "Brama liczy hash kodu z TYCH plików. Domyślny profil bramy to aktor Apify w Pythonie (src/, .actor/, Dockerfile, requirements.txt) — dla serwera w Ruście karta nie unieważniałaby się po zmianie Cargo.toml ani testów, czyli bramkowałaby nie ten kod, który wydajemy.",
-  "code_dirs": ["src", "tests", ".github"],
-  "code_files": ["Cargo.toml", "Cargo.lock", "Dockerfile", "rust-toolchain.toml", ".cargo/audit.toml"],
-  "_wymiary": "store-seo nie dotyczy serwera MCP (nie idzie do Apify Store). mcp-ready dotyczy najbardziej ze wszystkich.",
-  "dimensions": ["correctness", "reliability", "performance", "security",
-                 "compliance", "red-team", "mcp-ready", "supply-chain"]
-}
