@@ -267,6 +267,13 @@ jobs:
     #
     # No database here on purpose. What needs proving is that the artefact starts and that the parts
     # with no external dependencies work; the database behaviour is covered exhaustively on Linux.
+    #
+    # Only on a public repository. On a private one these runners bill at 10x (macOS) and 2x
+    # (Windows), and adding them exhausted the included minutes: the whole run — including the Linux
+    # jobs that had just been green — was rejected in three seconds with no logs at all. The check is
+    # worth having and turns itself on the day the repository is published, rather than sitting
+    # commented out where nobody would remember it.
+    if: ${{ !github.event.repository.private }}
     strategy:
       fail-fast: false
       matrix:
