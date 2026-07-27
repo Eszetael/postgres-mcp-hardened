@@ -258,3 +258,53 @@ jobs:
           DATABASE_URL="$DBURL" MCP_BEARER_TOKEN="$TOK" MCP_ADDR=127.0.0.1:8123 "$BIN" &
           for _ in $(seq 1 30); do curl -sf -H "authorization: Bearer $TOK" http://127.0.0.1:8123/health >/dev/null && break; sleep 1; done
           node probe.mjs
+
+  platforms:
+    # We ship signed binaries for macOS and Windows and had never STARTED one. Cross-compiling proves
+    # a binary exists, not that it runs: a missing runtime, a path assumption or a TLS trust store
+    # that is not there fails at launch, on a platform no job ever touched. This is the same shape as
+    # a release path that was never executed until it was — it looked fine for weeks.
+    #
+    # No database here on purpose. What needs proving is that the artefact starts and that the parts
+    # with no external dependencies work; the database behaviour is covered exhaustively on Linux.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup show
+      - name: The unit tests, which need nothing external
+        run: cargo test --release --locked
+      - name: The binary starts and the validator answers, both ways
+        shell: bash
+        run: |
+          BIN=target/release/postgres-mcp-hardened
+          [ "${{ matrix.os }}" = "windows-latest" ] && BIN=target/release/postgres-mcp-hardened.exe
+          out=$("$BIN" --validate "SELECT 1")
+          [ "$out" = "ALLOW" ] || { echo "a plain SELECT was not allowed: $out"; exit 1; }
+          # A refusal has to survive the platform too — an allow-everything binary would pass a
+          # check that only tested the happy path.
+          if "$BIN" --validate "DELETE FROM t" | grep -q '^ALLOW'; then
+            echo "a DELETE was allowed"; exit 1
+          fi
+          if "$BIN" --validate "SELECT setval('s',1)" | grep -q '^ALLOW'; then
+            echo "a side-effect function was allowed"; exit 1
+          fi
+      - name: The role generator runs
+        shell: bash
+        run: |
+          BIN=target/release/postgres-mcp-hardened
+          [ "${{ matrix.os }}" = "windows-latest" ] && BIN=target/release/postgres-mcp-hardened.exe
+          "$BIN" --print-setup-sql | grep -q "CREATE ROLE" || { echo "the generator produced no DDL"; exit 1; }
+      - name: A short fuzz run, because a parser can behave differently per platform
+        shell: bash
+        run: |
+          BIN=target/release/postgres-mcp-hardened
+          [ "${{ matrix.os }}" = "windows-latest" ] && BIN=target/release/postgres-mcp-hardened.exe
+          # Iteration count is a positional argument, not an environment variable — 20k rather than
+          # the default 200k because this is asking "does the parser behave the same here", not
+          # "find new bypasses"; the full run happens on Linux.
+          "$BIN" --fuzz 20000 | tail -3
+          "$BIN" --fuzz 20000 | grep -q "0 invariant violations" || { echo "the fuzz harness found a violation on ${{ matrix.os }}"; exit 1; }

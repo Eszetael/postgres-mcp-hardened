@@ -1,0 +1,49 @@
+name: Spec drift
+
+# The preview revision is keyed to an identifier we do not control. MCP names a revision for the
+# last date a backwards-incompatible change was made, so it MOVES when one more lands — our
+# `Rev::V20260728` can go stale through nobody's mistake. "Remember to re-check it" is not a control;
+# this is.
+#
+# Deliberately NOT part of the push gate: upstream renaming their draft is not a reason to block a
+# commit here. It runs weekly and on demand, and when it fires the fix is a one-line change plus a
+# re-read of the changelog.
+on:
+  schedule: [{ cron: "17 6 * * 1" }]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  identifier:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compare our preview identifier with the normative schema
+        shell: bash
+        run: |
+          set -euo pipefail
+          URL=https://raw.githubusercontent.com/modelcontextprotocol/modelcontextprotocol/main/schema/draft/schema.ts
+          upstream=$(curl -sSf --retry 3 "$URL" | sed -n 's/.*LATEST_PROTOCOL_VERSION *= *"\([0-9-]*\)".*/\1/p' | head -1)
+          [ -n "$upstream" ] || { echo "could not read LATEST_PROTOCOL_VERSION — the schema moved or the fetch failed"; exit 1; }
+          ours=$(sed -n 's/.*Rev::V20260728 => "\([0-9-]*\)".*/\1/p' src/protocol.rs | head -1)
+          [ -n "$ours" ] || { echo "could not find our own identifier in src/protocol.rs"; exit 1; }
+          echo "upstream draft: $upstream"
+          echo "this server:    $ours"
+          if [ "$upstream" != "$ours" ]; then
+            echo "::error title=Preview identifier is stale::The draft is now $upstream; this server still answers $ours. Re-read the changelog for what else changed, then update Rev and its tests."
+            exit 1
+          fi
+          echo "identifiers agree"
+      - name: Say whether the draft has become the current revision
+        shell: bash
+        run: |
+          # Promotion is the moment the preview switch should stop being a switch. Nothing announces
+          # it, so notice it here rather than by reading the news.
+          cur=$(curl -sSf --retry 3 https://modelcontextprotocol.io/specification/versioning \
+                | grep -oE '20[0-9]{2}-[0-9]{2}-[0-9]{2}' | head -1 || true)
+          echo "the site's current revision looks like: ${cur:-unknown}"
+          if [ "${cur:-}" = "$(sed -n 's/.*Rev::V20260728 => "\([0-9-]*\)".*/\1/p' src/protocol.rs | head -1)" ]; then
+            echo "::warning title=The draft is now current::What we ship behind MCP_PROTOCOL_PREVIEW is no longer a draft. Consider making it the default."
+          fi
