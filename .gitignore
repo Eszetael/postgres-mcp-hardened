@@ -5,3 +5,4 @@ tests/conformance/package-lock.json
 tests/bench/node_modules/
 tests/bench/package-lock.json
 PLAN.local.md
+docs/SELF_HOSTED_RUNNER.md
