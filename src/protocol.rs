@@ -31,6 +31,13 @@ pub(crate) enum Rev {
     V20251125,
     /// The next revision, still a draft upstream, reachable only behind `MCP_PROTOCOL_PREVIEW=1`.
     ///
+    /// The identifier is not a release date and nobody has announced one. MCP versions are named for
+    /// "the last date a backwards-incompatible change was made", so `2026-07-28` describes something
+    /// that has already happened in the draft — and it MOVES if one more breaking change lands before
+    /// the revision is promoted. It is taken from `LATEST_PROTOCOL_VERSION` in the normative
+    /// schema.ts, which is the only place it is authoritative. Re-read that constant when the draft
+    /// becomes current, rather than trusting this line.
+    ///
     /// It is the largest break MCP has had: no `initialize`, no session header, no `ping`. Every
     /// request carries its own protocol version in `_meta`, and `server/discover` replaces the
     /// handshake. We implement it early and behind a switch for one reason — a draft still moves,

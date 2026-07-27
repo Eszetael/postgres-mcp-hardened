@@ -293,7 +293,10 @@ they have always been.
 
 ### The next revision, before it lands
 
-`2026-07-28` is the largest break MCP has had: no `initialize`, no session header, no `ping`. Every
+`2026-07-28` is the largest break MCP has had: no `initialize`, no session header, no `ping`. That
+identifier comes from `LATEST_PROTOCOL_VERSION` in the draft schema, and it is not a release date —
+MCP names a revision for the last date a backwards-incompatible change was made, so it describes the
+draft's history rather than a schedule, and it moves if another breaking change lands. Every
 request carries its own protocol version in `_meta`, and a new `server/discover` replaces the
 handshake. We implement it behind `MCP_PROTOCOL_PREVIEW=1`, and it is off by default for a reason —
 a draft still moves, and a server that advertises support for a moving target will be wrong in
