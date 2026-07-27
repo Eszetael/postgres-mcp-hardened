@@ -81,6 +81,18 @@ comm -13 "$tmpdir/src_tools.txt" "$tmpdir/manifest_tools.txt" | while read -r t;
 done
 if [ -n "$(comm -13 "$tmpdir/src_tools.txt" "$tmpdir/manifest_tools.txt")" ]; then fail=1; fi
 
+# Control D: every source file the documentation points at must exist.
+#
+# THREAT_MODEL.md is a table of "which control lives where", which is the most useful thing in it and
+# the first thing a refactor breaks silently. Splitting main.rs left one row pointing at a file that
+# no longer held that control — the reader would go and look, find nothing, and stop trusting the
+# rest of the table. Controls A-C compared claims against behaviour and never noticed, because a
+# stale file name is not a wrong claim about the software, it is a wrong claim about the repository.
+for f in $(grep -ohE '`[a-z_]+\.rs`' README.md SECURITY.md THREAT_MODEL.md CONTRIBUTING.md 2>/dev/null \
+           | tr -d '`' | sort -u); do
+    [ -f "src/$f" ] || { printf "FAIL documentation points at src/%s, which does not exist\n" "$f"; fail=1; }
+done
+
 # A placeholder that reaches a published package is worse than a missing field: it looks filled in.
 if grep -q '<[A-Z_]*>' mcpb/manifest.json; then
     printf "FAIL mcpb/manifest.json still contains a placeholder\n"
@@ -91,6 +103,7 @@ if [ "$fail" -eq 0 ]; then
     echo "PASS Control A: every 'verified' claim names a test that exists"
     echo "PASS Control B: the documented settings and the source agree"
     echo "PASS Control C: the package manifest matches the tools that exist"
+    echo "PASS Control D: every source file the documentation points at exists"
 fi
 
 exit "$fail"

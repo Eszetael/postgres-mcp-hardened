@@ -95,7 +95,7 @@ server checks each one rather than assuming it.
 | Provenance wrapper | `tools.rs` | a client that renders `structuredContent` straight into a prompt — off by default, documented |
 | Hash-chained audit | `audit_log.rs` | truncating the tail, unless an anchor is kept elsewhere |
 | Request/header agreement | `protocol.rs` | nothing, for a gateway that authorises on `Mcp-Method`/`Mcp-Name` — but only from `2026-07-28`, where those headers exist. Earlier revisions have no such headers, so a gateway on those transports must read the body |
-| Scope enforcement | `main.rs` | a token issued with more scope than its holder needs — we check the scope, not the wisdom of whoever minted it. It now covers `resources/*` as well as `tools/call`: schema reads are data |
+| Scope enforcement | `authz.rs` | a token issued with more scope than its holder needs — we check the scope, not the wisdom of whoever minted it. It now covers `resources/*` as well as `tools/call`: schema reads are data |
 | Origin refusal | `http.rs` | a non-browser client, which never sends `Origin` — this defends against a page in someone's browser reaching a loopback server, not against a program |
 
 ## Residual risks, unfixed and named
