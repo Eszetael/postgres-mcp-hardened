@@ -21,8 +21,10 @@ if [ ! -x "$BIN" ]; then
   exit 1
 fi
 
-# Find a free ephemeral port to avoid conflicts
-ADV_PORT=$(python3 -c 'import socket; s=socket.socket(); s.bind(("",0)); print(s.getsockname()[1]); s.close()')
+# A free port, from the one helper the whole suite uses. This file had the right idea first and its
+# own copy of it; the copy also handed out ephemeral-range ports, which the acceptance suite had
+# already learned to avoid. One helper, one set of hard-won constraints.
+ADV_PORT=$("$PROJECT_DIR/tests/free_port.sh")
 
 # Start the server with the adversarial database and redaction settings
 # MCP_ADDR, not PORT — and loopback, so the start-up gate does not refuse a role it would be right

@@ -12,7 +12,12 @@ no(){ printf '  \033[31mFAIL\033[0m %s\n     %s\n' "$1" "${2:-}"; FAIL=$((FAIL+1
 skip(){ printf '  \033[33mSKIP\033[0m %s (%s)\n' "$1" "$2"; SKIP=$((SKIP+1)); }
 section(){ printf '\n== %s ==\n' "$1"; }
 
-PORT=$((10000 + RANDOM % 20000))
+FREE_PORT="$(dirname "$0")/free_port.sh"
+# Asked for, not guessed. `10000 + RANDOM % 20000` picks a plausible port without checking whether
+# anything already holds it — fine on a machine that belongs to the suite, a coin-flip anywhere else.
+# The suite walks upwards from here (PORT+1 per restart, plus fixed offsets further down), so this is
+# a base address rather than a single port.
+PORT=$("$FREE_PORT")
 start(){ # start(env..., ) -> server on $PORT
   env "$@" MCP_ADDR=127.0.0.1:$PORT "$BIN" >/tmp/acc_$PORT.log 2>&1 &
   SRV=$!; sleep 2
@@ -33,10 +38,10 @@ command -v docker >/dev/null || { echo 'docker required'; exit 1; }
 
 PGPW=acc_$RANDOM
 docker rm -f acc_pg >/dev/null 2>&1
-# Port 15500, not something in the 32768-60999 range: a fixed port inside the ephemeral range is
-# eventually taken by an unrelated outgoing connection, and the suite then fails as "fixture failed"
-# with nothing to do with the code under test. Seen once; it costs an afternoon to diagnose twice.
-PGPORT_ACC=${PGPORT_ACC:-15500}
+# Below the ephemeral range (32768-60999) — a fixed port in there is eventually taken by an unrelated
+# outgoing connection and the suite fails as "fixture failed" for reasons unconnected to the code.
+# Free-then-picked rather than constant: 15500 was still a guess about someone else's machine.
+PGPORT_ACC=${PGPORT_ACC:-$("$FREE_PORT")}
 # PG_IMAGE lets CI run the whole suite across PostgreSQL versions: the function deny-list is
 # version-dependent (pg_backup_start replaced pg_start_backup in 15, pg_read_all_data arrived in 14,
 # pg_maintain in 17), so testing one version tells us about one version.
@@ -353,6 +358,15 @@ for bad in "MCP_ADDR=nonsense" "MCP_AUDIT_LOG=/no/such/dir/a.log" "MCP_TRUST_PRO
   r=$(env DATABASE_URL="$URL" "$bad" "$BIN" 2>&1; echo "rc=$?")
   case "$r" in *"rc=2"*) ok "refuses to start on ${bad%%=*} with a bad value";; *) no "bad value accepted" "$bad -> $r";; esac
 done
+# A port someone else already holds is the most ordinary obstacle there is, and until our own CI ran
+# on a machine we share, this answered with a Rust panic and a backtrace hint. Six jobs died that way.
+start DATABASE_URL="$URL"
+r=$(env DATABASE_URL="$URL" MCP_ADDR="127.0.0.1:$PORT" "$BIN" 2>&1; echo "rc=$?")
+case "$r" in *panicked*) no "an occupied port still panics" "$r";;
+             *"Cannot listen"*"rc=1"*) ok "an occupied port is explained, not a panic";;
+             *) no "no clear message for an occupied port" "$r";; esac
+case "$r" in *MCP_ADDR*) ok "and it names the setting the operator can change";; *) no "the message does not say what to change" "$r";; esac
+stop
 r=$(env DATABASE_URL="postgres://u:p@db.example.com:5432/x?sslmode=disable" "$BIN" 2>&1; echo "rc=$?")
 case "$r" in *"in the clear"*) ok "refuses plaintext to a database that is not on this machine";; *) no "plaintext to a remote host accepted" "$r";; esac
 r=$(env DATABASE_URL="$URL" MCP_METRICS_TOKEN=same MCP_BEARER_TOKEN=same "$BIN" 2>&1; echo "rc=$?")

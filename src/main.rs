@@ -799,7 +799,8 @@ pub(crate) fn run_stdio() {
 
 // --- HTTP TRANSPORT ---
 pub(crate) async fn run_http() {
-    let addr = std::env::var("MCP_ADDR").unwrap_or_else(|_| "127.0.0.1:8080".into());
+    // The same reader the start-policy check used, so the address it judged is the address we bind.
+    let addr = listen_addr();
     let state = AppState::default();
 
     let app = Router::new()
@@ -817,15 +818,42 @@ pub(crate) async fn run_http() {
         )
         .with_state(state);
 
-    let listener = TcpListener::bind(&addr).await.unwrap();
+    // A port already in use is the most ordinary thing that can go wrong on someone else's machine,
+    // and it used to answer with a Rust panic and a backtrace hint. Our own CI found it: six jobs
+    // died on `AddrInUse` because the runner shares a host with a service already holding 8080.
+    // A server whose entire claim is "check, do not trust" cannot fall over with a stack trace on
+    // the first obstacle — it says what happened, in terms of the setting the operator controls.
+    let listener = match TcpListener::bind(&addr).await {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!(
+                "Cannot listen on {}: {}.{}",
+                addr,
+                e,
+                match e.kind() {
+                    std::io::ErrorKind::AddrInUse =>
+                        " Something else already holds that port — stop it, or set MCP_ADDR to a free one.",
+                    std::io::ErrorKind::PermissionDenied =>
+                        " Ports below 1024 need privileges this server deliberately does not have; set MCP_ADDR higher.",
+                    std::io::ErrorKind::AddrNotAvailable =>
+                        " No interface on this machine has that address; set MCP_ADDR to one that exists.",
+                    _ => "",
+                }
+            );
+            std::process::exit(1);
+        }
+    };
     eprintln!("MCP HTTP listening on http://{}", addr);
     // ConnectInfo: the rate limiter needs the peer address (headers are client-controlled, so untrusted).
-    axum::serve(
+    if let Err(e) = axum::serve(
         listener,
         app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
     )
     .await
-    .unwrap();
+    {
+        eprintln!("HTTP server stopped: {}", e);
+        std::process::exit(1);
+    }
 }
 
 /// `DELETE /mcp` — explicit session termination (Streamable HTTP). Without it a client had no way

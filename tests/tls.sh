@@ -18,7 +18,9 @@ command -v openssl >/dev/null || { echo 'openssl required'; exit 1; }
 [ -x "$BIN" ] || { echo "binary not found: $BIN"; exit 1; }
 
 DIR=$(mktemp -d); PGPW=tls_$RANDOM
-PGPORT_TLS=${PGPORT_TLS:-15501}
+# Asked for rather than assumed — see tests/free_port.sh for what a constant costs on a machine the
+# suite does not own.
+PGPORT_TLS=${PGPORT_TLS:-$("$(dirname "$0")/free_port.sh")}
 cleanup(){ docker rm -f tls_pg >/dev/null 2>&1; rm -rf "$DIR"; }
 trap cleanup EXIT
 
