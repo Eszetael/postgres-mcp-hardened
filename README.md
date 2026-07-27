@@ -1,5 +1,26 @@
 # postgres-mcp-hardened
 
+> ### 🚧 Work in progress — public so the work is visible, not because it is finished
+>
+> No release has been announced and none is submitted to any registry. It is public because that is
+> how the tooling gets to run, and because there is nothing here worth hiding.
+>
+> **What is actually proven**, in the sense that something other than an opinion checks it: the
+> read-only rules (a fuzz harness over 200k mutations, an adversarial corpus of every bypass found
+> so far, PostgreSQL 13–18); the authorisation path end to end; protocol conformance, checked by the
+> official MCP SDK rather than by our own tests; and the release path, whose signatures have been
+> verified by hand — including that a tampered file and a wrong identity are both rejected.
+>
+> **What is not**: nobody outside this project has run it in anger. The binaries for macOS and
+> Windows are built and signed but have never been *started* on those platforms. Nine adversarial
+> rounds and one independent review each found something real; there is no evidence that rate has
+> reached zero, and the honest reading is that round eleven would find something too.
+>
+> Known limits, and the places we were wrong, are written down rather than tidied away:
+> [`THREAT_MODEL.md`](THREAT_MODEL.md), [`docs/AUDIT_2026-07-26.md`](docs/AUDIT_2026-07-26.md).
+> If you find something, [`SECURITY.md`](SECURITY.md) says how to say so.
+
+
 **The official Postgres MCP server was deprecated in 2024 and still gets ~440k downloads a month. Its entire defence is one database-level read-only transaction — and that alone does not stop every write. This is a maintained Rust replacement with defence in depth.**
 
 A drop-in [Model Context Protocol](https://modelcontextprotocol.io) server that lets an AI agent query PostgreSQL — **read-only, enforced at the database level**, with real SQL validation, timeouts, cost limits, OAuth 2.1, and an audit trail. Speaks **Streamable HTTP** and stdio, and negotiates the MCP revision: `2025-11-25` (current), `2025-06-18` (what shipping clients speak today), and `2026-07-28` behind a switch while it is still a draft.
