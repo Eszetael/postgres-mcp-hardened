@@ -502,6 +502,38 @@ done
 stop
 rm -f "$PAUD"
 
+section "Answering \"would this index help\" without creating one"
+# The capability the leading alternative is known for — and it reaches it by defaulting to a
+# connection that can create real indexes. hypopg registers the index in backend memory only, so a
+# server that cannot write anything can still answer the question. Installed here rather than
+# skipped: a test that skips itself when a dependency is missing has quietly stopped running.
+PGMAJ=$(docker exec acc_pg psql -U postgres -At -c "SHOW server_version_num" 2>/dev/null | cut -c1-2)
+docker exec acc_pg bash -lc "apt-get update -qq >/dev/null 2>&1 && apt-get install -y -qq postgresql-${PGMAJ}-hypopg >/dev/null 2>&1" || true
+if docker exec -i acc_pg psql -U postgres -q -c "CREATE EXTENSION IF NOT EXISTS hypopg" >/dev/null 2>&1; then
+  docker exec -i acc_pg psql -U postgres -q -v ON_ERROR_STOP=1 >/dev/null <<'SQL'
+CREATE TABLE idxdemo(id int, payload text);
+INSERT INTO idxdemo SELECT g, md5(g::text) FROM generate_series(1,50000) g;
+ANALYZE idxdemo;
+SQL
+  start DATABASE_URL="$URL"
+  s(){ tool simulate_index "$1" | body; }
+  r=$(s '{"sql":"SELECT * FROM idxdemo WHERE id = 42","table":"public.idxdemo","columns":["id"]}')
+  echo "$r" | grep -q '"planner_switched_to_it":true' && ok "an index that helps is reported as one the planner would use" || no "helpful index not recognised" "$r"
+  echo "$r" | grep -q '"improvement_factor"' && ok "and the answer carries the estimated improvement" || no "no improvement factor" "$r"
+  r=$(s '{"sql":"SELECT * FROM idxdemo WHERE id = 42","table":"public.idxdemo","columns":["payload"]}')
+  echo "$r" | grep -q '"planner_switched_to_it":false' && ok "an index that does not help is reported as ignored, not as an improvement" || no "useless index oversold" "$r"
+  # The tool takes columns, never DDL. Both of these have to die on the catalogue lookup.
+  r=$(s '{"sql":"SELECT * FROM idxdemo WHERE id = 42","table":"public.idxdemo","columns":["id) ; DROP TABLE idxdemo; --"]}')
+  case "$r" in *"no column"*) ok "a column name carrying SQL is refused by the catalogue lookup";; *) no "injection through a column name" "$r";; esac
+  r=$(s '{"sql":"DELETE FROM idxdemo","table":"public.idxdemo","columns":["id"]}')
+  case "$r" in *"non-read-only"*) ok "a write cannot be smuggled in as the query to optimise";; *) no "write accepted for simulation" "$r";; esac
+  stop
+  n=$(docker exec acc_pg psql -U postgres -At -c "SELECT count(*) FROM pg_indexes WHERE tablename='idxdemo'" 2>/dev/null)
+  [ "$n" = "0" ] && ok "and after all of that the table still has no indexes at all" || no "an index was really created" "count=$n"
+else
+  no "hypopg could not be installed in the fixture" "the simulation path went untested"
+fi
+
 section "The denylist is checked against the database, not against my memory of it"
 # The list of side-effect functions is a snapshot of a moment. PostgreSQL 18 added seventy functions
 # to pg_catalog, five of which write. They were all refused already — the family rules caught them —

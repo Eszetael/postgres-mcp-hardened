@@ -1209,7 +1209,8 @@ static SECRET_CMP_KEY: Lazy<Vec<u8>> = Lazy::new(|| {
 pub(crate) fn required_scope(tool: &str) -> &'static str {
     match tool {
         // Runs caller-supplied SQL.
-        "query" | "explain_query" => "mcp:query",
+        // Takes caller SQL and plans it, like explain_query.
+        "query" | "explain_query" | "simulate_index" => "mcp:query",
         // Metadata about the database: schemas, tables, health, index and query statistics.
         "list_tables" | "list_schemas" | "describe_table" | "database_health"
         | "analyze_indexes" | "top_queries" => "mcp:read",
@@ -1554,6 +1555,28 @@ pub(crate) fn handle_tools_list() -> Value {
                 "type": "object",
                 "properties": { "database": { "type": "string", "description": "which configured database to use; omit when only one is configured" } }
             })
+        ),
+        tool_def(
+            "simulate_index",
+            "Would this index help?",
+            "Answers whether an index would change the plan for a given query — WITHOUT creating it. Uses the hypopg extension, which registers the index in \
+             backend memory only: the planner sees it, storage never does, and it is gone when the call returns. Give the query, the table and the columns; \
+             the index definition is assembled here, so there is no way to send DDL through this tool. Returns the plan and cost with and without, and \
+             whether the planner actually reached for it — a cost that barely moves and an index the planner ignored are different answers. These are \
+             planner ESTIMATES, not measured times: treat a big improvement as a reason to test the index, not as proof. Needs hypopg installed; says so \
+             plainly, with the package name, when it is missing.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "sql": { "type": "string", "description": "the read-only query the index is supposed to help" },
+                    "table": { "type": "string", "description": "the table to index, `schema.table` or just `table` (defaults to the `schema` field, then to public)" },
+                    "columns": { "type": "array", "items": { "type": "string" }, "minItems": 1, "maxItems": 32, "description": "column names, in index order" },
+                    "using": { "type": "string", "enum": ["btree", "hash", "gin", "gist", "spgist", "brin"], "default": "btree", "description": "access method" },
+                    "schema": { "type": "string", "default": "public", "description": "used only when `table` is unqualified" },
+                    "database": { "type": "string", "description": "which configured database to use; omit when only one is configured" }
+                },
+                "required": ["sql", "table", "columns"]
+            }),
         ),
         tool_def(
             "analyze_indexes",
@@ -1945,6 +1968,72 @@ pub(crate) fn handle_top_queries(args: &Value) -> Value {
 
 /// Index findings that are cheap to compute and expensive to notice by hand: indexes nobody uses,
 /// duplicates, and tables scanned sequentially often enough that an index would likely pay off.
+/// "Would this index help?" — answered without creating one.
+///
+/// The argument shape is deliberate: a table name, a list of columns, an access method from a fixed
+/// list. NOT a CREATE INDEX statement. A tool that accepted DDL from a model would be a tool that
+/// accepts DDL from a model, whatever it promised to do with it.
+pub(crate) fn handle_simulate_index(args: &Value) -> Value {
+    let db = args.get("database").and_then(|v| v.as_str());
+    let sql = match args.get("sql").and_then(|v| v.as_str()) {
+        Some(s) => s,
+        None => {
+            return err_content(
+                -32602,
+                "missing 'sql': the query the index is meant to help".into(),
+            )
+        }
+    };
+    if let Err(e) = validate::validate_readonly(sql) {
+        audit("simulate_index", "denied_validation", Some(sql));
+        return err_content(-32602, e.to_string());
+    }
+    let table = match args.get("table").and_then(|v| v.as_str()) {
+        Some(t) => t,
+        None => return err_content(-32602, "missing 'table'".into()),
+    };
+    // `public.orders` in one field is what a model will send, so accept it rather than making the
+    // caller guess which field the schema belongs in.
+    let (schema, table) = match table.split_once('.') {
+        Some((s, t)) => (s.to_string(), t.to_string()),
+        None => (
+            args.get("schema")
+                .and_then(|v| v.as_str())
+                .unwrap_or("public")
+                .to_string(),
+            table.to_string(),
+        ),
+    };
+    let columns: Vec<String> = match args.get("columns").and_then(|v| v.as_array()) {
+        Some(a) => a
+            .iter()
+            .filter_map(|v| v.as_str().map(|s| s.to_string()))
+            .collect(),
+        None => {
+            return err_content(
+                -32602,
+                "missing 'columns' (an array of column names)".into(),
+            )
+        }
+    };
+    let method = args
+        .get("using")
+        .and_then(|v| v.as_str())
+        .unwrap_or("btree")
+        .to_lowercase();
+
+    match db::simulate_index(sql, &schema, &table, &columns, &method, db) {
+        Ok(v) => {
+            audit("simulate_index", "allowed", Some(sql));
+            ok_content(&v)
+        }
+        Err(e) => {
+            audit("simulate_index", "error", Some(sql));
+            err_content(-32000, e)
+        }
+    }
+}
+
 pub(crate) fn handle_analyze_indexes(args: &Value) -> Value {
     let db = args.get("database").and_then(|v| v.as_str());
     let schema = args
@@ -2091,6 +2180,7 @@ pub(crate) fn handle_tools_call(params: &Value) -> Value {
         "database_health" => handle_database_health(&args),
         "top_queries" => handle_top_queries(&args),
         "analyze_indexes" => handle_analyze_indexes(&args),
+        "simulate_index" => handle_simulate_index(&args),
         "security_posture" => posture::handle_security_posture(&args),
         _ => json!({ "error": { "code": -32601, "message": format!("Unknown tool: {}", name) } }),
     }

@@ -96,6 +96,10 @@
       "description": "What this server can and cannot do"
     },
     {
+      "name": "simulate_index",
+      "description": "Would this index help?"
+    },
+    {
       "name": "analyze_indexes",
       "description": "Index findings"
     }

@@ -312,6 +312,24 @@ the thing that authorised and the thing that executes saw two different requests
 stating a version we do not implement is told so (`-32022`) rather than quietly served under a
 contract it never agreed to.
 
+## Would this index help? — answered without creating one
+
+The one capability the leading alternative is genuinely known for is index tuning: it can tell you
+an index would pay off before you build it. It gets there by defaulting to a connection that can
+create real indexes — safe only if you remembered to restrict it.
+
+`simulate_index` answers the same question from a connection that cannot write anything.
+[hypopg](https://github.com/HypoPG/hypopg) registers a hypothetical index in backend memory: the
+planner sees it, storage never does, and it is gone when the call returns. You get the plan and cost
+with and without, and — separately — whether the planner actually reached for it, because a cost
+that barely moves and an index the planner ignored are different answers.
+
+The tool takes a table and a list of columns. **Not a `CREATE INDEX` statement.** The definition is
+assembled server-side from identifiers the catalogue confirmed exist, quoted by PostgreSQL itself,
+so there is no path from a tool argument to arbitrary DDL — a column name carrying SQL dies on the
+catalogue lookup, and there is a test that fires exactly that. The numbers are planner estimates:
+treat a large improvement as a reason to test the index, not as proof.
+
 ## Conformance is checked by somebody else's client
 
 Every other test here is our harness talking to our server. If we misread the specification, we

@@ -809,3 +809,218 @@ mod tests {
         assert!(dump.contains("\"ada\"") && dump.contains("\"id\":2"));
     }
 }
+
+/// Ask the planner what a query would cost IF an index existed, without creating one.
+///
+/// `hypopg` registers a hypothetical index in backend memory: the planner sees it, storage never
+/// does, and it disappears with the session. That is what makes this possible on a server whose
+/// whole promise is that it cannot change anything — the leading alternative offers the same
+/// capability, but reaches it by defaulting to a connection that can create real indexes.
+///
+/// The caller never supplies DDL. The index definition is assembled here from identifiers the
+/// CATALOGUE confirmed exist, quoted by PostgreSQL itself via `quote_ident`, so there is no path
+/// from a tool argument to arbitrary SQL. The access method comes from a fixed list.
+///
+/// Both plans come from ONE connection inside ONE read-only transaction, because a hypothetical
+/// index belongs to the session that made it: a pooled second connection would measure a database
+/// that never heard of it.
+pub(crate) fn simulate_index(
+    query_sql: &str,
+    schema: &str,
+    table: &str,
+    columns: &[String],
+    method: &str,
+    db: Option<&str>,
+) -> Result<Value, String> {
+    const METHODS: &[&str] = &["btree", "hash", "gin", "gist", "spgist", "brin"];
+    if !METHODS.contains(&method) {
+        return Err(format!(
+            "unsupported index method {method:?}; use one of: {}",
+            METHODS.join(", ")
+        ));
+    }
+    if columns.is_empty() {
+        return Err("at least one column is required".into());
+    }
+    if columns.len() > 32 {
+        return Err("an index over more than 32 columns is not something to simulate".into());
+    }
+
+    let pool = pool_for(db)?;
+    let mut client = pool.get().map_err(|_| pool_error_detail(db))?;
+    client
+        .batch_execute("DISCARD ALL")
+        .map_err(|e| e.to_string())?;
+    client
+        .batch_execute(&format!(
+            "SET statement_timeout='{}'; SET idle_in_transaction_session_timeout='10s'; \
+             SET default_transaction_read_only=on;{}",
+            statement_timeout(),
+            search_path_stmt()
+        ))
+        .map_err(|e| e.to_string())?;
+
+    // Is the extension even here? Saying so precisely is worth more than a failure the caller has to
+    // decode — the same courtesy pg_stat_statements gets.
+    let has: bool = client
+        .query_one(
+            "SELECT EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'hypopg')",
+            &[],
+        )
+        .map_err(|e| e.to_string())?
+        .get(0);
+    if !has {
+        let available: bool = client
+            .query_one(
+                "SELECT EXISTS (SELECT 1 FROM pg_available_extensions WHERE name = 'hypopg')",
+                &[],
+            )
+            .map(|r| r.get(0))
+            .unwrap_or(false);
+        return Err(if available {
+            "the hypopg extension is installed on this server but not enabled in this database — \
+             run CREATE EXTENSION hypopg (needs a role that may create extensions; this server \
+             cannot and should not do it for you)"
+                .into()
+        } else {
+            "index simulation needs the hypopg extension, which is not installed on this server \
+             (Debian/Ubuntu: postgresql-<version>-hypopg, then CREATE EXTENSION hypopg). Nothing \
+             else in this server requires it."
+                .into()
+        });
+    }
+
+    // The identifiers are checked against the catalogue and quoted BY POSTGRES. A name that does not
+    // exist stops here with a message naming it, rather than becoming part of a statement.
+    let row = client
+        .query_opt(
+            "SELECT quote_ident(n.nspname), quote_ident(c.relname) \
+               FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+              WHERE n.nspname = $1 AND c.relname = $2 AND c.relkind IN ('r','m','p')",
+            &[&schema, &table],
+        )
+        .map_err(|e| e.to_string())?;
+    let (qschema, qtable): (String, String) = match row {
+        Some(r) => (r.get(0), r.get(1)),
+        None => return Err(format!("no table {schema}.{table} that this role can see")),
+    };
+
+    let mut quoted_cols: Vec<String> = Vec::with_capacity(columns.len());
+    for col in columns {
+        let r = client
+            .query_opt(
+                "SELECT quote_ident(a.attname) FROM pg_attribute a \
+                   JOIN pg_class c ON c.oid = a.attrelid \
+                   JOIN pg_namespace n ON n.oid = c.relnamespace \
+                  WHERE n.nspname = $1 AND c.relname = $2 AND a.attname = $3 \
+                    AND a.attnum > 0 AND NOT a.attisdropped",
+                &[&schema, &table, &col],
+            )
+            .map_err(|e| e.to_string())?;
+        match r {
+            Some(r) => quoted_cols.push(r.get(0)),
+            None => return Err(format!("{schema}.{table} has no column {col:?}")),
+        }
+    }
+    let ddl = format!(
+        "CREATE INDEX ON {qschema}.{qtable} USING {method} ({})",
+        quoted_cols.join(", ")
+    );
+
+    client
+        .batch_execute("BEGIN TRANSACTION READ ONLY")
+        .map_err(|e| e.to_string())?;
+
+    let plan = |c: &mut postgres::Client, sql: &str| -> Result<Value, String> {
+        let stmt = format!("EXPLAIN (FORMAT JSON) {sql}");
+        let r = c
+            .query_one(stmt.as_str(), &[])
+            .map_err(|e| friendly_pg_error_for(&e, Some(sql)))?;
+        // EXPLAIN (FORMAT JSON) returns a `json` column, not text. Reading it as a String panicked
+        // the worker thread and surfaced as "internal task error" — a message that tells the caller
+        // nothing and tells us nothing either. `try_get` so a type surprise is an error, not a panic.
+        r.try_get::<_, Value>(0)
+            .map_err(|e| format!("could not read the plan: {e}"))
+    };
+
+    let result = (|| -> Result<Value, String> {
+        let before = plan(&mut client, query_sql)?;
+        client
+            .query_one(
+                "SELECT indexname::text FROM hypopg_create_index($1)",
+                &[&ddl],
+            )
+            .map_err(|e| format!("hypopg refused the index definition: {e}"))?;
+        let after = plan(&mut client, query_sql)?;
+
+        let cost =
+            |p: &Value| -> Option<f64> { p.get(0)?.get("Plan")?.get("Total Cost")?.as_f64() };
+        let (c0, c1) = (cost(&before), cost(&after));
+        // Whether the planner actually reached for it. A cost that barely moves and an index the
+        // planner ignored are different answers, and the second one is the useful one.
+        let used = uses_hypothetical_index(&after);
+        Ok(json!({
+            "index_considered": ddl,
+            "cost_without_index": c0,
+            "cost_with_hypothetical_index": c1,
+            "improvement_factor": match (c0, c1) {
+                (Some(a), Some(b)) if b > 0.0 => Some((a / b * 100.0).round() / 100.0),
+                _ => None,
+            },
+            "planner_switched_to_it": used,
+            "plan_without_index": before,
+            "plan_with_hypothetical_index": after,
+            "note": "The index was never created. These are planner ESTIMATES, not measured times: \
+                     a lower estimated cost is a reason to test the index, not proof that it helps."
+        }))
+    })();
+
+    let _ = client.batch_execute("ROLLBACK");
+    let _ = client.batch_execute("SELECT hypopg_reset()");
+    result
+}
+
+/// Did the planner actually reach for the hypothetical index?
+///
+/// hypopg names its indexes `<oid>method_table_cols`, and that leading angle bracket distinguishes
+/// "the planner chose the index we invented" from "the planner was already using a real one". The
+/// first version of this searched the serialised JSON for a substring and got the answer wrong on
+/// the very first test — the formatting it assumed was not the formatting serde produces. Walking
+/// the structure asks the question the plan actually answers, and cannot be broken by whitespace.
+fn uses_hypothetical_index(plan: &Value) -> bool {
+    match plan {
+        Value::Object(map) => {
+            if let Some(Value::String(name)) = map.get("Index Name") {
+                if name.starts_with('<') {
+                    return true;
+                }
+            }
+            map.values().any(uses_hypothetical_index)
+        }
+        Value::Array(items) => items.iter().any(uses_hypothetical_index),
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+mod hypo_tests {
+    use super::*;
+
+    #[test]
+    fn a_hypothetical_index_is_told_apart_from_a_real_one() {
+        // hypopg's own naming, nested where a plan really puts it.
+        let hypo = json!([{ "Plan": { "Node Type": "Index Scan",
+            "Index Name": "<13630>btree_big_id" } }]);
+        assert!(uses_hypothetical_index(&hypo));
+        // A plan that was already using a real index is NOT a success for the simulation.
+        let real = json!([{ "Plan": { "Node Type": "Index Scan", "Index Name": "big_pkey" } }]);
+        assert!(!uses_hypothetical_index(&real));
+        // Nested under a parent node, which is where it lands in anything non-trivial.
+        let nested = json!([{ "Plan": { "Node Type": "Nested Loop", "Plans": [
+            { "Node Type": "Seq Scan" },
+            { "Node Type": "Index Scan", "Index Name": "<42>btree_t_c" }] } }]);
+        assert!(uses_hypothetical_index(&nested));
+        let seq = json!([{ "Plan": { "Node Type": "Seq Scan", "Relation Name": "big" } }]);
+        assert!(!uses_hypothetical_index(&seq));
+    }
+}

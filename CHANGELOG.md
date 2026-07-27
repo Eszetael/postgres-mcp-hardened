@@ -19,6 +19,10 @@ alternative to the deprecated `@modelcontextprotocol/server-postgres`.
 - **Signed releases:** every artefact is signed with Sigstore keyless signing, verifiable with
   `cosign verify-blob` against the workflow identity; public releases additionally carry SLSA
   build provenance. Release actions are pinned to commit hashes, not moving tags.
+- **Index tuning without write access:** `simulate_index` uses hypopg to ask the planner what a
+  query would cost if an index existed, then throws the hypothesis away. The tool takes a table and
+  columns rather than DDL, and builds the definition from catalogue-verified, PostgreSQL-quoted
+  identifiers.
 - **One authorisation policy, not one per mechanism:** the same methods require credentials whether
   the deployment uses a shared token or OAuth. `resources/read` and `resources/list` need a read
   scope, because table and column names are data. The single exception is `server/discover`, which
