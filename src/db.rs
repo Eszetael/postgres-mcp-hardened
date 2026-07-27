@@ -108,8 +108,8 @@ pub(crate) fn normalize_sslmode(url: &str) -> String {
 /// through `MCP_SSLROOTCERT`. WHETHER TLS is used follows from `sslmode` in DATABASE_URL
 /// (`disable` = no TLS, `prefer` = default, `require`/`verify-full` = mandatory).
 pub(crate) fn build_tls() -> Result<PgTls, String> {
-    // rustls 0.23 wymaga jawnego wyboru dostawcy kryptografii; ring = czysty Rust, bez OpenSSL
-    // (obraz jest distroless — nie ma tam libssl).
+    // rustls 0.23 requires an explicit crypto provider; ring is pure Rust, no OpenSSL — which the
+    // distroless image does not carry.
     let _ = rustls::crypto::ring::default_provider().install_default();
 
     let mut roots = rustls::RootCertStore::empty();

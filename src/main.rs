@@ -11,7 +11,6 @@
 
 use serde_json::{json, Value};
 mod audit_log;
-#[allow(dead_code)]
 mod auth;
 mod db;
 mod fuzz;
@@ -76,7 +75,7 @@ pub(crate) async fn main() {
         }
         return;
     }
-    // Dev/CI/auto-research: deterministyczny fuzz walidatora (bez bazy, bez LLM).
+    // Dev/CI/auto-research: a deterministic validator fuzz — no database, no LLM.
     // `--fuzz [iterations] [seed]`; exits 1 when an invariant breaks (suitable as a CI gate).
     if let Some(pos) = args.iter().position(|a| a == "--fuzz") {
         let iters: u64 = args
@@ -713,7 +712,7 @@ pub(crate) fn preflight_config() {
     }
 }
 
-// --- STDIO TRANSPORT (stara logika main, bez zmian) ---
+// --- STDIO TRANSPORT ---
 pub(crate) fn run_stdio() {
     use std::io::{self, BufRead, Write};
     // One key for the whole session: stdio has a single peer by construction, so the limiter measures
@@ -968,7 +967,7 @@ pub(crate) async fn mcp_handler(
             return (StatusCode::SERVICE_UNAVAILABLE, hdrs, Json(body)).into_response();
         }
     };
-    // OAuth 2.1: egzekwuj token+scope (aktywne gdy JWT_PUBKEY_PEM ustawiony); initialize/tools/list pomijane.
+    // OAuth 2.1: enforce token and scope (active once JWT_PUBKEY_PEM is set).
     let caller = match enforce_auth(&headers, &req) {
         Ok(c) => c,
         Err((status, msg, tenant)) => {
@@ -1032,7 +1031,7 @@ pub(crate) async fn mcp_handler(
                 .into_response();
         }
     }
-    // 1. NIE MA "id" → to notyfikacja → 202 Accepted, bez body
+    // 1. No "id" means a notification: 202 Accepted with no body.
     if req.is_object() && req.get("id").is_none() {
         // optionally: handle_request(&req) could be called here fire-and-forget
         return (
@@ -1369,7 +1368,7 @@ use axum::http::header::CONTENT_TYPE;
 pub(crate) const PRIVATE_NS: &str = "io.github.eszetael.postgres-mcp-hardened";
 
 pub(crate) fn handle_request(req: &Value) -> Value {
-    // Walidacja wersji JSON-RPC
+    // JSON-RPC version check.
     if req.get("jsonrpc") != Some(&json!("2.0")) {
         return json!({ "error": { "code": -32600, "message": "Invalid Request: jsonrpc must be 2.0" } });
     }
@@ -2250,7 +2249,7 @@ pub(crate) fn handle_query_tool(args: &Value) -> Value {
         None => return json!({ "error": { "code": -32602, "message": "Missing 'sql' argument" } }),
     };
 
-    // 1. Walidacja read-only
+    // 1. Read-only validation.
     if let Err(e) = validate::validate_readonly(sql) {
         audit("query", "denied_validation", Some(sql));
         METRICS.denied_validation.fetch_add(1, Ordering::Relaxed);

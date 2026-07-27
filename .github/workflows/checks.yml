@@ -88,12 +88,12 @@ jobs:
           curl -s -H content-type:application/json http://127.0.0.1:8080/mcp \
             -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"query","arguments":{"sql":"CREATE TABLE t(x int)"}}}' | grep -q 'non-read-only'
 
-      # Zadanie chodzi w kontenerze jako root, a `target/` i katalog roboczy zostają na dysku
-      # wspólnym z zadaniami spoza kontenera. Bez tego kroku następne zadanie na hoście padało już
-      # na `actions/checkout`: "EACCES: permission denied, unlink target/CACHEDIR.TAG" — nie umiało
-      # posprzątać plików, których nie jest właścicielem. `--reference` bierze właściciela z katalogu,
-      # który tworzy sam runner, więc nie wpisujemy tu na sztywno żadnego UID.
-      - name: Oddaj katalog roboczy użytkownikowi runnera
+      # This job runs as root inside the container, and `target/` outlives it on a disk shared with
+      # jobs that do not run in a container. Without this step the next such job died in
+      # `actions/checkout` with "EACCES: permission denied, unlink target/CACHEDIR.TAG" — it could
+      # not clean up files it does not own. `--reference` takes the owner from the directory the
+      # runner itself creates, so no UID is hardcoded here and this is a no-op on a hosted runner.
+      - name: Hand the workspace back to the runner's user
         if: always()
         run: chown -R --reference="$RUNNER_WORKSPACE" "$RUNNER_WORKSPACE" || true
 
@@ -159,12 +159,12 @@ jobs:
           ADV_URL: postgres://postgres:ci@postgres:5432/postgres  # pragma: allowlist secret
         run: ./tests/adversarial/run.sh
 
-      # Zadanie chodzi w kontenerze jako root, a `target/` i katalog roboczy zostają na dysku
-      # wspólnym z zadaniami spoza kontenera. Bez tego kroku następne zadanie na hoście padało już
-      # na `actions/checkout`: "EACCES: permission denied, unlink target/CACHEDIR.TAG" — nie umiało
-      # posprzątać plików, których nie jest właścicielem. `--reference` bierze właściciela z katalogu,
-      # który tworzy sam runner, więc nie wpisujemy tu na sztywno żadnego UID.
-      - name: Oddaj katalog roboczy użytkownikowi runnera
+      # This job runs as root inside the container, and `target/` outlives it on a disk shared with
+      # jobs that do not run in a container. Without this step the next such job died in
+      # `actions/checkout` with "EACCES: permission denied, unlink target/CACHEDIR.TAG" — it could
+      # not clean up files it does not own. `--reference` takes the owner from the directory the
+      # runner itself creates, so no UID is hardcoded here and this is a no-op on a hosted runner.
+      - name: Hand the workspace back to the runner's user
         if: always()
         run: chown -R --reference="$RUNNER_WORKSPACE" "$RUNNER_WORKSPACE" || true
 
@@ -313,12 +313,12 @@ jobs:
           for _ in $(seq 1 30); do curl -sf -H "authorization: Bearer $TOK" http://127.0.0.1:8123/health >/dev/null && break; sleep 1; done
           node probe.mjs
 
-      # Zadanie chodzi w kontenerze jako root, a `target/` i katalog roboczy zostają na dysku
-      # wspólnym z zadaniami spoza kontenera. Bez tego kroku następne zadanie na hoście padało już
-      # na `actions/checkout`: "EACCES: permission denied, unlink target/CACHEDIR.TAG" — nie umiało
-      # posprzątać plików, których nie jest właścicielem. `--reference` bierze właściciela z katalogu,
-      # który tworzy sam runner, więc nie wpisujemy tu na sztywno żadnego UID.
-      - name: Oddaj katalog roboczy użytkownikowi runnera
+      # This job runs as root inside the container, and `target/` outlives it on a disk shared with
+      # jobs that do not run in a container. Without this step the next such job died in
+      # `actions/checkout` with "EACCES: permission denied, unlink target/CACHEDIR.TAG" — it could
+      # not clean up files it does not own. `--reference` takes the owner from the directory the
+      # runner itself creates, so no UID is hardcoded here and this is a no-op on a hosted runner.
+      - name: Hand the workspace back to the runner's user
         if: always()
         run: chown -R --reference="$RUNNER_WORKSPACE" "$RUNNER_WORKSPACE" || true
 

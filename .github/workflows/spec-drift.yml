@@ -17,8 +17,8 @@ permissions:
 
 jobs:
   identifier:
-    # Ta sama zmienna co reszta — bo ten przepływ padł 27.07 z zerem kroków, odrzucony przez
-    # wyczerpany limit maszyn GitHuba, a wyglądało to jak wykryty rozjazd specyfikacji.
+    # The same variable as every other job. This workflow once failed with zero steps, rejected by
+    # exhausted hosted-runner minutes, and the failure read exactly like a detected spec drift.
     runs-on: ${{ vars.RUNNER_LABEL || 'ubuntu-latest' }}
     steps:
       - uses: actions/checkout@v4

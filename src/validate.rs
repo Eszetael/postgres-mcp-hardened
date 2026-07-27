@@ -1045,7 +1045,7 @@ const DENY_FAMILIES: &[&str] = &[
     "database_to_",
     "lo_",
     "lowrite",
-    "loread", // large objects: zapis przez deskryptor
+    "loread", // large objects: writes through a descriptor
 ];
 
 /// Pure READS that happen to match a denied family — explicit exceptions, so fail-closed does not
@@ -1186,7 +1186,7 @@ fn query_is_readonly(q: &Query) -> bool {
 fn setexpr_is_readonly(se: &SetExpr) -> bool {
     match se {
         // `SELECT ... INTO new_table` CREATES a table (a write) even though it is structurally a Select —
-        // Postgres: "cannot execute SELECT INTO in a read-only transaction" (znalezione przez
+        // Postgres: "cannot execute SELECT INTO in a read-only transaction" (found by
         // found by the parser-differential harness. Reject whenever the `into` field is set.
         SetExpr::Select(s) => s.into.is_none(),
         SetExpr::Values(_) | SetExpr::Table(_) => true,
@@ -1610,7 +1610,7 @@ mod adversarial {
         r#"WITH i AS (INSERT INTO t VALUES(1) RETURNING *) SELECT * FROM i"#,
         // Multi-statement
         r#"SELECT 1; DROP TABLE users"#,
-        // Komentarz-prefix (sqlparser ignoruje komentarze, parsuje jako DROP/DELETE)
+        // A comment prefix: sqlparser skips comments and parses this as DROP/DELETE.
         r#"/* x */ DROP TABLE users"#,
         r#"-- x\nDELETE FROM t"#,
         // DDL
@@ -1803,7 +1803,7 @@ mod adversarial {
     fn maybe_allow_print() {
         for sql in MAYBE_ALLOW {
             let res = validate_readonly(sql);
-            // Tylko logujemy wynik, nie asertujemy – przydatne przy migracji wersji sqlparser
+            // Logged, not asserted — useful when migrating to a new sqlparser version.
             println!("MAYBE_ALLOW: {:?} -> {:?}", sql, res);
         }
     }

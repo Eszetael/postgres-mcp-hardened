@@ -265,9 +265,9 @@ mod tests {
     use super::*;
     use axum::http::HeaderMap;
 
-    // `check_origin` jest jedyną obroną przed DNS rebindingiem — stroną w przeglądarce, która
-    // rozwiązuje własną nazwę na 127.0.0.1 i przez to rozmawia z serwerem stojącym na pętli
-    // zwrotnej. Do dziś nie miała ani jednego testu, mimo że jest bramą bezpieczeństwa.
+    // `check_origin` is the only defence against DNS rebinding — a browser page that resolves its
+    // own name to 127.0.0.1 and thereby talks to a server bound to loopback. Until now it had not a
+    // single assertion, despite being a security gate.
     fn hdr(pairs: &[(&str, &str)]) -> HeaderMap {
         let mut h = HeaderMap::new();
         for (k, v) in pairs {
@@ -281,8 +281,8 @@ mod tests {
 
     #[test]
     fn a_local_client_without_an_origin_is_allowed() {
-        // Klient MCP na tej samej maszynie (Claude Desktop, curl) nie wysyła Origin — to nie
-        // przeglądarka. Gdyby brama go odrzucała, byłaby bezużyteczna w głównym trybie pracy.
+        // An MCP client on the same machine (Claude Desktop, curl) sends no Origin — it is not a
+        // browser. A gate that refused it would be useless in the server's primary mode.
         assert!(check_origin(&hdr(&[("host", "localhost:8080")]), "127.0.0.1:8080").is_ok());
     }
 
@@ -292,10 +292,10 @@ mod tests {
             &hdr(&[("origin", "https://evil.example")]),
             "127.0.0.1:8080",
         )
-        .expect_err("nieznany origin musi zostać odrzucony");
+        .expect_err("an unlisted origin must be refused");
         assert!(
             e.contains("MCP_ALLOWED_ORIGINS"),
-            "komunikat ma mówić, co ustawić: {e}"
+            "the message must name the setting to change: {e}"
         );
     }
 
@@ -303,14 +303,14 @@ mod tests {
     fn a_lookalike_origin_does_not_pass_as_the_listed_one() {
         std::env::set_var("MCP_ALLOWED_ORIGINS", "https://localhost");
         let ok = check_origin(&hdr(&[("origin", "https://localhost")]), "127.0.0.1:8080");
-        // `https://evil-localhost.com` ZAWIERA `localhost` — test na podciąg przepuściłby to.
+        // `https://evil-localhost.com` CONTAINS `localhost` — a substring test would let it through.
         let bad = check_origin(
             &hdr(&[("origin", "https://evil-localhost.com")]),
             "127.0.0.1:8080",
         );
         std::env::remove_var("MCP_ALLOWED_ORIGINS");
-        assert!(ok.is_ok(), "wypisany origin musi przejść");
-        assert!(bad.is_err(), "podobny origin NIE jest wypisanym originem");
+        assert!(ok.is_ok(), "a listed origin must pass");
+        assert!(bad.is_err(), "a lookalike is NOT the listed origin");
     }
 
     #[test]
@@ -321,21 +321,24 @@ mod tests {
             "127.0.0.1:8080",
         );
         std::env::remove_var("MCP_ALLOWED_ORIGINS");
-        assert!(r.is_ok(), "ukośnik na końcu to ten sam origin, nie inny");
+        assert!(
+            r.is_ok(),
+            "a trailing slash is the same origin, not a different one"
+        );
     }
 
     #[test]
     fn dns_rebinding_is_refused_on_a_loopback_listener() {
-        // Nazwa atakującego rozwiązana na 127.0.0.1 dociera do gniazda; jedyne, co ją odróżnia
-        // od prawdziwego localhosta, to nagłówek Host.
+        // An attacker's name resolved to 127.0.0.1 reaches the socket; the only thing separating it
+        // from a genuine localhost client is the Host header.
         let e = check_origin(
             &hdr(&[("host", "rebind.attacker.example")]),
             "127.0.0.1:8080",
         )
-        .expect_err("obcy Host na pętli zwrotnej to rebinding");
+        .expect_err("a foreign Host on a loopback listener is rebinding");
         assert!(
             e.contains("MCP_ALLOWED_HOSTS"),
-            "komunikat ma wskazać wyjście: {e}"
+            "the message must point at the way out: {e}"
         );
     }
 
@@ -346,14 +349,14 @@ mod tests {
         std::env::remove_var("MCP_ALLOWED_HOSTS");
         assert!(
             named.is_ok(),
-            "port w nagłówku Host nie może unieważnić dopuszczonej nazwy"
+            "a port in the Host header must not invalidate an allowed name"
         );
     }
 
     #[test]
     fn a_network_listener_does_not_get_the_loopback_host_check() {
-        // Poza pętlą zwrotną serwer i tak stoi za bramą startową (token/OAuth), a nazwa hosta
-        // jest wtedy zwyczajnie cudza — wymuszanie „localhost" blokowałoby normalne wdrożenia.
+        // Off loopback the server already sits behind the start-up gate (token/OAuth), and the host
+        // name is legitimately somebody else's — demanding "localhost" would block real deployments.
         assert!(check_origin(&hdr(&[("host", "mcp.example.com")]), "0.0.0.0:8080").is_ok());
     }
 
@@ -362,12 +365,12 @@ mod tests {
         let out = render_metrics();
         assert!(
             out.contains("# TYPE"),
-            "brak nagłówków TYPE — to nie jest format Prometheusa"
+            "no TYPE headers — this is not the Prometheus exposition format"
         );
         assert!(
             out.lines()
                 .all(|l| l.is_empty() || l.starts_with('#') || l.contains(' ')),
-            "każda linia to komentarz albo para nazwa-wartość"
+            "every line is a comment or a name/value pair"
         );
     }
 }
