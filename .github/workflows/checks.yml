@@ -34,7 +34,11 @@ jobs:
           POSTGRES_PASSWORD: ci  # pragma: allowlist secret - throwaway CI database, dies with the runner
         options: >-
           --health-cmd pg_isready --health-interval 5s --health-timeout 5s --health-retries 10
-        ports: ["5432:5432"]
+        # Port hosta 15432, nie 5432: własny runner stoi na maszynie, na której działa PRODUKCYJNA baza
+        # Tempusa na 5432. Kontener usługowy przegrywał "driver failed programming external
+        # connectivity" i wszystkie zadania z bazą padały — konsekwencja, której nie dało się
+        # zobaczyć bez uruchomienia CI na własnym sprzęcie. Na maszynach GitHuba działa tak samo.
+        ports: ["15432:5432"]
     steps:
       - uses: actions/checkout@v4
       # rustup honours rust-toolchain.toml, so the version stays in exactly one file.
@@ -62,7 +66,7 @@ jobs:
 
       - name: Smoke test against a live database (reads work, writes rejected)
         env:
-          DATABASE_URL: postgres://postgres:ci@127.0.0.1:5432/postgres  # pragma: allowlist secret
+          DATABASE_URL: postgres://postgres:ci@127.0.0.1:15432/postgres  # pragma: allowlist secret
         run: |
           cargo build --locked --release
           ./target/release/postgres-mcp-hardened --validate "SELECT 1" | grep -q ALLOW
@@ -104,7 +108,11 @@ jobs:
           POSTGRES_PASSWORD: ci  # pragma: allowlist secret - throwaway CI database, dies with the runner
         options: >-
           --health-cmd pg_isready --health-interval 5s --health-timeout 5s --health-retries 10
-        ports: ["5432:5432"]
+        # Port hosta 15432, nie 5432: własny runner stoi na maszynie, na której działa PRODUKCYJNA baza
+        # Tempusa na 5432. Kontener usługowy przegrywał "driver failed programming external
+        # connectivity" i wszystkie zadania z bazą padały — konsekwencja, której nie dało się
+        # zobaczyć bez uruchomienia CI na własnym sprzęcie. Na maszynach GitHuba działa tak samo.
+        ports: ["15432:5432"]
     steps:
       - uses: actions/checkout@v4
       # rustup honours rust-toolchain.toml, so the version stays in exactly one file.
@@ -115,7 +123,7 @@ jobs:
         env:
           PGPASSWORD: ci  # pragma: allowlist secret
         run: |
-          psql -h 127.0.0.1 -U postgres -v ON_ERROR_STOP=1 <<'SQL'
+          psql -h 127.0.0.1 -p 15432 -U postgres -v ON_ERROR_STOP=1 <<'SQL'
           CREATE TABLE staff (staff_id int, first_name text, password text);
           INSERT INTO staff VALUES (1, 'Ada', 'a-secret-hash');
           CREATE TABLE film (title text);
@@ -124,7 +132,7 @@ jobs:
           SQL
       - name: Run the adversarial corpus
         env:
-          ADV_URL: postgres://postgres:ci@127.0.0.1:5432/postgres  # pragma: allowlist secret
+          ADV_URL: postgres://postgres:ci@127.0.0.1:15432/postgres  # pragma: allowlist secret
         run: ./tests/adversarial/run.sh
 
   tls:
@@ -232,7 +240,11 @@ jobs:
         image: postgres:18
         env:
           POSTGRES_PASSWORD: ci  # pragma: allowlist secret - throwaway CI database, dies with the runner
-        ports: ["5432:5432"]
+        # Port hosta 15432, nie 5432: własny runner stoi na maszynie, na której działa PRODUKCYJNA baza
+        # Tempusa na 5432. Kontener usługowy przegrywał "driver failed programming external
+        # connectivity" i wszystkie zadania z bazą padały — konsekwencja, której nie dało się
+        # zobaczyć bez uruchomienia CI na własnym sprzęcie. Na maszynach GitHuba działa tak samo.
+        ports: ["15432:5432"]
         options: >-
           --health-cmd pg_isready --health-interval 5s --health-timeout 5s --health-retries 10
     steps:
@@ -250,12 +262,12 @@ jobs:
         # a job that fails on the first machine that does not have it.
         run: |
           docker run --rm --network host -e PGPASSWORD=ci postgres:18 \
-            psql -h 127.0.0.1 -U postgres -q -v ON_ERROR_STOP=1 -c \
+            psql -h 127.0.0.1 -p 15432 -U postgres -q -v ON_ERROR_STOP=1 -c \
             "CREATE TABLE orders(id int PRIMARY KEY, customer text); INSERT INTO orders VALUES (1,'ada');"
       - name: Talk to the server as a real client would
         env:
           BIN: ${{ github.workspace }}/target/release/postgres-mcp-hardened
-          DBURL: postgres://postgres:ci@127.0.0.1:5432/postgres  # pragma: allowlist secret
+          DBURL: postgres://postgres:ci@127.0.0.1:15432/postgres  # pragma: allowlist secret
           MCPURL: http://127.0.0.1:8123/mcp
           TOK: conformance-token
         working-directory: tests/conformance
