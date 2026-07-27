@@ -17,7 +17,9 @@ permissions:
 
 jobs:
   identifier:
-    runs-on: ubuntu-latest
+    # Ta sama zmienna co reszta — bo ten przepływ padł 27.07 z zerem kroków, odrzucony przez
+    # wyczerpany limit maszyn GitHuba, a wyglądało to jak wykryty rozjazd specyfikacji.
+    runs-on: ${{ vars.RUNNER_LABEL || 'ubuntu-latest' }}
     steps:
       - uses: actions/checkout@v4
       - name: Compare our preview identifier with the normative schema
