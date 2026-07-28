@@ -611,6 +611,25 @@ echo "$card" | grep -q '"protocolVersions":\["2025-11-25","2025-06-18"\]' \
   && ok "and lists every revision it would accept" || no "no revision list on the card" ""
 echo "$card" | grep -q "\"version\":\"$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)\"" \
   && ok "and the version on it comes from the manifest, not a literal" || no "card version drifted" ""
+# The headers a gateway routes on must agree with the body even on 2025-11-25, where the revision
+# does not require them. Requiring them would break every current client; ignoring them when present
+# would leave the hole open in the revision almost everybody actually speaks — a proxy that
+# authorised on `Mcp-Method: tools/list` while we ran `tools/call` decided about another request.
+r=$(curl -s -m 15 -H content-type:application/json -H 'mcp-protocol-version: 2025-11-25' \
+    -H 'mcp-method: tools/list' "http://127.0.0.1:$PORT/mcp" \
+    -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"query","arguments":{"sql":"SELECT 1"}}}')
+echo "$r" | grep -q '\-32020' && ok "a header that disagrees with the body is refused on 2025-11-25 too" \
+  || no "mismatching Mcp-Method accepted on 2025-11-25" "$(echo "$r" | head -c 160)"
+# And a client that sends nothing is untouched, or the rule above would be a breaking change.
+r=$(curl -s -m 15 -H content-type:application/json -H 'mcp-protocol-version: 2025-11-25' \
+    "http://127.0.0.1:$PORT/mcp" -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}')
+echo "$r" | grep -q '"tools"' && ok "and a client that sends no such headers is unaffected" || no "broke ordinary clients" "$r"
+# Agreement, not presence: Mcp-Method alone must not demand Mcp-Name before the draft requires it.
+r=$(curl -s -m 15 -H content-type:application/json -H 'mcp-protocol-version: 2025-11-25' \
+    -H 'mcp-method: tools/call' "http://127.0.0.1:$PORT/mcp" \
+    -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"query","arguments":{"sql":"SELECT 1"}}}')
+echo "$r" | grep -q '\-32020' && no "Mcp-Name demanded before the draft requires it" "$r" \
+  || ok "and Mcp-Method alone is agreement enough before the draft"
 # The control that makes the test above mean something: without a session there is nothing to read,
 # and the answer falls back to the oldest revision this server implements.
 r=$(curl -s -m 20 -H content-type:application/json "http://127.0.0.1:$PORT/mcp" -d "$W")

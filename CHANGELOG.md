@@ -11,6 +11,11 @@ alternative to the deprecated `@modelcontextprotocol/server-postgres`.
   still a draft upstream. `server/discover` answers under every revision, and carries the security
   posture as structured data — so a client can learn it is talking to a superuser connection
   before it sends a query.
+- **`Mcp-Method`/`Mcp-Name` are checked whenever they are sent, not only from the revision that
+  requires them.** The reason the check exists — a proxy authorising on the header while the server
+  runs the body decides about a different request — does not depend on which revision is in force,
+  yet the check did. Requiring the headers early would break every current client, so they are held
+  to agreement rather than presence: send them and they must match, send none and nothing changes.
 - **An unsupported protocol version is refused, not downgraded.** `MCP-Protocol-Version:
   not-a-date` used to get `200` and the oldest contract; the transport specification makes `400 Bad
   Request` a MUST here, and for good reason — the client goes on believing it negotiated something

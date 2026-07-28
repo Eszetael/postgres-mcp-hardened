@@ -328,6 +328,13 @@ reason in the content — so the model rewrites the query instead of handing the
 does not change is the audit: the refusal is recorded by the code that refuses, and the acceptance
 suite asserts both halves together, so friendlier errors can never quietly mean a quieter log.
 
+`Mcp-Method` and `Mcp-Name` are held to **agreement, not presence**. The draft requires them; earlier
+revisions do not, and demanding them would break every client shipping today. But a gateway that
+routes or authorises on `Mcp-Method` while the server executes the body has decided about a
+different request than the one that runs — and that is true whatever revision is in force. So a
+header that is present must match the body under every revision, while a client that sends none is
+untouched.
+
 Protocol failures stay protocol failures. A malformed envelope, an unknown method or a missing token
 is not something a model can fix by rewriting SQL, and a client's error handling expects those where
 they have always been.

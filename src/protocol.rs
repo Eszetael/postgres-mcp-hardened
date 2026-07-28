@@ -204,10 +204,19 @@ pub(crate) fn check_header_agreement(
     hdr_method: Option<&str>,
     hdr_name: Option<&str>,
 ) -> Result<(), (i64, String)> {
-    if rev < Rev::V20260728 {
+    // Before 2026-07-28 these headers are not REQUIRED — but if a client sends them anyway, they
+    // must still agree with the body. The reason the check exists has nothing to do with which
+    // revision is in force: a gateway that routes or authorises on `Mcp-Method` while we execute the
+    // body is deciding about a different request than the one that runs, and that is true whether
+    // the revision mandates the header or merely tolerates it. Requiring them early would break
+    // every current client; ignoring them when present would leave the hole open in the revision
+    // almost everybody actually speaks.
+    let headers_absent = hdr_method.is_none() && hdr_name.is_none();
+    if rev < Rev::V20260728 && headers_absent {
         return Ok(());
     }
     match hdr_method {
+        None if rev < Rev::V20260728 => {}
         None => {
             return Err((
                 ERR_HEADER_MISMATCH,
@@ -225,6 +234,9 @@ pub(crate) fn check_header_agreement(
     // `Mcp-Name` names the tool or resource the call targets, and only calls that have one carry it.
     if let Some(expected) = body_name {
         match hdr_name {
+            // Only the draft REQUIRES it. Earlier revisions are held to agreement, not to presence:
+            // a client that sends `Mcp-Method` alone has not contradicted anything.
+            None if rev < Rev::V20260728 => {}
             None => {
                 return Err((
                     ERR_HEADER_MISMATCH,
