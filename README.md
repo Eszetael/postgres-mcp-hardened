@@ -610,7 +610,7 @@ left resident memory flat and file descriptors unchanged.
 | `MCP_RESERVED_AUTH_SLOTS` | database slots kept for authenticated traffic so an anonymous flood cannot take the pool (default: a quarter) |
 | `MCP_PUBLIC_URL` | this server's public base URL, used in the OAuth discovery metadata |
 | `MCP_AUTH_SERVERS` | authorization server URLs advertised in that metadata |
-| `MCP_PROTOCOL_PREVIEW` | `1` to also speak the next MCP revision (`2026-07-28`) while it is still a draft upstream; off by default, and off changes nothing about what current clients see |
+| `MCP_PROTOCOL_PREVIEW` | `1` to also speak the next MCP revision (`2026-07-28`) while it is still a draft upstream; off by default, and off changes nothing about what current clients see. **Read once at startup** — changing it needs a restart, and until then the server card and `server/discover` keep reporting what the running process actually speaks |
 | `MCP_ALLOW_SCHEMAS` | schemas a query may reach, e.g. `public,analytics`; setting either this or the next turns the allowlist on |
 | `MCP_ALLOW_TABLES` | relations a query may reach, e.g. `public.orders,analytics.*` |
 | `MCP_ALLOW_CATALOG` | `1` to keep `pg_catalog` reachable while an allowlist is active |
