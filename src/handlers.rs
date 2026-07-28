@@ -25,8 +25,14 @@ pub(crate) fn handle_request(req: &Value) -> Value {
 
     // From 2026-07-28 the version is not agreed once at the start — it rides on every request, so
     // it has to be read here, before anything decides what shape the answer takes.
-    if let Some(err) = protocol::unsupported_version_error(&params) {
-        return err;
+    // `initialize` is exempt, for the same reason the HTTP header check exempts it: the lifecycle
+    // says the handshake MUST be answered with a version the server supports, not with an error, and
+    // `negotiate_initialize` already does that. Refusing here would make a client that offers a
+    // revision we do not enable unable to negotiate down to one we do.
+    if method != "initialize" {
+        if let Some(err) = protocol::unsupported_version_error(&params) {
+            return err;
+        }
     }
     let _meta_rev = protocol::rev_from_meta(&params).map(|r| protocol::set_request_rev(Some(r)));
     let rev = protocol::current();

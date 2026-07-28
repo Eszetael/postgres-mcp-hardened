@@ -478,9 +478,15 @@ pub(crate) async fn mcp_handler(
     } else {
         None
     };
-    // A handshake that failed is not a session. Creating one anyway handed the client an id it could
-    // keep using — under whatever revision the fallback picked, since a failed `initialize` has no
-    // negotiated version to remember. Now a rejected handshake leaves nothing behind.
+    // A handshake that failed is not a session. Creating one anyway would hand the client an id it
+    // could keep using, under whatever revision the fallback picked, since a rejected `initialize`
+    // has no negotiated version to remember.
+    //
+    // Stated plainly because it matters when reading this: the guard is DEFENSIVE. No current path
+    // reaches it — `initialize` negotiates rather than refusing, and an authorisation failure
+    // returns long before this line. There is deliberately no acceptance check for it, because a
+    // check that cannot fail is not coverage, it is the appearance of coverage. It stays because
+    // the cost is one condition and the failure it prevents is silent.
     let final_session_id =
         if method == "initialize" && session_id.is_none() && resp.get("result").is_some() {
             let new_id = Uuid::new_v4().to_string();

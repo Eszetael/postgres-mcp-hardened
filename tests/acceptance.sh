@@ -585,12 +585,17 @@ got=$(curl -s -m 15 -H content-type:application/json -H 'mcp-protocol-version: 2
       | python3 -c 'import sys,json;d=json.load(sys.stdin);print(d.get("result",{}).get("protocolVersion","NONE"))' 2>/dev/null)
 [ "$got" = "2025-06-18" ] && ok "initialize still negotiates even with an unsupported header" \
   || no "the handshake was locked out by the header rule" "got $got"
-# A failed handshake must not leave a session behind: the id would be usable, under a revision
-# nobody agreed on, because a rejected initialize has no negotiated version to remember.
-SID2=$(curl -s -m 15 -D - -o /dev/null -H content-type:application/json "http://127.0.0.1:$PORT/mcp" \
-       -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"1999-01-01"}}}' \
-       | tr -d '\r' | awk 'tolower($1)=="mcp-session-id:"{print $2}')
-[ -z "$SID2" ] && ok "a rejected handshake leaves no session behind" || no "session issued for a failed initialize" "$SID2"
+# The same exemption on the draft's path: the version rides in `_meta` there, and refusing an
+# unsupported one is right for every method EXCEPT the handshake, which has to negotiate.
+got=$(curl -s -m 15 -H content-type:application/json "http://127.0.0.1:$PORT/mcp" \
+      -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28"}}}' \
+      | python3 -c 'import sys,json;d=json.load(sys.stdin);print(d.get("result",{}).get("protocolVersion","ERROR"))' 2>/dev/null)
+[ "$got" = "2025-11-25" ] && ok "a client offering a revision we do not enable is negotiated down, not refused" \
+  || no "the handshake refused instead of negotiating" "got $got"
+# …and on any other method it IS refused, or the exemption above would be a hole rather than a rule.
+r=$(curl -s -m 15 -H content-type:application/json "http://127.0.0.1:$PORT/mcp" \
+    -d '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28"}}}')
+echo "$r" | grep -q '\-32022' && ok "and outside the handshake that same revision is refused" || no "the _meta refusal stopped firing" "$r"
 # A supported one must still pass, or the check above would be satisfied by refusing everything.
 code=$(curl -s -o /dev/null -w '%{http_code}' -m 15 -H content-type:application/json \
        -H 'mcp-protocol-version: 2025-11-25' "http://127.0.0.1:$PORT/mcp" \
