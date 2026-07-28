@@ -511,6 +511,23 @@ fn redact_value(v: &mut Value, pats: &[String], masked: &mut std::collections::B
 }
 
 pub(crate) fn col_to_json(row: &Row, i: usize) -> Value {
+    // json/jsonb FIRST, deliberately.
+    //
+    // A G4 round called it a critical bug that `Option<String>` was tried before `Option<Value>`:
+    // if a `json` column could be read as text, an EXPLAIN plan would arrive as an escaped string
+    // instead of an object, and the agent would receive stringified structure. The claim is wrong —
+    // `postgres-types` gates `try_get` on `FromSql::accepts`, and `String` accepts only VARCHAR,
+    // TEXT, BPCHAR, NAME, UNKNOWN, citext and the ltree family; `json`/`jsonb` are not among them,
+    // so the text branch errors and control reaches this one anyway.
+    //
+    // It is still worth reordering. The old code was correct only because of a detail two crates
+    // away, invisible to anyone reading this function — and a reviewer who cannot see why something
+    // is safe will eventually "fix" it. `Value` accepts json/jsonb and nothing else, so trying it
+    // first cannot capture a value that belongs to another branch, and the correctness stops
+    // depending on the order at all.
+    if let Ok(v) = row.try_get::<_, Option<Value>>(i) {
+        return v.unwrap_or(Value::Null);
+    }
     if let Ok(v) = row.try_get::<_, Option<String>>(i) {
         return v.map(Value::String).unwrap_or(Value::Null);
     }
@@ -525,11 +542,6 @@ pub(crate) fn col_to_json(row: &Row, i: usize) -> Value {
     }
     if let Ok(v) = row.try_get::<_, Option<bool>>(i) {
         return v.map(|b| json!(b)).unwrap_or(Value::Null);
-    }
-    // json/jsonb columns — EXPLAIN (FORMAT JSON) returns one, and losing it to null would be
-    // exactly the silent-emptiness class this project exists to avoid.
-    if let Ok(v) = row.try_get::<_, Option<Value>>(i) {
-        return v.unwrap_or(Value::Null);
     }
     Value::Null
 }
