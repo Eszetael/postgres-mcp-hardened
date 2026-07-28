@@ -510,6 +510,16 @@ defeated in review and are therefore described as depth rather than as boundarie
   the transport and every setting in force, with connection passwords stripped and secrets reduced to
   fingerprints, plus a `config_fp` an operator can pin across restarts. A log that says what happened
   but not under which settings cannot answer the first question an incident asks.
+- **The audit notices being shortened:** a hash chain proves entries were not *altered*, but a log
+  with its tail cut off is internally consistent — recomputing it finds nothing wrong. Alongside
+  `MCP_AUDIT_LOG` the server therefore keeps `<log>.hwm`, a one-line record of the last sequence
+  number and hash it wrote, updated only after the entry is durably appended. On start the two are
+  compared, and a disagreement is reported: entries missing from the end, a rewritten last entry, or
+  a log that has gone away entirely. This is not proof of tampering — an unclean shutdown looks the
+  same — but a tamper-*evident* trail owes you the question, not the verdict. Keep the sidecar with
+  the log when you archive or move it; deleting it only loses the truncation check, never an entry.
+  The offline verifier is unchanged and still needs an external anchor:
+  `--verify-audit <file> --expect-last <hash>`.
 - **A wrong setting is fatal, not merely wrong:** an unparsable listen address, an audit file that
   cannot be written, `sslmode=disable` to a database on another machine, a metrics token that is also
   the database credential, a boolean spelt `yes` — each used to be accepted and quietly do something
@@ -549,7 +559,7 @@ left resident memory flat and file descriptors unchanged.
 | `MCP_ADDR` | HTTP listen address (default `127.0.0.1:8080`) |
 | `MCP_MAX_COST` | reject queries whose `EXPLAIN` cost exceeds this (default 1,000,000) |
 | `JWT_PUBKEY_PEM`, `JWT_AUD`, `JWT_ISS` | enable OAuth 2.1 token validation (omit to disable auth); the key may be the PEM text or a path to a PEM file |
-| `MCP_AUDIT_LOG` | path to the append-only audit log (hash-chained); verify with `--verify-audit <file> [--expect-last <hash>]` |
+| `MCP_AUDIT_LOG` | path to the append-only audit log (hash-chained); verify with `--verify-audit <file> [--expect-last <hash>]`. The server also writes `<log>.hwm` beside it — the last sequence number and hash, used at startup to notice a shortened log |
 | `MCP_AUDIT_HMAC_KEY` / `MCP_AUDIT_HMAC_KEY_FILE` | key that turns the audit chain into HMAC-SHA256 — keep it off the host so the log cannot be rewritten (a trailing newline in the file is ignored) |
 | `MCP_AUDIT_HMAC_KEYS_OLD` | comma-separated previous keys, so a log that survived a key rotation still verifies |
 | `MCP_REDACT_COLUMNS` | columns to keep out of results, e.g. `password, ssn, card_number` — masked at any depth and refused if referenced. Defence in depth, not a boundary: pair it with `REVOKE SELECT (col)` |

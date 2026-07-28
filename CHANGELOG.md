@@ -16,6 +16,18 @@ alternative to the deprecated `@modelcontextprotocol/server-postgres`.
   gateway can authorise without parsing the body, and if the two may disagree then whatever
   authorised and whatever runs saw different requests. A protocol version we do not implement is
   refused rather than silently served under a contract nobody agreed to.
+- **The audit notices being shortened, not only altered:** a hash chain proves entries were not
+  rewritten, but a log with its tail cut off is internally consistent and recomputing it finds
+  nothing wrong — the previous code even carried a comment claiming otherwise, while reading its
+  resume state from the very file it was guarding. A sidecar `<log>.hwm` now records the last
+  sequence number and hash the server wrote, updated only after the entry is durably appended, and
+  a mismatch at startup is reported: entries missing from the end, a rewritten last entry, or a log
+  that has gone. Separately, a missing audit file and an unreadable one no longer share a code path
+  — deleting the trail used to be indistinguishable from a first run.
+- **The catalog path streams:** `describe_table`, `list_tables`, `explain_query` and the other
+  non-SELECT tools buffered every row before the byte ceiling was applied, so the ceiling trimmed
+  the answer while the peak stayed unbounded. They now stream through a portal like the query path
+  and stop at the limit.
 - **Signed releases:** every artefact is signed with Sigstore keyless signing, verifiable with
   `cosign verify-blob` against the workflow identity; public releases additionally carry SLSA
   build provenance. Release actions are pinned to commit hashes, not moving tags.
