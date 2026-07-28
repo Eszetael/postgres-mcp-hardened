@@ -718,45 +718,54 @@ pub(crate) fn query_catalog(
     } else {
         (sql, false)
     };
-    let rows = match client.query(sql, params) {
-        Ok(r) => r,
-        Err(e) => {
-            let _ = client.batch_execute("ROLLBACK");
-            return Err(friendly_pg_error_for(&e, Some(sql)));
-        }
-    };
-    let mut out = Vec::with_capacity(rows.len());
-    // The same byte ceiling the query path enforces. This function serves every catalog tool and
-    // `explain_query`, and it buffered the whole result: `EXPLAIN VERBOSE` of a large UNION, or
-    // analyze_indexes on a database with hundreds of thousands of relations, materialised in full
-    // before anyone could object. A cap that applies to one path and not the other is not a cap.
+    // STREAMED, like the query path — not buffered and then measured.
+    //
+    // `client.query()` pulls EVERY row into a `Vec<Row>` before returning, so the byte ceiling below
+    // could only ever trim the ANSWER; the PEAK was unbounded. `EXPLAIN (FORMAT JSON)` of a large
+    // UNION, or a catalog scan over hundreds of thousands of relations, materialised in full inside
+    // this process before anyone could object. The comment here used to claim "the same byte ceiling
+    // the query path enforces" while the mechanism was different — the row path had already been
+    // moved to `query_raw`, and this one had not.
+    //
+    // `query_raw` pulls through a portal in batches, so we stop growing at the limit instead of
+    // discovering we exceeded it.
+    use postgres::fallible_iterator::FallibleIterator;
+    let mut out: Vec<Value> = Vec::new();
     let mut bytes = 0usize;
     let mut capped = false;
-    for row in rows {
-        if bytes > MAX_RESULT_BYTES {
-            capped = true;
-            break;
-        }
-        if wrapped_mode {
-            let txt: Option<String> = row
-                .try_get::<_, Option<String>>(0)
-                .map_err(|_| "result serialization error".to_string())?;
-            let v: Value = serde_json::from_str(&txt.unwrap_or_else(|| "null".into()))
-                .map_err(|_| "result serialization error".to_string())?;
+    let streamed: Result<(), String> = (|| {
+        let mut it = client
+            .query_raw(sql, params.iter().copied())
+            .map_err(|e| friendly_pg_error_for(&e, Some(sql)))?;
+        while let Some(row) = it
+            .next()
+            .map_err(|e| friendly_pg_error_for(&e, Some(sql)))?
+        {
+            if bytes > MAX_RESULT_BYTES {
+                capped = true;
+                break;
+            }
+            let v = if wrapped_mode {
+                let txt: Option<String> = row
+                    .try_get::<_, Option<String>>(0)
+                    .map_err(|_| "result serialization error".to_string())?;
+                serde_json::from_str(&txt.unwrap_or_else(|| "null".into()))
+                    .map_err(|_| "result serialization error".to_string())?
+            } else {
+                let mut obj = serde_json::Map::new();
+                for i in 0..row.columns().len() {
+                    let col_name = row.columns()[i].name().to_string();
+                    obj.insert(col_name, col_to_json(&row, i));
+                }
+                Value::Object(obj)
+            };
             bytes += serde_json::to_string(&v).map(|s| s.len()).unwrap_or(0);
             out.push(v);
-            continue;
         }
-        let mut obj = serde_json::Map::new();
-        for i in 0..row.columns().len() {
-            let col_name = row.columns()[i].name().to_string();
-            obj.insert(col_name, col_to_json(&row, i));
-        }
-        let v = Value::Object(obj);
-        bytes += serde_json::to_string(&v).map(|s| s.len()).unwrap_or(0);
-        out.push(v);
-    }
+        Ok(())
+    })();
     let _ = client.batch_execute("ROLLBACK");
+    streamed?;
     let mut res = json!({ "returnedRows": out.len(), "rows": out });
     if capped {
         res["truncated"] = json!(true);
@@ -930,6 +939,12 @@ pub(crate) fn simulate_index(
     client
         .batch_execute("BEGIN TRANSACTION READ ONLY")
         .map_err(|e| e.to_string())?;
+
+    // Shrink the plan at the source, since we cannot measure it before it arrives (see below).
+    // Parallel plans repeat a subtree once per gather worker, so a plan that is merely large becomes
+    // large times N. Turning gather off costs nothing here — we want the SHAPE of the plan, not its
+    // wall-clock — and it is the only lever that reduces the peak rather than reporting on it.
+    let _ = client.batch_execute("SET LOCAL max_parallel_workers_per_gather = 0");
 
     let plan = |c: &mut postgres::Client, sql: &str| -> Result<Value, String> {
         let stmt = format!("EXPLAIN (FORMAT JSON) {sql}");
