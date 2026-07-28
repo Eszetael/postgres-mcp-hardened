@@ -11,8 +11,12 @@ on:
     tags:
       - 'v*'
 
+# Domyślnie READ dla całego przepływu; zapis przyznaje się ZADANIU, które go potrzebuje.
+# Poprzednio `contents: write` stało na poziomie przepływu, więc dziedziczyły je także `checks`,
+# `build` i `sbom` — zadania, które niczego nie publikują. Token z prawem zapisu w zadaniu, które
+# tylko kompiluje, to nadmiar, który nic nie kosztuje, dopóki nie kosztuje wszystkiego.
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   # Nothing is published that these gates have not approved. Before this, pushing a tag built
