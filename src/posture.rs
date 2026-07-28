@@ -175,6 +175,33 @@ pub(crate) fn is_loopback(addr: &str) -> bool {
     host == "localhost" || host == "::1" || host.starts_with("127.")
 }
 
+/// True when a container platform stands in front of us and authenticates the caller itself.
+///
+/// Today that means Apify Standby, which routes only after checking the caller's Apify token —
+/// header `Authorization: Bearer <token>` or `?token=`, with no anonymous path documented. Our
+/// process cannot see that check, so without this it refuses to start: from inside the container,
+/// `0.0.0.0` with no `MCP_BEARER_TOKEN` looks exactly like an open server.
+///
+/// This is NOT a general relaxation and deliberately not an escape hatch. It requires **two**
+/// markers the platform sets and a user cannot plausibly set by accident, and it changes the
+/// reported posture to `apify-platform` rather than `none` — we are not claiming there is no
+/// authentication problem, we are naming who solves it. Anywhere else, the refusal stands.
+///
+/// The alternative was to demand `MCP_BEARER_TOKEN` on top of the platform's token. That would mean
+/// an agent which finds this server in the Store cannot call it without a second secret it has no
+/// way to obtain — which defeats the point of being there.
+pub(crate) fn platform_authenticates() -> bool {
+    let at_home = std::env::var("APIFY_IS_AT_HOME").is_ok_and(|v| {
+        let v = v.trim();
+        !v.is_empty() && v != "0" && !v.eq_ignore_ascii_case("false")
+    });
+    let assigned_port = std::env::var("ACTOR_WEB_SERVER_PORT").is_ok_and(|v| {
+        let v = v.trim();
+        !v.is_empty() && v.chars().all(|c| c.is_ascii_digit())
+    });
+    at_home && assigned_port
+}
+
 fn hatch(name: &str) -> bool {
     // A value, not `1`: an escape hatch that can be switched on by a typo is not an escape hatch.
     // It is also recorded in the startup audit entry, so the decision to lower the bar is written down.
@@ -195,6 +222,13 @@ pub(crate) fn enforce_start_policy(transport: &str, addr: &str) {
         || std::env::var("JWT_PUBKEY_PEM").is_ok_and(|t| !t.trim().is_empty())
     {
         // authenticated — the remaining question is what the role can do
+    } else if platform_authenticates() {
+        eprintln!(
+            "Serving {} without our own authentication: the Apify platform authenticates callers \
+             before routing to this container (Standby requires an Apify token). Set \
+             MCP_BEARER_TOKEN as well if you want a second lock on the same door.",
+            addr
+        );
     } else if hatch("MCP_ALLOW_ANONYMOUS_NETWORK") {
         eprintln!(
             "WARNING: serving {} with no authentication at all, because \
@@ -496,8 +530,13 @@ pub(crate) fn report(db: Option<&str>) -> Value {
         "grade": worst.grade(),
         "listening": addr,
         "exposedToNetwork": exposed,
+        // "none" would be a lie behind Apify Standby, where the platform checks the caller's token
+        // before we see the request — and "shared token" would be a different lie, since we hold no
+        // secret. Naming the authenticator is the only honest answer, and it is the one a client
+        // reading this needs: it says whose credential to present.
         "authentication": if env_set("JWT_PUBKEY_PEM") { "oauth" }
                           else if env_set("MCP_BEARER_TOKEN") { "shared token" }
+                          else if platform_authenticates() { "apify-platform" }
                           else { "none" },
         "findings": items,
         "note": "The grade is the worst finding, not an average. A is: a role that cannot write, \

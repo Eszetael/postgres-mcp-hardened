@@ -96,6 +96,7 @@ pub(crate) async fn run_http() {
     let state = AppState::default();
 
     let app = Router::new()
+        .route("/", get(root_handler))
         .route("/mcp", post(mcp_handler).delete(delete_session_handler))
         .route("/metrics", get(metrics_handler))
         .route("/health", get(health_handler))
@@ -198,7 +199,56 @@ pub(crate) async fn delete_session_handler(
 // --- HANDLER /mcp (STREAMABLE HTTP) ---
 /// The address the server was told to listen on, for checks that depend on exposure.
 pub(crate) fn listen_addr() -> String {
+    // On a container platform the PLATFORM owns the port: Apify Standby passes it in
+    // `ACTOR_WEB_SERVER_PORT` and routes to it, so a server that binds somewhere else is simply
+    // never reached — the run waits for a readiness probe that cannot arrive and then times out
+    // with nothing in the log to explain it. That is why the platform's port wins over `MCP_ADDR`
+    // here rather than the other way round: a copied `MCP_ADDR=127.0.0.1:8080` is the likeliest
+    // way to produce exactly that silent hang.
+    //
+    // It is said out loud, not applied quietly, because overriding an operator's explicit setting
+    // is the kind of helpfulness that costs an hour when it is wrong.
+    //
+    // `0.0.0.0` rather than loopback: the container is reached from outside it. This makes the
+    // origin check STRICTER, not weaker — `check_origin` stops treating loopback origins as
+    // automatically allowed once the server is not on loopback, so a browser page needs
+    // `MCP_ALLOWED_ORIGINS` to talk to us at all.
+    if let Ok(port) = std::env::var("ACTOR_WEB_SERVER_PORT") {
+        let port = port.trim();
+        if !port.is_empty() && port.chars().all(|c| c.is_ascii_digit()) {
+            if let Ok(explicit) = std::env::var("MCP_ADDR") {
+                if !explicit.trim().is_empty() && !explicit.ends_with(&format!(":{port}")) {
+                    eprintln!(
+                        "ACTOR_WEB_SERVER_PORT={port} overrides MCP_ADDR={explicit}: on this \
+                         platform the port is assigned, and binding elsewhere means the run is \
+                         never marked ready."
+                    );
+                }
+            }
+            return format!("0.0.0.0:{port}");
+        }
+        eprintln!("ACTOR_WEB_SERVER_PORT={port:?} is not a port number — ignoring it.");
+    }
     std::env::var("MCP_ADDR").unwrap_or_else(|_| "127.0.0.1:8080".to_string())
+}
+
+/// `GET /` — the platform's readiness probe, and a signpost for anything else that lands here.
+///
+/// Apify sends `GET /` with `x-apify-container-server-readiness-probe` and waits for a response:
+/// "You must return a response; otherwise, the Actor run will never be marked as ready." It must not
+/// touch the database — readiness of the container is not readiness of Postgres, and a probe that
+/// blocks on a busy pool turns a slow database into a container that never starts. `/ready` is where
+/// the database question is answered.
+pub(crate) async fn root_handler(headers: HeaderMap) -> impl IntoResponse {
+    if headers.contains_key("x-apify-container-server-readiness-probe") {
+        return (StatusCode::OK, "ready").into_response();
+    }
+    (
+        StatusCode::OK,
+        "postgres-mcp-hardened — MCP endpoint is POST /mcp (Streamable HTTP). \
+         Probes: GET /health, GET /ready. Metrics: GET /metrics.\n",
+    )
+        .into_response()
 }
 
 pub(crate) async fn mcp_handler(

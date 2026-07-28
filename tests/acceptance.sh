@@ -639,6 +639,57 @@ echo "$r" | grep -q '"isError":true' \
 stop
 rm -f "$PAUD"
 
+section "Standby: the container platform's port and readiness probe"
+# Apify Standby routes to a port IT assigns and waits for a readiness answer on `GET /`. The
+# documentation is blunt about the consequence: "You must return a response; otherwise, the Actor
+# run will never be marked as ready." Both halves are worth a check because both fail SILENTLY —
+# a server on the wrong port and a server that never answers look identical from outside: a run
+# that hangs and then times out.
+SB=$("$FREE_PORT")
+# A least-privilege role, not the superuser the rest of the suite uses: on a container platform the
+# server is EXPOSED, and the second start gate refuses to expose a role that can write. Reaching for
+# MCP_ALLOW_EXCESSIVE_ROLE here would test the escape hatch instead of the deployment.
+docker exec -i acc_pg psql -U postgres -q -v ON_ERROR_STOP=1 <<'SQL' >/dev/null 2>&1 || true
+CREATE ROLE acc_standby LOGIN PASSWORD 's' NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS NOREPLICATION;
+GRANT CONNECT ON DATABASE postgres TO acc_standby;
+GRANT USAGE ON SCHEMA public TO acc_standby;
+GRANT SELECT ON ALL TABLES IN SCHEMA public TO acc_standby;
+SQL
+SBURL="postgres://acc_standby:s@127.0.0.1:$PGPORT_ACC/postgres"
+# One marker is not enough, on purpose: `ACTOR_WEB_SERVER_PORT` alone must NOT buy an exemption
+# from the anonymous-network refusal, or the exemption becomes a one-variable bypass of the policy.
+env DATABASE_URL="$SBURL" ACTOR_WEB_SERVER_PORT=$SB "$BIN" >/tmp/acc_sb_half.log 2>&1
+grep -q "REFUSING TO START" /tmp/acc_sb_half.log \
+  && ok "one platform marker alone does not buy an exemption from the auth policy" \
+  || no "the exemption is reachable with a single env var" "$(head -2 /tmp/acc_sb_half.log)"
+env DATABASE_URL="$SBURL" APIFY_IS_AT_HOME=1 ACTOR_WEB_SERVER_PORT=$SB MCP_ADDR=127.0.0.1:$((SB+1)) "$BIN" >/tmp/acc_sb.log 2>&1 &
+SBPID=$!; sleep 2
+code=$(curl -s -o /tmp/sb_probe -w '%{http_code}' -m 10 -H 'x-apify-container-server-readiness-probe: 1' "http://127.0.0.1:$SB/" 2>/dev/null)
+[ "$code" = "200" ] && ok "the readiness probe is answered on the port the platform assigned" \
+  || no "the run would never be marked ready" "HTTP $code on $SB"
+grep -q "overrides MCP_ADDR" /tmp/acc_sb.log \
+  && ok "and overriding an explicit MCP_ADDR is said out loud, not done quietly" || no "silent override" "$(head -3 /tmp/acc_sb.log)"
+# The probe must not depend on the database: container readiness is not database readiness, and a
+# probe that blocks on a busy pool turns a slow database into a container that never starts.
+grep -qi "postgres\|database\|pool" /tmp/sb_probe && no "the probe touched the database" "$(head -c 100 /tmp/sb_probe)" \
+  || ok "and it answers without asking the database anything"
+# Anything else landing on `/` gets a signpost rather than a 404 — an agent that guessed the wrong
+# path should be told the right one.
+curl -s -m 10 "http://127.0.0.1:$SB/" | grep -q "POST /mcp" && ok "a bare GET / points at the MCP endpoint" || no "no signpost on /" ""
+# And MCP itself still works on the platform-assigned port, or the whole exercise moved the server
+# somewhere unreachable.
+curl -s -m 15 -H content-type:application/json "http://127.0.0.1:$SB/mcp" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' | grep -q '"tools"' \
+  && ok "and MCP answers on that port too" || no "MCP unreachable on the assigned port" ""
+# The card must not tell a registry the server is open: reaching it needs the platform's token,
+# and naming the authenticator is the only answer that is both true and useful.
+card=$(curl -s -m 10 "http://127.0.0.1:$SB/.well-known/mcp/server-card.json")
+echo "$card" | grep -q '"required":true' && ok "the card says a credential IS required behind the platform" \
+  || no "the card advertises an open server" "$(echo "$card" | head -c 160)"
+echo "$card" | grep -q '"type":"apify-platform"' && ok "and names who checks it, rather than claiming a lock we do not hold" \
+  || no "the card misnames the authenticator" ""
+{ kill -9 "$SBPID"; } 2>/dev/null; rm -f /tmp/sb_probe /tmp/acc_sb_half.log; sleep 0.3
+
 section "Answering \"would this index help\" without creating one"
 # The capability the leading alternative is known for — and it reaches it by defaulting to a
 # connection that can create real indexes. hypopg registers the index in backend memory only, so a

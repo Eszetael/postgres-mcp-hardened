@@ -11,6 +11,14 @@ alternative to the deprecated `@modelcontextprotocol/server-postgres`.
   still a draft upstream. `server/discover` answers under every revision, and carries the security
   posture as structured data — so a client can learn it is talking to a superuser connection
   before it sends a query.
+- **Runs on a container platform without code changes (Apify Standby).** The assigned port is read
+  from `ACTOR_WEB_SERVER_PORT` and wins over `MCP_ADDR` — said out loud on stderr, because binding
+  elsewhere means the run is never marked ready and the symptom is an unexplained timeout. `GET /`
+  answers the readiness probe without touching the database. Authentication there belongs to the
+  platform, which checks the caller's token before routing; the server stops demanding its own only
+  when **both** `APIFY_IS_AT_HOME` and `ACTOR_WEB_SERVER_PORT` are present, and then reports
+  `"type": "apify-platform"` instead of claiming a lock it does not hold. One marker alone changes
+  nothing, and the refusal to expose a role that can write is untouched.
 - **`Mcp-Method`/`Mcp-Name` are checked whenever they are sent, not only from the revision that
   requires them.** The reason the check exists — a proxy authorising on the header while the server
   runs the body decides about a different request — does not depend on which revision is in force,

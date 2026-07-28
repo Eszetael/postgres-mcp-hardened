@@ -270,9 +270,13 @@ pub(crate) async fn server_card_handler() -> impl axum::response::IntoResponse {
     let base = base.trim_end_matches('/');
     // A shared bearer token counts as authentication too — reporting "open" while it is enforced
     // would make a registry advertise the server as public when it is not.
+    // Behind Apify Standby the caller DOES need a credential — the platform's, not ours. Reporting
+    // `required: false` there would tell a registry the server is open when reaching it requires an
+    // Apify token, which is the same class of untruth as reporting a revision we do not speak.
     let auth_required = ["JWT_PUBKEY_PEM", "MCP_BEARER_TOKEN"]
         .iter()
-        .any(|k| std::env::var(k).map(|v| !v.trim().is_empty()) == Ok(true));
+        .any(|k| std::env::var(k).map(|v| !v.trim().is_empty()) == Ok(true))
+        || posture::platform_authenticates();
     let tools = handle_tools_list()["result"]["tools"].clone();
     Json(json!({
         "name": "postgres-mcp-hardened",
@@ -287,7 +291,13 @@ pub(crate) async fn server_card_handler() -> impl axum::response::IntoResponse {
         "endpoint": if base.is_empty() { "/mcp".to_string() } else { format!("{}/mcp", base) },
         "authentication": {
             "required": auth_required,
-            "type": if auth_required { "oauth2.1" } else { "none" },
+            "type": if std::env::var("JWT_PUBKEY_PEM").map(|v| !v.trim().is_empty()) == Ok(true) {
+                        "oauth2.1"
+                    } else if std::env::var("MCP_BEARER_TOKEN").map(|v| !v.trim().is_empty()) == Ok(true) {
+                        "bearer"
+                    } else if posture::platform_authenticates() {
+                        "apify-platform"
+                    } else { "none" },
             "protectedResourceMetadata": "/.well-known/oauth-protected-resource"
         },
         "tools": tools

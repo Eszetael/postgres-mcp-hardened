@@ -127,6 +127,42 @@ postgres-mcp-hardened
 >
 > **Tip:** point `DATABASE_URL` at a **least-privilege read-only role**. The server enforces read-only itself, but a scoped DB role is defense-in-depth.
 
+### Or run it on a container platform (Apify Standby)
+
+The server needs no code changes to run as an Apify Actor in Standby mode. It reads the port the
+platform assigns from `ACTOR_WEB_SERVER_PORT` and binds `0.0.0.0` there — that port wins over
+`MCP_ADDR`, loudly, on stderr, because binding anywhere else means the run is never marked ready and
+the failure looks like a mysterious timeout. `GET /` answers the platform's readiness probe
+(`x-apify-container-server-readiness-probe`) without touching the database: container readiness is
+not database readiness, and a probe that waits on a busy pool turns a slow database into a container
+that never starts.
+
+| Endpoint | Method | Purpose |
+|---|---|---|
+| `/mcp` | POST | the MCP endpoint (Streamable HTTP). `DELETE` ends a session. |
+| `/` | GET | readiness probe; otherwise a signpost naming the real endpoint |
+| `/health` | GET | the process is alive |
+| `/ready` | GET | the process **and** a database connection are available |
+| `/metrics` | GET | counters (needs `MCP_METRICS_TOKEN`) |
+| `/.well-known/mcp/server-card.json` | GET | what a registry reads: revisions, transports, tools |
+
+**Input** is a JSON-RPC request in the POST body — `initialize`, `tools/list`, `tools/call`,
+`resources/list`, `resources/read`, `server/discover`. **Output** is a JSON-RPC response; from
+`2025-11-25` a refused statement comes back as a tool execution error (`isError: true`) with the
+reason in the content, so the model can rewrite the query. `tools/list` is the authoritative
+description of every argument.
+
+**Authentication there is the platform's, not ours.** Apify checks the caller's token before routing
+to the container, so the server does not additionally demand `MCP_BEARER_TOKEN` — requiring a second
+secret would mean an agent that finds this server cannot call it. That exemption is narrow: it needs
+**both** `APIFY_IS_AT_HOME` and `ACTOR_WEB_SERVER_PORT`, one alone changes nothing, and the server
+card then reports `"type": "apify-platform"` rather than claiming a lock we do not hold. Everywhere
+else the server still refuses to start on a network address with no authentication. Set
+`MCP_BEARER_TOKEN` as well if you want a second lock on the same door.
+
+The other start gate is unchanged and matters more here: a role that can write is refused a network
+listener. Point `DATABASE_URL` at a read-only role — `--print-setup-sql` writes the statements.
+
 ## Migrating from the deprecated server
 
 The most-discussed problems reported against `@modelcontextprotocol/server-postgres` were
