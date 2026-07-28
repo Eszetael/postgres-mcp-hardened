@@ -11,6 +11,13 @@ alternative to the deprecated `@modelcontextprotocol/server-postgres`.
   still a draft upstream. `server/discover` answers under every revision, and carries the security
   posture as structured data — so a client can learn it is talking to a superuser connection
   before it sends a query.
+- **A session remembers what it negotiated.** A client that agreed on a revision at `initialize` and
+  then omitted the `MCP-Protocol-Version` header used to be served the oldest contract instead.
+  The transport specification allows that default only when the server has no other way to
+  establish the version, and names the session as exactly that other way; the session now carries
+  the negotiated revision and the header-less request is answered under it. Only a request with
+  neither header nor session falls back, and it falls back to the oldest revision this server
+  implements rather than to a revision it does not.
 - **Two of the draft's rules are treated as security controls:** `Mcp-Method`/`Mcp-Name` must
   agree with the request body, and a mismatch is refused and audited — the headers exist so a
   gateway can authorise without parsing the body, and if the two may disagree then whatever

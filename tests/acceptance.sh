@@ -6,6 +6,22 @@
 #   KEEP=1 ./tests/acceptance.sh     # leave the scratch containers up for inspection
 set -uo pipefail
 BIN="${BIN:-$(dirname "$0")/../target/release/postgres-mcp-hardened}"
+
+# A suite that runs a stale binary reports on code that is no longer in the tree — and reports it
+# in green. It happened: a fix sat in the debug build while every check here passed against the
+# release build from an hour earlier. Refuse rather than warn; a warning in a 240-line run is a
+# warning nobody reads.
+if [ -e "$BIN" ]; then
+  SRC_NEWER=$(find "$(dirname "$0")/.." -newer "$BIN" \
+                \( -path '*/src/*.rs' -o -name Cargo.toml -o -name Cargo.lock \) \
+                -not -path '*/target/*' -print -quit 2>/dev/null)
+  if [ -n "$SRC_NEWER" ]; then
+    printf '\033[31mThe binary is older than the source: %s\033[0m\n' "$SRC_NEWER"
+    printf 'Run `cargo build --release` first — otherwise this suite grades code you are not shipping.\n'
+    exit 2
+  fi
+fi
+
 PASS=0; FAIL=0; SKIP=0
 ok(){ printf '  \033[32mPASS\033[0m %s\n' "$1"; PASS=$((PASS+1)); }
 no(){ printf '  \033[31mFAIL\033[0m %s\n     %s\n' "$1" "${2:-}"; FAIL=$((FAIL+1)); }
@@ -531,6 +547,25 @@ for v in 2025-06-18 2025-11-25 2099-01-01; do
     *) no "bad negotiation for $v" "$got";;
   esac
 done
+# A client that negotiated a revision and then omits the header must not be silently demoted to an
+# older contract. The transport specification allows the default only when the server has "no other
+# way to identify the version — for example, by relying on the protocol version negotiated during
+# initialization", and the session IS that other way. Measured on the one observable difference
+# between the two revisions: 2025-11-25 answers a refused statement as a tool execution error.
+SID=$(curl -s -m 15 -D - -o /dev/null -H content-type:application/json "http://127.0.0.1:$PORT/mcp" \
+      -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25"}}' \
+      | tr -d '\r' | awk 'tolower($1)=="mcp-session-id:"{print $2}')
+[ -n "$SID" ] && ok "initialize hands out a session id" || no "no session id issued" ""
+r=$(curl -s -m 20 -H content-type:application/json -H "mcp-session-id: $SID" "http://127.0.0.1:$PORT/mcp" -d "$W")
+echo "$r" | grep -q '"isError":true' \
+  && ok "a session keeps its negotiated revision when the client omits the header" \
+  || no "session revision ignored — client demoted to the older contract" "$r"
+# The control that makes the test above mean something: without a session there is nothing to read,
+# and the answer falls back to the oldest revision this server implements.
+r=$(curl -s -m 20 -H content-type:application/json "http://127.0.0.1:$PORT/mcp" -d "$W")
+echo "$r" | grep -q '"isError":true' \
+  && no "fallback no longer conservative — a headerless stranger got the newer contract" "$r" \
+  || ok "and a request with neither header nor session still gets the oldest contract"
 stop
 rm -f "$PAUD"
 

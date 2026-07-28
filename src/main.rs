@@ -56,10 +56,16 @@ use uuid::Uuid;
 // --- Session state (simple, in memory) ---
 #[derive(Clone, Default)]
 pub(crate) struct AppState {
-    /// value = last use (seconds since process start). The map MUST have a cap and a TTL:
-    /// `initialize` is unauthenticated by design, so without one anybody could inflate it
-    /// without bound — the very defence already present in the rate limiter.
-    sessions: Arc<tokio::sync::RwLock<std::collections::HashMap<String, u64>>>,
+    /// value = (last use in seconds since process start, revision negotiated at `initialize`).
+    /// The map MUST have a cap and a TTL: `initialize` is unauthenticated by design, so without
+    /// one anybody could inflate it without bound — the very defence already present in the rate
+    /// limiter.
+    ///
+    /// The revision is stored because the transport specification allows the default only when the
+    /// server has no other way to establish the version, and names the session negotiated at
+    /// `initialize` as exactly that other way. Without it a client that omits the header would be
+    /// served an older contract than the one it agreed to.
+    sessions: Arc<tokio::sync::RwLock<std::collections::HashMap<String, (u64, protocol::Rev)>>>,
 }
 
 /// How many sessions we keep, and for how long while idle.

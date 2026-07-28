@@ -301,6 +301,19 @@ The server answers `initialize` with the revision the client asked for when it i
 with its newest otherwise. Over HTTP the revision comes from the `MCP-Protocol-Version` header, per
 request — one client's negotiation cannot change the contract another client is served under.
 
+If a request carries no header, the server does not fall straight back to the oldest contract. It
+reads the revision **this** session agreed on at `initialize`, which is what the transport
+specification asks for: the default applies only "if the server does not receive an
+`MCP-Protocol-Version` header, and has no other way to identify the version — for example, by
+relying on the protocol version negotiated during initialization". A session is that other way, so a
+client that negotiated `2025-11-25` and then omitted the header keeps the contract it agreed to
+rather than being silently demoted.
+
+Only a request with neither a header nor a session falls back, and it falls back to `2025-06-18` —
+the oldest revision this server implements — rather than the `2025-03-26` the specification names.
+That revision is not implemented here, and answering under a contract the server cannot honour would
+be worse than answering under the oldest one it can.
+
 The difference that matters is where a refusal goes. Under `2025-06-18` "this statement is not
 read-only" was a JSON-RPC error: the client saw a broken call and the model often never saw the
 reason. From `2025-11-25` (SEP-1303) it arrives as a tool execution error — `isError: true` with the

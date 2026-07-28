@@ -235,10 +235,16 @@ pub(crate) async fn mcp_handler(
     }
     // An unknown `Mcp-Session-Id` must get a 404 so the client knows to initialize again
     // (Streamable HTTP). The server used to accept ANY invented id and echo it back.
+    // Carries the revision this session agreed on at `initialize`, so a request that arrives
+    // without the header is answered under the contract the client actually negotiated.
+    let mut session_rev: Option<protocol::Rev> = None;
     if let Some(sid) = headers.get("mcp-session-id").and_then(|v| v.to_str().ok()) {
         let mut known = state.sessions.write().await;
         match known.get_mut(sid) {
-            Some(last) => *last = uptime_secs(), // refresh so an active session does not expire
+            Some((last, rev)) => {
+                *last = uptime_secs(); // refresh so an active session does not expire
+                session_rev = Some(*rev);
+            }
             None => {
                 let body = json!({ "jsonrpc": "2.0", "id": req.get("id").cloned().unwrap_or(Value::Null),
                     "error": { "code": -32001, "message": "unknown or expired session — reinitialize" } });
@@ -363,8 +369,19 @@ pub(crate) async fn mcp_handler(
     let req_logic = req.clone();
     // The negotiated revision has to be read on the thread that runs the logic: `spawn_blocking`
     // moves the work to another thread and thread-local state does not follow it.
-    // Always Some: an HTTP request must not inherit the revision another client negotiated. A
-    // client that sends no header is, in practice, an older client.
+    //
+    // Always Some: an HTTP request must not inherit the revision *another* client negotiated —
+    // several clients share one process here. It may, and must, inherit the one THIS session
+    // negotiated, which is why the fallback goes through `session_rev` rather than straight to the
+    // oldest revision. The transport specification permits the default only "if the server does
+    // not receive an MCP-Protocol-Version header, and has no other way to identify the version —
+    // for example, by relying on the protocol version negotiated during initialization".
+    //
+    // The last resort is the oldest revision we implement, not the `2025-03-26` the specification
+    // names: that revision is not in `Rev::parse`, so assuming it would mean answering under a
+    // contract this server cannot honour. The oldest one we do implement is the conservative
+    // reading the clause asks for.
+    //
     // The draft carries the version in the body's `_meta`; earlier revisions use the header. Read
     // both here, because the header agreement check below needs to know which contract applies
     // before the request reaches the thread that runs it.
@@ -374,6 +391,7 @@ pub(crate) async fn mcp_handler(
             .get("mcp-protocol-version")
             .and_then(|v| v.to_str().ok())
             .and_then(protocol::Rev::parse)
+            .or(session_rev)
             .unwrap_or(protocol::Rev::V20250618)
     });
     let wire_rev = Some(rev_for_request);
@@ -425,20 +443,42 @@ pub(crate) async fn mcp_handler(
 
     // initialize without a session id → issue a new one
     let method = req.get("method").and_then(|v| v.as_str()).unwrap_or("");
+    // What we ANSWERED with, not what the client asked for: that string is the contract this
+    // session now runs under, so that is the one worth remembering. A failed `initialize` has no
+    // `result` and leaves nothing to remember.
+    let negotiated = if method == "initialize" {
+        resp.get("result")
+            .and_then(|r| r.get("protocolVersion"))
+            .and_then(|v| v.as_str())
+            .and_then(protocol::Rev::parse)
+    } else {
+        None
+    };
     let final_session_id = if method == "initialize" && session_id.is_none() {
         let new_id = Uuid::new_v4().to_string();
         let now = uptime_secs();
         let mut s = state.sessions.write().await;
         if s.len() >= MAX_SESSIONS {
-            s.retain(|_, last| now.saturating_sub(*last) < SESSION_IDLE_SECS);
+            s.retain(|_, (last, _)| now.saturating_sub(*last) < SESSION_IDLE_SECS);
             if s.len() >= MAX_SESSIONS {
                 s.clear(); // still full = someone is inflating it; start clean rather than grow
             }
         }
-        s.insert(new_id.clone(), now);
+        s.insert(
+            new_id.clone(),
+            (now, negotiated.unwrap_or(protocol::Rev::V20250618)),
+        );
         new_id
     } else {
-        session_id.unwrap_or_default()
+        let sid = session_id.unwrap_or_default();
+        // Re-initializing over a live session changes the contract, so the remembered revision has
+        // to change with it — otherwise the session would keep answering under the old one.
+        if let Some(rev) = negotiated {
+            if let Some(entry) = state.sessions.write().await.get_mut(&sid) {
+                entry.1 = rev;
+            }
+        }
+        sid
     };
 
     if !final_session_id.is_empty() {
