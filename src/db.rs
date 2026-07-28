@@ -939,8 +939,28 @@ pub(crate) fn simulate_index(
         // EXPLAIN (FORMAT JSON) returns a `json` column, not text. Reading it as a String panicked
         // the worker thread and surfaced as "internal task error" — a message that tells the caller
         // nothing and tells us nothing either. `try_get` so a type surprise is an error, not a panic.
-        r.try_get::<_, Value>(0)
-            .map_err(|e| format!("could not read the plan: {e}"))
+        let v = r
+            .try_get::<_, Value>(0)
+            .map_err(|e| format!("could not read the plan: {e}"))?;
+        // The same 8 MB ceiling every other result path answers to. A G4 round called this one
+        // unbounded; it is not truly unbounded — the plan grows with the query, and the query is
+        // already capped at MAX_SQL_LEN and killed by statement_timeout — but it was the ONE
+        // endpoint from which a caller could get a response larger than the server's own limit.
+        //
+        // Honest about what this does and does not do: it bounds the RESPONSE, not the peak. The
+        // plan is already in memory by the time we can measure it, because PostgreSQL will not let
+        // you wrap EXPLAIN in a subquery and ask it to measure the result for you — the trick used
+        // in `execute_readonly` is unavailable here for exactly that reason.
+        let size = serde_json::to_string(&v).map(|s| s.len()).unwrap_or(0);
+        if size > MAX_RESULT_BYTES {
+            return Err(format!(
+                "the query plan is {} MB, over the {} MB limit — simplify the query before asking \
+                 what an index would do to it",
+                size / 1_048_576,
+                MAX_RESULT_BYTES / 1_048_576
+            ));
+        }
+        Ok(v)
     };
 
     let result = (|| -> Result<Value, String> {

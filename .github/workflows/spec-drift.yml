@@ -38,14 +38,29 @@ jobs:
             exit 1
           fi
           echo "identifiers agree"
-      - name: Say whether the draft has become the current revision
+      - name: Fail the moment the draft becomes a released revision
         shell: bash
         run: |
-          # Promotion is the moment the preview switch should stop being a switch. Nothing announces
-          # it, so notice it here rather than by reading the news.
-          cur=$(curl -sSf --retry 3 https://modelcontextprotocol.io/specification/versioning \
-                | grep -oE '20[0-9]{2}-[0-9]{2}-[0-9]{2}' | head -1 || true)
-          echo "the site's current revision looks like: ${cur:-unknown}"
-          if [ "${cur:-}" = "$(sed -n 's/.*Rev::V20260728 => "\([0-9-]*\)".*/\1/p' src/protocol.rs | head -1)" ]; then
-            echo "::warning title=The draft is now current::What we ship behind MCP_PROTOCOL_PREVIEW is no longer a draft. Consider making it the default."
-          fi
+          set -euo pipefail
+          # Promotion is the moment `MCP_PROTOCOL_PREVIEW` should stop being a switch and become the
+          # default. The previous version of this step scraped modelcontextprotocol.io and compared a
+          # date it grepped out of the page. That page answers with a JavaScript shell, so the grep
+          # found nothing, the variable was empty, and the comparison was false on every run since it
+          # was written. A control that cannot fire is worse than no control: it occupies the place
+          # where a real one would go.
+          #
+          # The unambiguous signal is structural: the specification repository cuts a directory named
+          # after the revision when it ships. `draft` becoming `2026-07-28` is a fact, not a rendering.
+          ours=$(sed -n 's/.*Rev::V20260728 => "\([0-9-]*\)".*/\1/p' src/protocol.rs | head -1)
+          dirs=$(curl -sSf --retry 3 \
+                 https://api.github.com/repos/modelcontextprotocol/modelcontextprotocol/contents/schema \
+                 | python3 -c 'import json,sys; print(" ".join(d["name"] for d in json.load(sys.stdin) if d["type"]=="dir"))')
+          echo "schema directories upstream: $dirs"
+          echo "our preview revision:        $ours"
+          for d in $dirs; do
+            if [ "$d" = "$ours" ]; then
+              echo "::error title=The preview is now a released revision::$ours has been cut upstream. Compare it with what we ship behind MCP_PROTOCOL_PREVIEW, then make it the default — a client speaking $ours is currently negotiated DOWN to 2025-11-25."
+              exit 1
+            fi
+          done
+          echo "still a draft — the preview switch stays a switch"
