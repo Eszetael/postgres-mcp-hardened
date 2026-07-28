@@ -9,42 +9,158 @@ use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 // --- Global hash chain state ---
-pub(crate) static AUDIT_PREV: Lazy<Mutex<String>> = Lazy::new(|| {
-    // Chain continuity across restarts: read the last hash from the audit file (MCP_AUDIT_LOG) so
-    // tamper evidence survives a restart (resetting to GENESIS would break the chain).
-    let start = std::env::var("MCP_AUDIT_LOG")
-        .ok()
+//
+// The high-water mark lives BESIDE the log, not inside it. A verifier whose memory sits within the
+// thing it protects cannot detect that thing being shortened: truncate the tail, restart, and both
+// the last hash and the last sequence number are re-read from the new final line. The chain is
+// internally consistent, the numbering is contiguous, and nothing objects. The previous docstring
+// claimed tail truncation was detectable; it was not, for exactly that reason.
+//
+// `<log>.hwm` therefore records the last (seq, hash) we ourselves wrote. On start we compare it with
+// the log. Disagreement is reported loudly — it is not proof of tampering (an unclean shutdown looks
+// the same), but it is proof that something is worth looking at, which is the whole job of a
+// tamper-EVIDENT trail.
+fn hwm_path() -> Option<String> {
+    std::env::var("MCP_AUDIT_LOG").ok().map(|p| format!("{}.hwm", p))
+}
+
+/// Last entry recorded in the log itself: `(seq, hash)`.
+/// `None` = the file does not exist. `Some(None)` = it exists but its last line is unusable.
+fn last_entry_in_log() -> Option<Option<(u64, String)>> {
+    let path = std::env::var("MCP_AUDIT_LOG").ok()?;
+    if !std::path::Path::new(&path).exists() {
+        return None; // genuinely a first run — silence is correct here
+    }
+    let content = match std::fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(e) => {
+            // The file IS there and we cannot read it. Falling back to GENESIS here would make a
+            // deleted or unreadable audit trail indistinguishable from a first run.
+            eprintln!(
+                "AUDIT: {} exists but cannot be read ({}) — the chain cannot be continued.",
+                path, e
+            );
+            return Some(None);
+        }
+    };
+    let last = content.lines().rev().find(|l| !l.trim().is_empty());
+    let Some(last) = last else {
+        return Some(None); // present but empty
+    };
+    match serde_json::from_str::<Value>(last) {
+        Ok(v) => {
+            let seq = v.get("seq").and_then(|s| s.as_u64());
+            let hash = v.get("hash").and_then(|h| h.as_str()).map(String::from);
+            match (seq, hash) {
+                (Some(s), Some(h)) => Some(Some((s, h))),
+                _ => {
+                    eprintln!("AUDIT: last line of {} has no seq/hash — chain state unknown.", path);
+                    Some(None)
+                }
+            }
+        }
+        Err(e) => {
+            eprintln!("AUDIT: last line of {} is not valid JSON ({}) — chain state unknown.", path, e);
+            Some(None)
+        }
+    }
+}
+
+/// What we resume from, and whether anything about it deserves a shout.
+///
+/// The anomaly is a RETURNED VALUE, not a side effect on stderr. A detector whose only output is
+/// a print cannot be tested, and an untested detector is a claim — which is precisely the defect
+/// this change exists to remove.
+pub(crate) struct Resume {
+    pub seq: u64,
+    pub hash: String,
+    pub anomaly: Option<String>,
+}
+
+pub(crate) fn resume_state() -> Resume {
+    let in_log = last_entry_in_log();
+    let hwm = hwm_path()
         .and_then(|p| std::fs::read_to_string(p).ok())
-        .and_then(|c| {
-            c.lines()
-                .rev()
-                .find(|l| !l.trim().is_empty())
-                .map(String::from)
-        })
-        .and_then(|last| serde_json::from_str::<Value>(&last).ok())
-        .and_then(|v| v.get("hash").and_then(|h| h.as_str()).map(String::from))
-        .unwrap_or_else(|| "GENESIS".into());
-    Mutex::new(start)
+        .and_then(|c| serde_json::from_str::<Value>(&c).ok())
+        .and_then(|v| {
+            Some((
+                v.get("seq")?.as_u64()?,
+                v.get("hash")?.as_str()?.to_string(),
+            ))
+        });
+    match (&in_log, &hwm) {
+        // First run: no log, no mark. Nothing to say.
+        (None, None) => Resume { seq: 0, hash: "GENESIS".into(), anomaly: None },
+        // A mark but no log at all — the log was removed.
+        (None, Some((s, _))) => Resume {
+            seq: *s,
+            hash: "GENESIS".into(),
+            anomaly: Some(format!(
+                "the log is gone but the high-water mark says {} entries were written — the trail \
+                 has been removed or moved",
+                s
+            )),
+        },
+        // A log we cannot parse. `last_entry_in_log` already said why, on stderr.
+        (Some(None), _) => Resume {
+            seq: hwm.map(|(s, _)| s).unwrap_or(0),
+            hash: "GENESIS".into(),
+            anomaly: Some("the log exists but its last entry is unusable — chain state unknown".into()),
+        },
+        // A log we can read, and no mark to compare with (upgrade from an older build).
+        (Some(Some((s, h))), None) => Resume { seq: *s, hash: h.clone(), anomaly: None },
+        // Both present — this is the comparison that makes truncation visible.
+        (Some(Some((s_log, h_log))), Some((s_hwm, h_hwm))) => {
+            let anomaly = if *s_log < *s_hwm {
+                Some(format!(
+                    "the log ends at entry {} but {} were written — {} entries are MISSING FROM \
+                     THE END. A truncated log is internally consistent, which is why this check \
+                     lives outside it",
+                    s_log,
+                    s_hwm,
+                    s_hwm - s_log
+                ))
+            } else if *s_log == *s_hwm && h_log != h_hwm {
+                Some(format!(
+                    "entry {} is present but its hash differs from the recorded one — the last \
+                     entry was rewritten",
+                    s_log
+                ))
+            } else {
+                None
+            };
+            Resume { seq: *s_log.max(s_hwm), hash: h_log.clone(), anomaly }
+        }
+    }
+}
+
+/// One read of the state, shared by both statics — and the single place the anomaly is announced.
+/// The previous code read the file twice, once per static, which was both wasteful and a way for
+/// the two to disagree.
+static RESUME: Lazy<Resume> = Lazy::new(|| {
+    let r = resume_state();
+    if let Some(a) = &r.anomaly {
+        eprintln!("AUDIT: {}", a);
+    }
+    r
 });
 
-/// Sequence number of the last entry — a gap reveals a deleted entry, and knowing the last number
-/// makes TAIL TRUNCATION detectable (recomputing the chain alone cannot see it, because a truncated
-/// log is internally consistent).
-pub(crate) static AUDIT_SEQ: Lazy<std::sync::atomic::AtomicU64> = Lazy::new(|| {
-    let last = std::env::var("MCP_AUDIT_LOG")
-        .ok()
-        .and_then(|p| std::fs::read_to_string(p).ok())
-        .and_then(|c| {
-            c.lines()
-                .rev()
-                .find(|l| !l.trim().is_empty())
-                .map(String::from)
-        })
-        .and_then(|l| serde_json::from_str::<Value>(&l).ok())
-        .and_then(|v| v.get("seq").and_then(|s| s.as_u64()))
-        .unwrap_or(0);
-    std::sync::atomic::AtomicU64::new(last)
-});
+pub(crate) static AUDIT_PREV: Lazy<Mutex<String>> = Lazy::new(|| Mutex::new(RESUME.hash.clone()));
+
+/// Sequence number of the last entry. A gap reveals a deleted entry; comparison with the sidecar
+/// high-water mark reveals a shortened one.
+pub(crate) static AUDIT_SEQ: Lazy<std::sync::atomic::AtomicU64> =
+    Lazy::new(|| std::sync::atomic::AtomicU64::new(RESUME.seq));
+
+/// Records (seq, hash) beside the log. Best effort: a failure here must never lose an audit entry,
+/// but it is reported, because a silent failure would quietly disarm the truncation check.
+fn write_hwm(seq: u64, hash: &str) {
+    let Some(p) = hwm_path() else { return };
+    let body = json!({ "seq": seq, "hash": hash }).to_string();
+    if let Err(e) = std::fs::write(&p, body) {
+        eprintln!("AUDIT: could not update {} ({}) — truncation detection is degraded.", p, e);
+    }
+}
 
 // --- SQL fingerprint (first 16 hex characters of SHA-256) ---
 pub(crate) fn sql_fingerprint(sql: &str) -> String {
@@ -149,6 +265,10 @@ pub(crate) fn audit_extra(
         if let Err(e) = res {
             METRICS.audit_write_failed.fetch_add(1, Ordering::Relaxed);
             eprintln!("AUDIT WRITE FAILED ({}): {}", path, e);
+        } else {
+            // The mark moves only AFTER the entry is durably appended. The other order would let a
+            // crash between the two leave a mark ahead of the log and cry truncation on every start.
+            write_hwm(seq, &full_entry["hash"].as_str().unwrap_or_default().to_string());
         }
     }
 }
@@ -484,6 +604,55 @@ mod tests {
             "{err}"
         );
         std::fs::remove_file(p).ok();
+    }
+
+    /// The truncation detector must FIRE, not merely exist. The previous mechanism had a docstring
+    /// promising exactly this and could never deliver it, because its memory lived inside the file
+    /// it was guarding. This test cuts the tail and asserts the anomaly is reported.
+    #[test]
+    fn a_shortened_log_is_detected_by_the_sidecar_mark() {
+        let dir = std::env::temp_dir().join(format!("hwm-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("audit.jsonl");
+        let hwm = dir.join("audit.jsonl.hwm");
+        let c = chain(&[entry(1, "query"), entry(2, "query"), entry(3, "query")]);
+        std::fs::write(&log, &c).unwrap();
+        let last = serde_json::from_str::<Value>(c.lines().last().unwrap()).unwrap();
+        std::fs::write(
+            &hwm,
+            json!({"seq": last["seq"], "hash": last["hash"]}).to_string(),
+        )
+        .unwrap();
+
+        std::env::set_var("MCP_AUDIT_LOG", log.to_str().unwrap());
+        let intact = resume_state();
+        assert!(intact.anomaly.is_none(), "an intact log must not raise: {:?}", intact.anomaly);
+
+        // Cut the last entry — the log stays internally consistent, which is the whole problem.
+        let lines: Vec<&str> = c.lines().collect();
+        std::fs::write(&log, format!("{}\n{}\n", lines[0], lines[1])).unwrap();
+        let cut = resume_state();
+        let a = cut.anomaly.expect("a shortened log MUST be reported");
+        assert!(a.contains("MISSING FROM"), "{a}");
+        assert!(a.contains("2") && a.contains("3"), "should name both counts: {a}");
+
+        // A rewritten last entry is a different anomaly, and must also be seen.
+        let mut tampered: Value = serde_json::from_str(lines[2]).unwrap();
+        tampered["hash"] = json!("0000000000000000000000000000000000000000000000000000000000000000");
+        std::fs::write(
+            &log,
+            format!("{}\n{}\n{}\n", lines[0], lines[1], tampered),
+        )
+        .unwrap();
+        let rew = resume_state();
+        assert!(
+            rew.anomaly.as_deref().unwrap_or("").contains("rewritten"),
+            "{:?}",
+            rew.anomaly
+        );
+
+        std::env::remove_var("MCP_AUDIT_LOG");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// Adding fields to a record must not invalidate the chain: the startup and posture entries carry
