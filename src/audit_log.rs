@@ -21,7 +21,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 // the same), but it is proof that something is worth looking at, which is the whole job of a
 // tamper-EVIDENT trail.
 fn hwm_path() -> Option<String> {
-    std::env::var("MCP_AUDIT_LOG").ok().map(|p| format!("{}.hwm", p))
+    std::env::var("MCP_AUDIT_LOG")
+        .ok()
+        .map(|p| format!("{}.hwm", p))
 }
 
 /// Last entry recorded in the log itself: `(seq, hash)`.
@@ -54,13 +56,19 @@ fn last_entry_in_log() -> Option<Option<(u64, String)>> {
             match (seq, hash) {
                 (Some(s), Some(h)) => Some(Some((s, h))),
                 _ => {
-                    eprintln!("AUDIT: last line of {} has no seq/hash — chain state unknown.", path);
+                    eprintln!(
+                        "AUDIT: last line of {} has no seq/hash — chain state unknown.",
+                        path
+                    );
                     Some(None)
                 }
             }
         }
         Err(e) => {
-            eprintln!("AUDIT: last line of {} is not valid JSON ({}) — chain state unknown.", path, e);
+            eprintln!(
+                "AUDIT: last line of {} is not valid JSON ({}) — chain state unknown.",
+                path, e
+            );
             Some(None)
         }
     }
@@ -90,7 +98,11 @@ pub(crate) fn resume_state() -> Resume {
         });
     match (&in_log, &hwm) {
         // First run: no log, no mark. Nothing to say.
-        (None, None) => Resume { seq: 0, hash: "GENESIS".into(), anomaly: None },
+        (None, None) => Resume {
+            seq: 0,
+            hash: "GENESIS".into(),
+            anomaly: None,
+        },
         // A mark but no log at all — the log was removed.
         (None, Some((s, _))) => Resume {
             seq: *s,
@@ -105,10 +117,16 @@ pub(crate) fn resume_state() -> Resume {
         (Some(None), _) => Resume {
             seq: hwm.map(|(s, _)| s).unwrap_or(0),
             hash: "GENESIS".into(),
-            anomaly: Some("the log exists but its last entry is unusable — chain state unknown".into()),
+            anomaly: Some(
+                "the log exists but its last entry is unusable — chain state unknown".into(),
+            ),
         },
         // A log we can read, and no mark to compare with (upgrade from an older build).
-        (Some(Some((s, h))), None) => Resume { seq: *s, hash: h.clone(), anomaly: None },
+        (Some(Some((s, h))), None) => Resume {
+            seq: *s,
+            hash: h.clone(),
+            anomaly: None,
+        },
         // Both present — this is the comparison that makes truncation visible.
         (Some(Some((s_log, h_log))), Some((s_hwm, h_hwm))) => {
             let anomaly = if *s_log < *s_hwm {
@@ -129,7 +147,11 @@ pub(crate) fn resume_state() -> Resume {
             } else {
                 None
             };
-            Resume { seq: *s_log.max(s_hwm), hash: h_log.clone(), anomaly }
+            Resume {
+                seq: *s_log.max(s_hwm),
+                hash: h_log.clone(),
+                anomaly,
+            }
         }
     }
 }
@@ -158,7 +180,10 @@ fn write_hwm(seq: u64, hash: &str) {
     let Some(p) = hwm_path() else { return };
     let body = json!({ "seq": seq, "hash": hash }).to_string();
     if let Err(e) = std::fs::write(&p, body) {
-        eprintln!("AUDIT: could not update {} ({}) — truncation detection is degraded.", p, e);
+        eprintln!(
+            "AUDIT: could not update {} ({}) — truncation detection is degraded.",
+            p, e
+        );
     }
 }
 
@@ -268,7 +293,7 @@ pub(crate) fn audit_extra(
         } else {
             // The mark moves only AFTER the entry is durably appended. The other order would let a
             // crash between the two leave a mark ahead of the log and cry truncation on every start.
-            write_hwm(seq, &full_entry["hash"].as_str().unwrap_or_default().to_string());
+            write_hwm(seq, full_entry["hash"].as_str().unwrap_or_default());
         }
     }
 }
@@ -626,7 +651,11 @@ mod tests {
 
         std::env::set_var("MCP_AUDIT_LOG", log.to_str().unwrap());
         let intact = resume_state();
-        assert!(intact.anomaly.is_none(), "an intact log must not raise: {:?}", intact.anomaly);
+        assert!(
+            intact.anomaly.is_none(),
+            "an intact log must not raise: {:?}",
+            intact.anomaly
+        );
 
         // Cut the last entry — the log stays internally consistent, which is the whole problem.
         let lines: Vec<&str> = c.lines().collect();
@@ -634,16 +663,16 @@ mod tests {
         let cut = resume_state();
         let a = cut.anomaly.expect("a shortened log MUST be reported");
         assert!(a.contains("MISSING FROM"), "{a}");
-        assert!(a.contains("2") && a.contains("3"), "should name both counts: {a}");
+        assert!(
+            a.contains("2") && a.contains("3"),
+            "should name both counts: {a}"
+        );
 
         // A rewritten last entry is a different anomaly, and must also be seen.
         let mut tampered: Value = serde_json::from_str(lines[2]).unwrap();
-        tampered["hash"] = json!("0000000000000000000000000000000000000000000000000000000000000000");
-        std::fs::write(
-            &log,
-            format!("{}\n{}\n{}\n", lines[0], lines[1], tampered),
-        )
-        .unwrap();
+        tampered["hash"] =
+            json!("0000000000000000000000000000000000000000000000000000000000000000");
+        std::fs::write(&log, format!("{}\n{}\n{}\n", lines[0], lines[1], tampered)).unwrap();
         let rew = resume_state();
         assert!(
             rew.anomaly.as_deref().unwrap_or("").contains("rewritten"),
