@@ -386,6 +386,20 @@ pub(crate) async fn mcp_handler(
     // both here, because the header agreement check below needs to know which contract applies
     // before the request reaches the thread that runs it.
     let body_params = req.get("params").cloned().unwrap_or_else(|| json!({}));
+    // A header we cannot parse is refused, not downgraded — the specification makes this a MUST,
+    // and the difference matters: an absent header means "an older client", a header reading
+    // `not-a-date` means a client that believes it negotiated something we never agreed to.
+    if let Some(asked) = headers
+        .get("mcp-protocol-version")
+        .and_then(|v| v.to_str().ok())
+    {
+        if protocol::Rev::parse(asked).is_none() {
+            let mut body = protocol::unsupported_header_error(asked);
+            body["jsonrpc"] = Value::String("2.0".into());
+            body["id"] = req.get("id").cloned().unwrap_or(Value::Null);
+            return (StatusCode::BAD_REQUEST, HeaderMap::new(), Json(body)).into_response();
+        }
+    }
     let rev_for_request = protocol::rev_from_meta(&body_params).unwrap_or_else(|| {
         headers
             .get("mcp-protocol-version")

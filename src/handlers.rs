@@ -86,7 +86,7 @@ pub(crate) fn handle_server_discover() -> Value {
             "protocolVersions": protocol::Rev::supported(),
             "serverInfo": {
                 "name": server_label(),
-                "version": "0.1.0",
+                "version": env!("CARGO_PKG_VERSION"),
                 "description": "Read-only PostgreSQL for AI agents, with the read-only part enforced before the database sees the statement."
             },
             "capabilities": { "tools": {}, "resources": {} },
@@ -111,7 +111,7 @@ pub(crate) fn handle_initialize(params: &Value) -> Value {
             "instructions": posture::instructions(),
             "serverInfo": {
                 "name": server_label(),
-                "version": "0.1.0",
+                "version": env!("CARGO_PKG_VERSION"),
                 // `description` on Implementation, from 2025-11-25: a client listing several
                 // servers can say what each one is without the user opening its documentation.
                 "description": "Read-only PostgreSQL for AI agents, with the read-only part enforced before the database sees the statement."

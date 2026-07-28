@@ -11,6 +11,16 @@ alternative to the deprecated `@modelcontextprotocol/server-postgres`.
   still a draft upstream. `server/discover` answers under every revision, and carries the security
   posture as structured data — so a client can learn it is talking to a superuser connection
   before it sends a query.
+- **An unsupported protocol version is refused, not downgraded.** `MCP-Protocol-Version:
+  not-a-date` used to get `200` and the oldest contract; the transport specification makes `400 Bad
+  Request` a MUST here, and for good reason — the client goes on believing it negotiated something
+  the server never agreed to, and nothing in the exchange says otherwise. The refusal carries the
+  list of revisions the server does speak. Falling back is for a header that is absent, not one
+  that disagrees.
+- **The server card advertises what the server speaks.** `/.well-known/mcp/server-card.json` named
+  `2025-06-18` while the server has spoken `2025-11-25` since it shipped, so a registry or an agent
+  reading the card had no way to learn otherwise. It now reports the newest revision and the full
+  list, and takes its version from the package manifest instead of a literal that drifts.
 - **A session remembers what it negotiated.** A client that agreed on a revision at `initialize` and
   then omitted the `MCP-Protocol-Version` header used to be served the oldest contract instead.
   The transport specification allows that default only when the server has no other way to

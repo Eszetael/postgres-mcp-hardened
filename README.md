@@ -309,6 +309,13 @@ relying on the protocol version negotiated during initialization". A session is 
 client that negotiated `2025-11-25` and then omitted the header keeps the contract it agreed to
 rather than being silently demoted.
 
+A header we cannot parse is a different matter from a header that is absent, and the specification
+is explicit about it: "If the server receives a request with an invalid or unsupported
+`MCP-Protocol-Version`, it **MUST** respond with `400 Bad Request`." A version we do not implement —
+`2025-03-26`, `not-a-date`, or the draft when `MCP_PROTOCOL_PREVIEW` is off — is refused with `400`
+and the list of revisions we do speak, rather than served under a contract the client never agreed
+to. Falling back is for silence, not for disagreement.
+
 Only a request with neither a header nor a session falls back, and it falls back to `2025-06-18` —
 the oldest revision this server implements — rather than the `2025-03-26` the specification names.
 That revision is not implemented here, and answering under a contract the server cannot honour would

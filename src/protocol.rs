@@ -131,6 +131,22 @@ pub(crate) fn unsupported_version_error(params: &Value) -> Option<Value> {
     }))
 }
 
+/// The same refusal for the HTTP header, which the transport specification makes a hard rule:
+/// "If the server receives a request with an invalid or unsupported `MCP-Protocol-Version`, it MUST
+/// respond with `400 Bad Request`." A header we cannot parse is not a reason to fall back — falling
+/// back is only for a header that is *absent*. This server used to answer `200` to
+/// `mcp-protocol-version: not-a-date` and serve the oldest contract, which is the silent downgrade
+/// the rule exists to prevent.
+pub(crate) fn unsupported_header_error(asked: &str) -> Value {
+    json!({
+        "error": {
+            "code": ERR_UNSUPPORTED_PROTOCOL_VERSION,
+            "message": format!("unsupported protocol version {asked:?}"),
+            "data": { "supported": Rev::supported() }
+        }
+    })
+}
+
 /// Results the draft says a client may cache, with how long it may hold them.
 ///
 /// This is not decoration. An agent that re-reads a 40-table schema on every turn spends more
@@ -168,7 +184,7 @@ pub(crate) fn decorate_result(mut resp: Value, rev: Rev, method: &str, label: &s
     if let Some(m) = meta.as_object_mut() {
         m.insert(
             "io.modelcontextprotocol/serverInfo".into(),
-            json!({ "name": label, "version": "0.1.0" }),
+            json!({ "name": label, "version": env!("CARGO_PKG_VERSION") }),
         );
     }
     resp

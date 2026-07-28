@@ -278,7 +278,11 @@ pub(crate) async fn server_card_handler() -> impl axum::response::IntoResponse {
         "name": "postgres-mcp-hardened",
         "version": env!("CARGO_PKG_VERSION"),
         "description": "Read-only PostgreSQL MCP server in Rust: AST-enforced read-only queries plus database-level read-only transaction, per-session statement_timeout, schema inspection.",
-        "protocolVersion": "2025-06-18",
+        // What a registry reads to decide whether an agent can talk to us. It advertised only
+        // `2025-06-18` while the server has spoken `2025-11-25` since it shipped — a scanner had no
+        // way to learn that. Newest first, and the full list beside it.
+        "protocolVersion": protocol::Rev::latest().as_str(),
+        "protocolVersions": protocol::Rev::supported(),
         "transport": ["streamable-http", "stdio"],
         "endpoint": if base.is_empty() { "/mcp".to_string() } else { format!("{}/mcp", base) },
         "authentication": {

@@ -560,6 +560,36 @@ r=$(curl -s -m 20 -H content-type:application/json -H "mcp-session-id: $SID" "ht
 echo "$r" | grep -q '"isError":true' \
   && ok "a session keeps its negotiated revision when the client omits the header" \
   || no "session revision ignored — client demoted to the older contract" "$r"
+# An unparseable or unsupported header is a refusal, not a downgrade: "If the server receives a
+# request with an invalid or unsupported MCP-Protocol-Version, it MUST respond with 400 Bad Request."
+# It answered 200 and served the oldest contract, so a client could believe it had negotiated
+# something the server never agreed to — the failure mode is silence, which is why it survived.
+for bad in not-a-date 1999-01-01 2025-03-26; do
+  code=$(curl -s -o /tmp/badver_$$ -w '%{http_code}' -m 15 -H content-type:application/json \
+         -H "mcp-protocol-version: $bad" "http://127.0.0.1:$PORT/mcp" \
+         -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}')
+  if [ "$code" = "400" ] && grep -q '"supported"' /tmp/badver_$$; then
+    ok "an unsupported protocol version ($bad) is refused with 400 and the supported list"
+  else
+    no "unsupported version $bad silently downgraded" "HTTP $code $(head -c 120 /tmp/badver_$$)"
+  fi
+done
+rm -f /tmp/badver_$$
+# A supported one must still pass, or the check above would be satisfied by refusing everything.
+code=$(curl -s -o /dev/null -w '%{http_code}' -m 15 -H content-type:application/json \
+       -H 'mcp-protocol-version: 2025-11-25' "http://127.0.0.1:$PORT/mcp" \
+       -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}')
+[ "$code" = "200" ] && ok "and a supported version still gets through" || no "refusing everything" "HTTP $code"
+# What a registry reads. It advertised only 2025-06-18 while the server has spoken 2025-11-25 since
+# it shipped: an agent scanning the card had no way to learn what we actually speak.
+card=$(curl -s -m 15 "http://127.0.0.1:$PORT/.well-known/mcp/server-card.json")
+echo "$card" | grep -q '"protocolVersion":"2025-11-25"' \
+  && ok "the server card advertises the revision we actually speak" \
+  || no "server card advertises the wrong revision" "$(echo "$card" | head -c 200)"
+echo "$card" | grep -q '"protocolVersions":\["2025-11-25","2025-06-18"\]' \
+  && ok "and lists every revision it would accept" || no "no revision list on the card" ""
+echo "$card" | grep -q "\"version\":\"$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)\"" \
+  && ok "and the version on it comes from the manifest, not a literal" || no "card version drifted" ""
 # The control that makes the test above mean something: without a session there is nothing to read,
 # and the answer falls back to the oldest revision this server implements.
 r=$(curl -s -m 20 -H content-type:application/json "http://127.0.0.1:$PORT/mcp" -d "$W")
