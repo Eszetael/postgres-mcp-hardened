@@ -575,6 +575,22 @@ for bad in not-a-date 1999-01-01 2025-03-26; do
   fi
 done
 rm -f /tmp/badver_$$
+# …but not on the handshake itself. The header rule is written about "subsequent requests", while
+# the lifecycle says initialize MUST be answered with a version the server supports. An old client
+# that hardcodes 2025-03-26 in its header has to be able to negotiate, or the backwards-compatibility
+# clause achieves the opposite of its purpose.
+got=$(curl -s -m 15 -H content-type:application/json -H 'mcp-protocol-version: 2025-03-26' \
+      "http://127.0.0.1:$PORT/mcp" \
+      -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}' \
+      | python3 -c 'import sys,json;d=json.load(sys.stdin);print(d.get("result",{}).get("protocolVersion","NONE"))' 2>/dev/null)
+[ "$got" = "2025-06-18" ] && ok "initialize still negotiates even with an unsupported header" \
+  || no "the handshake was locked out by the header rule" "got $got"
+# A failed handshake must not leave a session behind: the id would be usable, under a revision
+# nobody agreed on, because a rejected initialize has no negotiated version to remember.
+SID2=$(curl -s -m 15 -D - -o /dev/null -H content-type:application/json "http://127.0.0.1:$PORT/mcp" \
+       -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"1999-01-01"}}}' \
+       | tr -d '\r' | awk 'tolower($1)=="mcp-session-id:"{print $2}')
+[ -z "$SID2" ] && ok "a rejected handshake leaves no session behind" || no "session issued for a failed initialize" "$SID2"
 # A supported one must still pass, or the check above would be satisfied by refusing everything.
 code=$(curl -s -o /dev/null -w '%{http_code}' -m 15 -H content-type:application/json \
        -H 'mcp-protocol-version: 2025-11-25' "http://127.0.0.1:$PORT/mcp" \

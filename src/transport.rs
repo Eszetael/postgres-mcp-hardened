@@ -389,8 +389,18 @@ pub(crate) async fn mcp_handler(
     // A header we cannot parse is refused, not downgraded — the specification makes this a MUST,
     // and the difference matters: an absent header means "an older client", a header reading
     // `not-a-date` means a client that believes it negotiated something we never agreed to.
+    //
+    // `initialize` is exempt, and deliberately so. Two rules meet here: the transport says a bad
+    // header MUST get a 400, but it says so about "all subsequent requests" — requests after the
+    // handshake — while the lifecycle says the server MUST answer `initialize` with a version it
+    // supports rather than an error. On `initialize` the specific rule wins: an older client that
+    // hardcodes `2025-03-26` in its header would otherwise be locked out of a handshake that would
+    // have succeeded, which is the opposite of what the backwards-compatibility clause is for.
+    // Negotiation belongs in the body there; the header rule applies from the next request on.
+    let is_initialize = req.get("method").and_then(|v| v.as_str()) == Some("initialize");
     if let Some(asked) = headers
         .get("mcp-protocol-version")
+        .filter(|_| !is_initialize)
         .and_then(|v| v.to_str().ok())
     {
         if protocol::Rev::parse(asked).is_none() {
@@ -468,32 +478,36 @@ pub(crate) async fn mcp_handler(
     } else {
         None
     };
-    let final_session_id = if method == "initialize" && session_id.is_none() {
-        let new_id = Uuid::new_v4().to_string();
-        let now = uptime_secs();
-        let mut s = state.sessions.write().await;
-        if s.len() >= MAX_SESSIONS {
-            s.retain(|_, (last, _)| now.saturating_sub(*last) < SESSION_IDLE_SECS);
+    // A handshake that failed is not a session. Creating one anyway handed the client an id it could
+    // keep using — under whatever revision the fallback picked, since a failed `initialize` has no
+    // negotiated version to remember. Now a rejected handshake leaves nothing behind.
+    let final_session_id =
+        if method == "initialize" && session_id.is_none() && resp.get("result").is_some() {
+            let new_id = Uuid::new_v4().to_string();
+            let now = uptime_secs();
+            let mut s = state.sessions.write().await;
             if s.len() >= MAX_SESSIONS {
-                s.clear(); // still full = someone is inflating it; start clean rather than grow
+                s.retain(|_, (last, _)| now.saturating_sub(*last) < SESSION_IDLE_SECS);
+                if s.len() >= MAX_SESSIONS {
+                    s.clear(); // still full = someone is inflating it; start clean rather than grow
+                }
             }
-        }
-        s.insert(
-            new_id.clone(),
-            (now, negotiated.unwrap_or(protocol::Rev::V20250618)),
-        );
-        new_id
-    } else {
-        let sid = session_id.unwrap_or_default();
-        // Re-initializing over a live session changes the contract, so the remembered revision has
-        // to change with it — otherwise the session would keep answering under the old one.
-        if let Some(rev) = negotiated {
-            if let Some(entry) = state.sessions.write().await.get_mut(&sid) {
-                entry.1 = rev;
+            s.insert(
+                new_id.clone(),
+                (now, negotiated.unwrap_or(protocol::Rev::V20250618)),
+            );
+            new_id
+        } else {
+            let sid = session_id.unwrap_or_default();
+            // Re-initializing over a live session changes the contract, so the remembered revision has
+            // to change with it — otherwise the session would keep answering under the old one.
+            if let Some(rev) = negotiated {
+                if let Some(entry) = state.sessions.write().await.get_mut(&sid) {
+                    entry.1 = rev;
+                }
             }
-        }
-        sid
-    };
+            sid
+        };
 
     if !final_session_id.is_empty() {
         resp_headers.insert(
