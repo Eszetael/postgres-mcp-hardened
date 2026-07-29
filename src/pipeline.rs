@@ -1,9 +1,9 @@
 //! The gates every request passes, whichever transport it arrived on.
 //!
-//! They used to live inside the HTTP handler, which meant stdio — the transport Claude Desktop and
-//! Claude Code actually use — had none of them: no rate limit, no per-client concurrency cap, no
-//! share of the database pool, and `caller: "-"` in the audit for every single request. The most
-//! common way to run this server was the least protected one.
+//! Gates that live inside one transport protect only that transport. stdio is what Claude Desktop
+//! and Claude Code actually use, so leaving it outside would make the most common way to run this
+//! server the least protected one: no rate limit, no per-client concurrency cap, no share of the
+//! database pool, and no identity in the audit.
 //!
 //! Both transports call `gate` now. They differ only in how a refusal is spelled: HTTP has status
 //! codes, stdio has JSON-RPC errors.

@@ -383,11 +383,10 @@ case "$r" in *panicked*) no "an occupied port still panics" "$r";;
              *) no "no clear message for an occupied port" "$r";; esac
 case "$r" in *MCP_ADDR*) ok "and it names the setting the operator can change";; *) no "the message does not say what to change" "$r";; esac
 stop
-# Audience i issuer są tym, co odróżnia token wystawiony dla NAS od tokenu wystawionego przez tego
-# samego dostawcę tożsamości dla cudzej aplikacji. Bez nich `validate_token` i tak odrzucał każde
-# żądanie, więc fail-open nie było — ale serwer wstawał i dopiero potem odmawiał wszystkiego, jako
-# jedyna misconfiguracja w całym programie. Runda G4 nazwała to krytycznym obejściem; to nie było
-# obejście, tylko niekonsekwencja, i tak jest naprawiona.
+# Audience and issuer are what separate a token minted for this server from one the same identity
+# provider minted for somebody else's application. Configuring OAuth without them is a configuration
+# that cannot work, and the server refuses to start on it rather than starting and then rejecting
+# every request — a misconfiguration should be visible where it was made.
 PEMDIR=$(mktemp -d); openssl genrsa -out "$PEMDIR/k.pem" 2048 2>/dev/null
 openssl rsa -in "$PEMDIR/k.pem" -pubout -out "$PEMDIR/pub.pem" 2>/dev/null
 for miss in JWT_AUD JWT_ISS; do
@@ -902,10 +901,10 @@ GRANT CONNECT ON DATABASE postgres TO acc_posture;
 GRANT USAGE ON SCHEMA public TO acc_posture;
 GRANT SELECT ON customers TO acc_posture;
 SQL
-# Członkostwo w roli WŁASNEJ z niebezpiecznymi atrybutami. Pytaliśmy o osiem nazw wbudowanych
-# i o nic więcej — a atrybutów roli nie dziedziczy się tylko do chwili, w której użytkownik napisze
-# `SET ROLE`. Sprawdzone na ŻYWEJ bazie, bo to jedyny sposób odróżnić "zapytanie wygląda dobrze"
-# od "baza odpowiada tak, jak myślimy".
+# Membership in a custom role that carries dangerous attributes. Attributes are not inherited until
+# the user types `SET ROLE`, which makes membership one command away from holding them. Exercised
+# against a live database: it is the only way to tell "the query looks right" apart from "the
+# database answers the way we think it does".
 docker exec -i acc_pg psql -U postgres -q -v ON_ERROR_STOP=1 <<'SQL' >/dev/null 2>&1 || true
 CREATE ROLE acc_custom_admin NOSUPERUSER CREATEROLE NOLOGIN;
 CREATE ROLE acc_member LOGIN PASSWORD 'm' NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS NOREPLICATION;

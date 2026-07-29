@@ -57,12 +57,10 @@ impl RoleFacts {
         for r in &self.dangerous_roles {
             out.push(format!("is a member of {}", r));
         }
-        // Ucięta próbka NIE JEST dowodem. `LIMIT` w zapytaniu nie ma `ORDER BY`, więc te pięć
-        // tysięcy relacji to arbitralny, niepowtarzalny podzbiór — rola zapisywalna wyłącznie do
-        // tabel spoza niego przechodziła bramę z werdyktem „czytelnik" i serwer wystawiał się do
-        // sieci. `excessive()` w ogóle nie patrzyło na `sampled`, więc brak znaleziska znaczył
-        // „nie znaleźliśmy", a raportowaliśmy to jako „nie ma". To ta sama klasa co cichy limit
-        // w każdym innym pomiarze: niezmierzone trzeba nazwać niezmierzonym.
+        // A truncated scan is not evidence. The write query stops at a bound and has no `ORDER BY`,
+        // so the relations it examined are an arbitrary subset: a role writable only to tables
+        // outside that subset looks exactly like a reader. "We found nothing" and "there is nothing"
+        // are different statements, and only the second one justifies exposing a network listener.
         if self.sampled && self.writable == 0 {
             out.push(format!(
                 "may or may not be able to write: the check stopped at {} relations and this schema                  has more, so \"cannot write\" is something we did not verify",
@@ -690,13 +688,11 @@ mod tests {
         assert!(p.iter().any(|s| s.contains("public.orders")));
     }
 
-    /// Ucięta próbka nie może uchodzić za dowód.
+    /// A bounded scan may not be reported as a clean result.
     ///
-    /// `LIMIT` w zapytaniu o zapisywalne relacje nie ma `ORDER BY`, więc badane pięć tysięcy to
-    /// arbitralny podzbiór. Rola zapisywalna wyłącznie do tabel spoza niego przechodziła bramę
-    /// startową z werdyktem „czytelnik" i serwer wystawiał się do sieci — bo `excessive()` w ogóle
-    /// nie patrzyło na `sampled`. Brak znaleziska znaczył „nie znaleźliśmy", a raportowaliśmy to
-    /// jako „nie ma".
+    /// The write query has no `ORDER BY`, so the relations it reaches are an arbitrary subset of a
+    /// large schema. Finding no writable table among them says nothing about the ones it never
+    /// looked at, and a network listener may only be opened on what was actually verified.
     #[test]
     fn a_truncated_scan_is_not_a_clean_bill_of_health() {
         let truncated = RoleFacts {
@@ -710,8 +706,8 @@ mod tests {
         assert_eq!(p.len(), 1, "niezmierzone musi byc nazwane: {p:?}");
         assert!(p[0].contains("did not verify"), "{p:?}");
 
-        // A pełny skan bez zapisywalnych tabel nadal jest czysty — inaczej kontrola blokowalaby
-        // kazde uczciwe wdrozenie i zostalaby wylaczona.
+        // A complete scan with no writable tables is still clean. Without this half the check would
+        // block every honest deployment, and a check that blocks everything gets switched off.
         let complete = RoleFacts {
             user: "app".into(),
             writable: 0,
@@ -722,9 +718,9 @@ mod tests {
         assert!(complete.excessive().is_empty());
     }
 
-    /// Członkostwo w roli WŁASNEJ z niebezpiecznymi atrybutami było niewidzialne: pytaliśmy o osiem
-    /// nazw wbudowanych i o nic więcej. Atrybutów roli nie dziedziczy się tylko do momentu, w którym
-    /// użytkownik napisze `SET ROLE` — czyli członkostwo jest jedno polecenie od uprawnienia.
+    /// Custom roles carry attributes too, and membership in one is a single `SET ROLE` away from
+    /// holding them. Naming only the built-in roles would answer a narrower question than the one
+    /// that matters: what this login can end up being able to do.
     #[test]
     fn membership_query_asks_about_custom_roles_too() {
         let q = super::MEMBERSHIPS_FOR_TEST;

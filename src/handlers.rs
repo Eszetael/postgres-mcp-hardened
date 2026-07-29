@@ -1,7 +1,9 @@
-//! Split out of `main.rs`, which had grown to 2572 lines holding the entry point, the
-//! configuration gate, both transports, authorisation and the tool dispatcher at once. The
-//! code below is UNCHANGED — this was a move, so that the diff reads as "the same thing,
-//! somewhere else" on the most security-sensitive file in the project.
+//! The methods themselves: what each MCP call answers, and what it declines to answer.
+//!
+//! Every response leaves through one place, so no handler has to know which protocol revision it is
+//! speaking or how a refusal is shaped this year. Tool descriptions are written for the caller that
+//! actually reads them — a model choosing between eight tools with no other context — which is why
+//! each one names its limits rather than leaving them to be discovered by a truncated answer.
 
 use crate::*;
 
@@ -103,9 +105,9 @@ pub(crate) fn handle_server_discover() -> Value {
 }
 
 pub(crate) fn handle_initialize(params: &Value) -> Value {
-    // Answer with a revision we can actually speak: the client's if we implement it, ours otherwise.
-    // The version used to be a constant, which meant we announced 2025-06-18 to a client that had
-    // asked for something newer and could have had the better error contract.
+    // Answer with a revision this server can actually speak: the client's if we implement it, ours
+    // otherwise. Announcing a constant would hand an older contract to a client that asked for a
+    // newer one and could have had the better error shape.
     let rev = protocol::negotiate_initialize(params);
     json!({
         "result": {
@@ -498,10 +500,10 @@ pub(crate) fn handle_database_health(args: &Value) -> Value {
              FROM pg_stat_activity",
         ),
         (
-            // `longest_query_seconds` used to include sessions that are idle in transaction, where
-            // query_start is when the LAST query ended — a connection abandoned for three hours was
-            // reported as a three-hour running query, hiding the actual diagnosis. Split apart, the
-            // idle-in-transaction figure now names the leak instead of disguising it.
+            // Active queries and idle-in-transaction sessions are reported separately, because
+            // `query_start` on an idle session marks when its LAST query ended: counted together,
+            // a connection abandoned for three hours reads as a three-hour running query and hides
+            // the actual diagnosis. Split apart, the second figure names the leak.
             "longest_running",
             "SELECT round(EXTRACT(epoch FROM max(now() - query_start) FILTER (WHERE state = 'active'))::numeric, 1) AS longest_active_query_seconds, \
                     round(EXTRACT(epoch FROM max(now() - xact_start))::numeric, 1) AS longest_transaction_seconds, \
@@ -762,11 +764,10 @@ pub(crate) fn handle_analyze_indexes(args: &Value) -> Value {
          WHERE s.schemaname = $1 AND s.idx_scan = 0 AND NOT i.indisprimary AND NOT i.indisunique \
            AND has_table_privilege(s.relid, 'SELECT') \
          ORDER BY pg_relation_size(s.indexrelid) DESC LIMIT 20";
-    // Grouping used to collapse on `indpred IS NULL`, which asks whether an index is partial but not
-    // WHICH rows it covers — so `WHERE active` and `WHERE NOT active`, indexing disjoint sets, were
-    // reported as duplicates. It also ignored uniqueness, so a UNIQUE index landed in a cluster with
-    // ordinary ones and "drop the redundant copy" could remove the only thing enforcing uniqueness.
-    // Grouping on the predicate text and on indisunique makes the claim mean what it says.
+    // Grouping on `indpred IS NULL` would ask whether an index is partial but not WHICH rows it
+    // covers, so `WHERE active` and `WHERE NOT active` — indexing disjoint sets — would be reported
+    // as duplicates. Ignoring `indisunique` would put a UNIQUE index in a cluster with ordinary
+    // ones, where "drop the redundant copy" could remove the only thing enforcing uniqueness.
     // The grouping key has to be everything that makes two indexes interchangeable. Adding the
     // predicate was not enough: expression indexes all share indkey='0', so `lower(a)` and `upper(b)`
     // grouped together and the tool advised dropping a working index. Sort order (indoption) and

@@ -24,9 +24,8 @@ pub(crate) use db::*;
 pub(crate) use http::*;
 pub(crate) use tools::*;
 
-// Third-party names the modules share. They used to sit loose in the middle of this file and were
-// visible to everyone only because this file IS the crate root; after the split they have to be
-// re-exported deliberately, which is the same prelude idea stated out loud.
+// Third-party names the modules share, re-exported deliberately rather than reachable by accident
+// because this file happens to be the crate root. A prelude, stated out loud.
 pub(crate) use axum::http::header::CONTENT_TYPE;
 pub(crate) use once_cell::sync::Lazy;
 pub(crate) use postgres::Row;
@@ -103,7 +102,7 @@ pub(crate) async fn main() {
             .unwrap_or(0x5EED_1234);
         let r = fuzz::run(iters, seed);
         println!(
-            "fuzz: {} iteracji, seed {}, najwolniejsza walidacja {} ms",
+            "fuzz: {} iterations, seed {}, slowest validation {} ms",
             r.iters, r.seed, r.slowest_ms
         );
         if r.slowest_ms > 0 {
@@ -223,10 +222,9 @@ pub(crate) async fn main() {
     }
 }
 
-// `main.rs` used to be 2572 lines: the entry point, the configuration gate, both transports,
-// authorisation and the tool dispatcher in one file. It was the first file a stranger opens, and it
-// read as something that had grown rather than been designed. These four modules are that file,
-// split along the seams it already had — the code inside them is unchanged.
+// The entry point, the configuration gate, the transports, authorisation and the tool dispatcher
+// are four separate concerns and live in four files. This one keeps only what a stranger opening the
+// project first should see: what starts, in what order, and what has to hold before it does.
 mod authz;
 mod handlers;
 mod startup;

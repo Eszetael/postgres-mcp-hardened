@@ -735,9 +735,8 @@ pub(crate) fn query_catalog(
     // `client.query()` pulls EVERY row into a `Vec<Row>` before returning, so the byte ceiling below
     // could only ever trim the ANSWER; the PEAK was unbounded. `EXPLAIN (FORMAT JSON)` of a large
     // UNION, or a catalog scan over hundreds of thousands of relations, materialised in full inside
-    // this process before anyone could object. The comment here used to claim "the same byte ceiling
-    // the query path enforces" while the mechanism was different — the row path had already been
-    // moved to `query_raw`, and this one had not.
+    // this process before anyone could object. Both paths therefore stream; a ceiling that trims the
+    // answer while the peak stays unbounded protects the reader and not the server.
     //
     // `query_raw` pulls through a portal in batches, so we stop growing at the limit instead of
     // discovering we exceeded it.

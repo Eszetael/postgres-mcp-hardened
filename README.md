@@ -1,9 +1,8 @@
 # postgres-mcp-hardened
 
-> ### 🚧 Work in progress — public so the work is visible, not because it is finished
+> ### 🚧 Work in progress — nothing here is announced as finished
 >
-> No release has been announced and none is submitted to any registry. It is public because that is
-> how the tooling gets to run, and because there is nothing here worth hiding.
+> No release has been announced and none is submitted to any registry.
 >
 > **What is actually proven**, in the sense that something other than an opinion checks it: the
 > read-only rules (a fuzz harness over 200k mutations, an adversarial corpus of every bypass found
@@ -12,9 +11,9 @@
 > verified by hand — including that a tampered file and a wrong identity are both rejected.
 >
 > **What is not**: nobody outside this project has run it in anger. The binaries for macOS and
-> Windows are built and signed but have never been *started* on those platforms. Nine adversarial
-> rounds and one independent review each found something real; there is no evidence that rate has
-> reached zero, and the honest reading is that round eleven would find something too.
+> Windows are built and signed but have never been *started* on those platforms. Every adversarial
+> round run against this code so far has found something real, including rounds run after the
+> previous one came back clean — so the honest reading is that the next one would find something too.
 >
 > Known limits, and the places we were wrong, are written down rather than tidied away:
 > [`THREAT_MODEL.md`](THREAT_MODEL.md), [`docs/AUDIT_2026-07-26.md`](docs/AUDIT_2026-07-26.md).
@@ -60,7 +59,7 @@ the original never had.
 | Auth | none | **OAuth 2.1** (RS256 JWT, scope + audience + issuer) |
 | Audit | none | tamper-evident hash-chained log |
 | Schema as MCP resources | ✅ | ✅ — plus comments, primary and foreign keys |
-| Tests / CI | none | 25 tests, fuzz harness, clippy + `cargo audit` + container build on every push |
+| Tests / CI | none | unit + end-to-end suites against live PostgreSQL, a deterministic fuzz harness, conformance driven by the official MCP SDK, clippy + `cargo audit` + container build on every push |
 | Transport | stdio / deprecated SSE | **Streamable HTTP** + stdio |
 | Maintained | ❌ deprecated since 2024 | ✅ |
 

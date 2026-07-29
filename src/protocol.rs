@@ -139,9 +139,9 @@ pub(crate) fn unsupported_version_error(params: &Value) -> Option<Value> {
 /// The same refusal for the HTTP header, which the transport specification makes a hard rule:
 /// "If the server receives a request with an invalid or unsupported `MCP-Protocol-Version`, it MUST
 /// respond with `400 Bad Request`." A header we cannot parse is not a reason to fall back — falling
-/// back is only for a header that is *absent*. This server used to answer `200` to
-/// `mcp-protocol-version: not-a-date` and serve the oldest contract, which is the silent downgrade
-/// the rule exists to prevent.
+/// back is only for a header that is *absent*. Answering `200` to `mcp-protocol-version: not-a-date`
+/// and serving the oldest contract is precisely the silent downgrade the rule exists to prevent: the
+/// client goes on believing it negotiated something the server never agreed to.
 pub(crate) fn unsupported_header_error(asked: &str) -> Value {
     json!({
         "error": {

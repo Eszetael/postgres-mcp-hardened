@@ -1,7 +1,9 @@
-//! Split out of `main.rs`, which had grown to 2572 lines holding the entry point, the
-//! configuration gate, both transports, authorisation and the tool dispatcher at once. The
-//! code below is UNCHANGED — this was a move, so that the diff reads as "the same thing,
-//! somewhere else" on the most security-sensitive file in the project.
+//! Who is allowed to call what.
+//!
+//! Two mechanisms answer the same question: a shared bearer token for deployments without an
+//! identity provider, and OAuth 2.1 where there is one. They are not alternatives at runtime — when
+//! OAuth is configured the shared token is ignored, because accepting either would let anyone
+//! holding the secret act with full scope while the audit recorded no identity at all.
 
 use crate::*;
 
@@ -67,13 +69,11 @@ static SECRET_CMP_KEY: Lazy<Vec<u8>> = Lazy::new(|| {
 /// should not need the scope that lets them query it.
 /// Which scope a tool needs. Every tool is named; nothing falls through to a default.
 ///
-/// It used to end `_ => "mcp:read"`, and a test asserted that an unknown name — literally
-/// `"anything_added_later"` — was fine with the weakest scope. That is comfortable right up to the
-/// first tool that is more than a read: it would inherit the mildest right in the system without
-/// anyone deciding that, and nothing would say so. An independent review flagged it.
-///
-/// Now the fallback is the strongest scope, so a tool nobody classified is reachable only by an
-/// admin, and `every_tool_has_a_scope_decision` fails the build until someone classifies it.
+/// A fallback of `_ => "mcp:read"` is comfortable right up to the first tool that is more than a
+/// read: it would inherit the mildest right in the system without anyone deciding that, and nothing
+/// would say so. The fallback is therefore the STRONGEST scope — a tool nobody classified is
+/// reachable only by an admin — and `every_tool_has_a_scope_decision` fails the build until someone
+/// classifies it.
 pub(crate) fn required_scope(tool: &str) -> &'static str {
     match tool {
         // Runs caller-supplied SQL.
@@ -144,10 +144,11 @@ pub(crate) fn enforce_auth(
         None => return Ok(None),
     };
 
-    // `initialize` and `tools/list` used to be exempt HERE and nowhere else, so the same door was
-    // shut with a shared token and open with OAuth. An operator moving from one to the other had no
-    // way of seeing that the tool inventory had just become anonymous. Whether those methods are
-    // worth protecting is arguable; a policy that depends on which auth mechanism you picked is not.
+    // One policy, both mechanisms. Exempting methods here and not in the shared-token path would
+    // leave the same door shut with a token and open with OAuth, and an operator moving between them
+    // would have no way of seeing that the tool inventory had just become anonymous. Whether a given
+    // method is worth protecting is arguable; a policy that depends on which mechanism you picked
+    // is not.
 
     // Fail-closed: auth enabled (a pubkey is set) but JWT_AUD/JWT_ISS empty means a broken config.
     // Without this, validate_token skipped the audience check and accepted ANY token signed with the key.

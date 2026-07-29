@@ -1,7 +1,8 @@
-//! Split out of `main.rs`, which had grown to 2572 lines holding the entry point, the
-//! configuration gate, both transports, authorisation and the tool dispatcher at once. The
-//! code below is UNCHANGED — this was a move, so that the diff reads as "the same thing,
-//! somewhere else" on the most security-sensitive file in the project.
+//! What must be true before the first request is served.
+//!
+//! Configuration is validated once, loudly, at start — not lazily on the first request that trips
+//! over it. A server that starts and then refuses everything reports the failure in the wrong place:
+//! far from the setting that caused it, and only to whoever happens to be watching the logs.
 
 use crate::*;
 
@@ -103,10 +104,10 @@ pub(crate) fn spawn_redaction_verification() {
 
 /// Every environment variable this server reads. One list, so that a typo cannot pass for a setting.
 ///
-/// `MCP_REDACT_COLUMN=ssn` — singular, one letter short — used to start the server with redaction
-/// silently switched off, and nothing anywhere would say so. A configuration mistake that turns a
-/// protection off must be louder than one that turns it on, and the only way to be loud about a
-/// misspelling is to know every correct spelling.
+/// `MCP_REDACT_COLUMN=ssn` — singular, one letter short — would otherwise start the server with
+/// redaction silently switched off, and nothing anywhere would say so. A configuration mistake that
+/// turns a protection off must be louder than one that turns it on, and the only way to be loud
+/// about a misspelling is to know every correct spelling.
 ///
 /// `MCP_X_*` is reserved for whoever needs their own variables in the same environment (another MCP
 /// server in the same compose file, say) and is never rejected.
@@ -202,9 +203,8 @@ const SECRET_VARS: &[&str] = &[
 
 /// The settings the server is actually running with, rendered for the audit log.
 ///
-/// The chain used to begin at the first query, so it could say what happened but never under what
-/// configuration — and "was the rate limit on when this happened?" is exactly the question an
-/// incident asks. Connection strings lose their password; secrets become fingerprints; the whole
+/// A chain that begins at the first query can say what happened but never under what configuration,
+/// and "was the rate limit on at the time?" is exactly the question an incident asks. Connection strings lose their password; secrets become fingerprints; the whole
 /// thing is hashed into `config_fp`, which an operator can pin and compare across restarts.
 fn config_snapshot() -> serde_json::Map<String, Value> {
     let mut out = serde_json::Map::new();

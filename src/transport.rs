@@ -1,7 +1,9 @@
-//! Split out of `main.rs`, which had grown to 2572 lines holding the entry point, the
-//! configuration gate, both transports, authorisation and the tool dispatcher at once. The
-//! code below is UNCHANGED — this was a move, so that the diff reads as "the same thing,
-//! somewhere else" on the most security-sensitive file in the project.
+//! The two ways a client reaches this server: stdio and Streamable HTTP.
+//!
+//! Everything that differs between a local subprocess and a networked service lives here — framing,
+//! sessions, rate limits, origin checks — so the handlers below can be written once and answer the
+//! same way on both. What does not live here is the decision about WHAT a request may do; that
+//! belongs to `authz` and `posture`, and this layer only makes sure it is asked.
 
 use crate::*;
 
@@ -111,11 +113,10 @@ pub(crate) async fn run_http() {
         )
         .with_state(state);
 
-    // A port already in use is the most ordinary thing that can go wrong on someone else's machine,
-    // and it used to answer with a Rust panic and a backtrace hint. Our own CI found it: six jobs
-    // died on `AddrInUse` because the runner shares a host with a service already holding 8080.
-    // A server whose entire claim is "check, do not trust" cannot fall over with a stack trace on
-    // the first obstacle — it says what happened, in terms of the setting the operator controls.
+    // A port already in use is the most ordinary thing that can go wrong on someone else's machine:
+    // a CI runner sharing a host, a second instance, a service that took 8080 first. A server whose
+    // whole claim is "check, do not trust" cannot answer that with a stack trace — it says what
+    // happened, in terms of the setting the operator controls.
     let listener = match TcpListener::bind(&addr).await {
         Ok(l) => l,
         Err(e) => {
@@ -173,8 +174,8 @@ pub(crate) async fn delete_session_handler(
         return (StatusCode::TOO_MANY_REQUESTS, "rate limit exceeded").into_response();
     }
     // Session teardown is a state change, so it goes through the same gate as everything else on
-    // this surface. It used to be reachable without a token: anyone who saw a session id (a log, a
-    // proxy, a crash report) could end that client's session on an otherwise authenticated server.
+    // this surface. A session id travels through logs, proxies and crash reports; anyone who reads
+    // one must not be able to end that client's session on an otherwise authenticated server.
     if let Err((code, msg, _)) = enforce_auth(&headers, &json!({"method": "session/delete"})) {
         METRICS.denied_auth.fetch_add(1, Ordering::Relaxed);
         audit("http", "denied_auth", None);
@@ -283,8 +284,9 @@ pub(crate) async fn mcp_handler(
         hdrs.insert("Retry-After", HeaderValue::from_static("1"));
         return (StatusCode::TOO_MANY_REQUESTS, hdrs, Json(body)).into_response();
     }
-    // An unknown `Mcp-Session-Id` must get a 404 so the client knows to initialize again
-    // (Streamable HTTP). The server used to accept ANY invented id and echo it back.
+    // An unknown `Mcp-Session-Id` gets a 404 so the client knows to initialize again (Streamable
+    // HTTP). Accepting an invented id and echoing it back would let a client believe it holds a
+    // session the server has no record of.
     // Carries the revision this session agreed on at `initialize`, so a request that arrives
     // without the header is answered under the contract the client actually negotiated.
     let mut session_rev: Option<protocol::Rev> = None;
@@ -354,8 +356,8 @@ pub(crate) async fn mcp_handler(
             return (sc, hdrs, Json(body)).into_response();
         }
     };
-    // Batch: removed from the MCP 2025-06-18 spec. An explicit error instead of 202 "accepted"
-    // (the client used to wait for responses that never came).
+    // Batch: removed from the MCP 2025-06-18 spec. An explicit error rather than a 202 "accepted",
+    // which would leave the client waiting for responses that are never coming.
     if req.is_array() {
         let body = json!({ "jsonrpc": "2.0", "id": Value::Null,
             "error": { "code": -32600, "message": "JSON-RPC batching is not supported in MCP 2025-06-18 — send one request per message" } });
@@ -532,11 +534,10 @@ pub(crate) async fn mcp_handler(
     // could keep using, under whatever revision the fallback picked, since a rejected `initialize`
     // has no negotiated version to remember.
     //
-    // Stated plainly because it matters when reading this: the guard is DEFENSIVE. No current path
-    // reaches it — `initialize` negotiates rather than refusing, and an authorisation failure
-    // returns long before this line. There is deliberately no acceptance check for it, because a
-    // check that cannot fail is not coverage, it is the appearance of coverage. It stays because
-    // the cost is one condition and the failure it prevents is silent.
+    // The guard is defensive: no path reaches it today, because `initialize` negotiates rather than
+    // refusing and an authorisation failure returns long before this line. It carries no acceptance
+    // check on purpose — a check that cannot fail is not coverage but the appearance of it. It stays
+    // because the cost is one condition and the failure it prevents is silent.
     let final_session_id =
         if method == "initialize" && session_id.is_none() && resp.get("result").is_some() {
             let new_id = Uuid::new_v4().to_string();

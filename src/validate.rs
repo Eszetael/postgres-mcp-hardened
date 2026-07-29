@@ -229,8 +229,8 @@ fn is_invisible(c: char) -> bool {
     // one by the tokenizer, and therefore turns `lowrite` into an identifier that no rule about
     // `lowrite` will ever match. Same for U+2007, U+202F, U+3000 and the rest of the family. This is
     // a rule rather than a list on purpose: it asks the standard library's Unicode tables instead of
-    // enumerating what a fuzz run happened to find, which is how the previous two attempts at this
-    // check each missed the next character along.
+    // enumerating what a fuzz run happened to find. An enumeration is complete only until the next
+    // character along.
     if c.is_whitespace() && !matches!(c, ' ' | '\t' | '\n' | '\r' | '\u{000B}' | '\u{000C}') {
         return true;
     }
@@ -1209,8 +1209,8 @@ fn stmt_kind(s: &Statement) -> String {
 }
 
 /// Caps the row count at `max_rows`: injects a `LIMIT`, and when the query HAS its own limit it
-/// **clamps it downwards** (a hand-written `LIMIT 999999999` used to bypass the declared hard cap
-/// entirely). Returns canonical AST text that itself passes the validator (the round-trip gate).
+/// **clamps it downwards**, so a hand-written `LIMIT 999999999` cannot lift the declared hard cap.
+/// Returns canonical AST text that itself passes the validator (the round-trip gate).
 pub fn enforce_limit(sql: &str, max_rows: u64) -> Result<String, ValidationError> {
     enforce_limit_offset(sql, max_rows, 0)
 }
@@ -1549,7 +1549,7 @@ mod tests {
         ] {
             assert!(
                 validate_readonly(sql).is_ok(),
-                "legalny odczyt zablokowany: {sql}"
+                "a legitimate read was rejected: {sql}"
             );
         }
     }
