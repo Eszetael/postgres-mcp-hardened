@@ -568,8 +568,9 @@ for bad in not-a-date 1999-01-01 2025-03-26; do
   code=$(curl -s -o /tmp/badver_$$ -w '%{http_code}' -m 15 -H content-type:application/json \
          -H "mcp-protocol-version: $bad" "http://127.0.0.1:$PORT/mcp" \
          -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}')
-  if [ "$code" = "400" ] && grep -q '"supported"' /tmp/badver_$$; then
-    ok "an unsupported protocol version ($bad) is refused with 400 and the supported list"
+  if [ "$code" = "400" ] && grep -q '"supported"' /tmp/badver_$$ \
+     && grep -q "\"requested\":\"$bad\"" /tmp/badver_$$; then
+    ok "an unsupported protocol version ($bad) is refused with 400, the supported list and what was asked"
   else
     no "unsupported version $bad silently downgraded" "HTTP $code $(head -c 120 /tmp/badver_$$)"
   fi

@@ -24,6 +24,11 @@ alternative to the deprecated `@modelcontextprotocol/server-postgres`.
   runs the body decides about a different request — does not depend on which revision is in force,
   yet the check did. Requiring the headers early would break every current client, so they are held
   to agreement rather than presence: send them and they must match, send none and nothing changes.
+- **The version refusal carries `requested`, not only `supported`.** The finalized draft puts both in
+  `data`, and the shape matters more than it looks: its backward-compatibility rules tell a client to
+  recognise a *modern* server by recognising this error object. A value carried only in the message is
+  a value a client cannot read — leaving it out would have made this server look legacy to exactly the
+  clients that arrived speaking the new revision.
 - **An unsupported protocol version is refused, not downgraded.** `MCP-Protocol-Version:
   not-a-date` used to get `200` and the oldest contract; the transport specification makes `400 Bad
   Request` a MUST here, and for good reason — the client goes on believing it negotiated something

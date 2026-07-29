@@ -122,11 +122,16 @@ pub(crate) fn unsupported_version_error(params: &Value) -> Option<Value> {
     if Rev::parse(asked).is_some() {
         return None;
     }
+    // `requested` sits in `data`, not only in the message. That is where the finalized draft puts it
+    // — and the shape matters more than it looks: the backward-compatibility rules tell a client to
+    // recognise a MODERN server by recognising this error object. A field carried only in prose is a
+    // field a client cannot read, so leaving it out would make us look like a legacy server to
+    // exactly the clients that came here speaking the new revision.
     Some(json!({
         "error": {
             "code": ERR_UNSUPPORTED_PROTOCOL_VERSION,
-            "message": format!("unsupported protocol version {asked:?}"),
-            "data": { "supported": Rev::supported() }
+            "message": "Unsupported protocol version",
+            "data": { "supported": Rev::supported(), "requested": asked }
         }
     }))
 }
@@ -141,8 +146,8 @@ pub(crate) fn unsupported_header_error(asked: &str) -> Value {
     json!({
         "error": {
             "code": ERR_UNSUPPORTED_PROTOCOL_VERSION,
-            "message": format!("unsupported protocol version {asked:?}"),
-            "data": { "supported": Rev::supported() }
+            "message": "Unsupported protocol version",
+            "data": { "supported": Rev::supported(), "requested": asked }
         }
     })
 }
