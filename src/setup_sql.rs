@@ -20,6 +20,20 @@ fn quote_ident(name: &str) -> String {
 /// Refuses names that have no business being identifiers before they reach `quote_ident`.
 /// Quoting alone is enough for safety; this exists so a typo produces a message rather than a role
 /// called `"; DROP TABLE"`.
+/// Escapes a value that goes inside a single-quoted SQL string literal.
+///
+/// `quote_ident` is the wrong tool here and the difference is not cosmetic: an identifier lives
+/// between double quotes, a literal between single ones, and a name that is safe as one can end the
+/// other. Hand-rolling `replace('\'', "''")` at each site is how one site ends up without it.
+fn quote_literal(value: &str) -> String {
+    value.replace('\'', "''")
+}
+
+/// Names this tool will put into generated SQL.
+///
+/// The escaping below is what makes the output safe; this check is the second lock. A role or schema
+/// name carrying a quote, a semicolon or a backslash is far likelier to be an injection attempt than
+/// a name someone meant — and this SQL is run by a superuser, where being wrong once is enough.
 fn sane_ident(name: &str) -> Result<&str, String> {
     if name.is_empty() || name.len() > 63 {
         return Err(format!(
@@ -27,7 +41,7 @@ fn sane_ident(name: &str) -> Result<&str, String> {
             name
         ));
     }
-    if name.contains(['\0', '\n', '\r', '"']) {
+    if name.contains(['\0', '\n', '\r', '"', '\'', ';', '\\']) {
         return Err(format!(
             "{:?} contains characters an identifier may not",
             name
@@ -247,7 +261,7 @@ fn render(
     ));
     s.push_str(&format!(
         "ALTER ROLE {role} SET search_path = '{}';\n",
-        schemas.join(",")
+        quote_literal(&schemas.join(","))
     ));
 
     s.push_str("\n-- 3. Nothing by default. USAGE on the schema, not CREATE.\n");
@@ -334,12 +348,12 @@ fn render(
     s.push_str(&format!(
         "SELECT 'still privileged' AS problem, rolname FROM pg_roles\n \
          WHERE rolname = '{0}' AND (rolsuper OR rolbypassrls OR rolcreatedb OR rolcreaterole OR rolreplication);\n",
-        opts.role.replace('\'', "''")
+        quote_literal(&opts.role)
     ));
     s.push_str(&format!(
         "SELECT 'owns a relation (owners bypass column grants and RLS)' AS problem, c.relname\n \
          FROM pg_class c WHERE c.relowner = '{0}'::regrole;\n",
-        opts.role.replace('\'', "''")
+        quote_literal(&opts.role)
     ));
     if !opts.redact.is_empty() {
         s.push_str("-- and the column that must stay hidden, asked as the role itself:\n");
@@ -406,5 +420,53 @@ mod tests {
             !out.contains("\"ssn\""),
             "the hidden column is never granted"
         );
+    }
+}
+
+#[cfg(test)]
+mod injection_tests {
+    use super::*;
+
+    /// The generated file is run by a superuser. A name that closes the string literal it sits in
+    /// turns "here is a script that creates a read-only role" into arbitrary DDL, and the operator
+    /// pasting it has no reason to read 60 lines of SQL first.
+    #[test]
+    fn a_name_that_closes_a_literal_is_refused() {
+        for payload in [
+            "public'; DROP DATABASE postgres; --",
+            "public'",
+            "public; DROP SCHEMA public CASCADE",
+            "back\\slash",
+        ] {
+            assert!(
+                sane_ident(payload).is_err(),
+                "accepted a name that has no business in generated SQL: {payload:?}"
+            );
+        }
+    }
+
+    /// Ordinary names still work, or the check above would be satisfied by refusing everything.
+    #[test]
+    fn ordinary_names_still_pass() {
+        for ok in [
+            "public",
+            "app_reader",
+            "Sales2026",
+            "schema-with-dash",
+            "zażółć",
+        ] {
+            assert!(sane_ident(ok).is_ok(), "rejected a legitimate name: {ok:?}");
+        }
+    }
+
+    /// Escaping is the fix; the character check is the second lock. This asserts the fix itself, so
+    /// loosening the check later cannot quietly reopen the hole.
+    #[test]
+    fn a_literal_is_escaped_not_merely_rejected() {
+        assert_eq!(
+            quote_literal("public'; DROP DATABASE postgres; --"),
+            "public''; DROP DATABASE postgres; --"
+        );
+        assert_eq!(quote_literal("plain"), "plain");
     }
 }

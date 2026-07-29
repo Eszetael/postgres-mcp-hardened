@@ -24,6 +24,13 @@ alternative to the deprecated `@modelcontextprotocol/server-postgres`.
   runs the body decides about a different request — does not depend on which revision is in force,
   yet the check did. Requiring the headers early would break every current client, so they are held
   to agreement rather than presence: send them and they must match, send none and nothing changes.
+- **The generated setup script can no longer be turned into arbitrary DDL.** `--print-setup-sql`
+  writes SQL an operator pastes into `psql` as a superuser. A schema name went into the
+  `search_path` line as a raw single-quoted literal, so `--schemas "public'; DROP DATABASE postgres; --"`
+  produced a script containing a live `DROP DATABASE`. Two other sites in the same file already
+  escaped correctly — the pattern was known and applied to some of them. Escaping now goes through
+  one function, and names carrying a quote, a semicolon or a backslash are refused outright: the
+  escaping is the fix, the character check is the second lock.
 - **A truncated write-check no longer passes as a clean bill of health.** The query behind "this role
   cannot write" stops at 5 000 relations and has no `ORDER BY`, so the sample is arbitrary — yet the
   verdict ignored whether it had been truncated. A role writable only to tables outside that
