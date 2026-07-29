@@ -504,22 +504,42 @@ fn check(
             return;
         }
     };
-    if validate::validate_readonly(&canon).is_err() {
+    // I2 says the validator never panics, and this harness is what finds out. A panic in the checks
+    // BELOW would abort the run instead of being reported — the finder dying on the thing it exists
+    // to find. Every call that touches attacker-shaped text is therefore caught, not just the first.
+    let post = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        (
+            validate::validate_readonly(&canon).is_err(),
+            validate::is_query_stmt(input) && !crate::is_row_query(&canon),
+        )
+    }));
+    let (canon_unsafe, cost_bypass) = match post {
+        Ok(v) => v,
+        Err(_) => {
+            findings.push(Finding {
+                kind: "PANIC",
+                input: input.to_string(),
+                detail: "a check on the canonical text panicked".into(),
+            });
+            return;
+        }
+    };
+    if canon_unsafe {
         findings.push(Finding {
             kind: "CANON_UNSAFE",
             input: input.to_string(),
             detail: format!(
-                "kanonizacja daje tekst odrzucany przez walidator (I3): {}",
+                "canonical form is rejected by the validator (I3): {}",
                 trunc(&canon)
             ),
         });
     }
-    if validate::is_query_stmt(input) && !crate::is_row_query(&canon) {
+    if cost_bypass {
         findings.push(Finding {
             kind: "COST_BYPASS",
             input: input.to_string(),
             detail: format!(
-                "Query, ale kanoniczny tekst nie jest row-query → omija cost_guard (I4): {}",
+                "a Query whose canonical text is not a row-query, so it skips the cost guard (I4): {}",
                 trunc(&canon)
             ),
         });
