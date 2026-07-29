@@ -83,9 +83,14 @@ pub(crate) async fn main() {
     // Dev/CI: run one statement through the validator and exit.
     if let Some(pos) = args.iter().position(|a| a == "--validate") {
         let sql = args.get(pos + 1).map(|s| s.as_str()).unwrap_or("");
+        // The exit code says the same thing as the text. A gate that prints REJECT and exits 0 is
+        // not a gate: `if server --validate "$sql"` would read a refused write as permitted.
         match validate::validate_readonly(sql) {
             Ok(()) => println!("ALLOW"),
-            Err(e) => println!("REJECT: {}", e),
+            Err(e) => {
+                println!("REJECT: {}", e);
+                std::process::exit(1);
+            }
         }
         return;
     }
@@ -134,7 +139,10 @@ pub(crate) async fn main() {
         let sql = args.get(pos + 1).map(|s| s.as_str()).unwrap_or("");
         match validate::enforce_limit(sql, 1000) {
             Ok(c) => println!("{}", c),
-            Err(e) => println!("ERR: {}", e),
+            Err(e) => {
+                println!("ERR: {}", e);
+                std::process::exit(1);
+            }
         }
         return;
     }
@@ -144,7 +152,7 @@ pub(crate) async fn main() {
     /// reader has seen enough". `--verify-audit … | head` printed a Rust panic and a non-zero status
     /// on a log long enough to race — it looked like the verification had failed when it had not.
     /// Every other write error is still real and still reported.
-    fn say(line: String) {
+    fn say_with_status(line: String, status: i32) {
         use std::io::Write;
         let mut out = std::io::stdout().lock();
         match out
@@ -153,12 +161,18 @@ pub(crate) async fn main() {
             .and_then(|_| out.flush())
         {
             Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => std::process::exit(0),
+            // A closed pipe means the reader has seen enough, not that the news was good. Exiting 0
+            // here would turn `--verify-audit tampered.log | head -1` into a silent pass — the one
+            // case where the answer matters most.
+            Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => std::process::exit(status),
             Err(e) => {
                 eprintln!("cannot write to stdout: {}", e);
                 std::process::exit(1);
             }
         }
+    }
+    fn say(line: String) {
+        say_with_status(line, 0);
     }
 
     // Audit chain verification. "Tamper-evident" without a tool to check it is a slogan, not a
@@ -184,7 +198,7 @@ pub(crate) async fn main() {
                 ));
             }
             Err(e) => {
-                say(format!("TAMPERED: {}", e));
+                say_with_status(format!("TAMPERED: {}", e), 1);
                 std::process::exit(1);
             }
         }

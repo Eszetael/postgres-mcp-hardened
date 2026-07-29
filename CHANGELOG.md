@@ -24,6 +24,11 @@ alternative to the deprecated `@modelcontextprotocol/server-postgres`.
   runs the body decides about a different request — does not depend on which revision is in force,
   yet the check did. Requiring the headers early would break every current client, so they are held
   to agreement rather than presence: send them and they must match, send none and nothing changes.
+- **The command-line gates exit with the verdict they print.** `--validate` printed `REJECT:` and
+  exited `0`, so `if server --validate "$sql"` read a refused write as permitted; `--canon` did the
+  same on an error. `--verify-audit tampered.log | head -1` exited `0` as well, because a closed pipe
+  was treated as "the reader has seen enough" without asking what the verdict had been — silently
+  passing in the one case where the answer matters most.
 - **The generated setup script can no longer be turned into arbitrary DDL.** `--print-setup-sql`
   writes SQL an operator pastes into `psql` as a superuser. A schema name went into the
   `search_path` line as a raw single-quoted literal, so `--schemas "public'; DROP DATABASE postgres; --"`

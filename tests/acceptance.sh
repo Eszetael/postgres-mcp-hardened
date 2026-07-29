@@ -690,6 +690,26 @@ echo "$card" | grep -q '"type":"apify-platform"' && ok "and names who checks it,
   || no "the card misnames the authenticator" ""
 { kill -9 "$SBPID"; } 2>/dev/null; rm -f /tmp/sb_probe /tmp/acc_sb_half.log; sleep 0.3
 
+section "The command-line gates exit with the verdict they print"
+# A gate that prints REJECT and exits 0 is not a gate: `if server --validate "$sql"` reads a refused
+# write as permitted. Everything that answers a yes/no question has to answer it in the exit code too.
+"$BIN" --validate "SELECT 1" >/dev/null 2>&1 \
+  && ok "--validate exits 0 on a statement it allows" || no "an allowed statement exited non-zero" ""
+"$BIN" --validate "INSERT INTO x VALUES (1)" >/dev/null 2>&1 \
+  && no "--validate exited 0 on a REJECTED statement" "a script using \$? would read this as allowed" \
+  || ok "--validate exits non-zero on a statement it refuses"
+"$BIN" --canon "INSERT INTO x VALUES (1)" >/dev/null 2>&1 \
+  && no "--canon exited 0 on an error" "" || ok "--canon exits non-zero when it cannot answer"
+# A closed pipe means the reader has seen enough, not that the news was good.
+printf 'not a valid audit line\n' > /tmp/acc_tamper_$$.log
+"$BIN" --verify-audit /tmp/acc_tamper_$$.log > /dev/null 2>&1
+[ $? -ne 0 ] && ok "--verify-audit exits non-zero on a tampered log" || no "tampering exited 0" ""
+"$BIN" --verify-audit /tmp/acc_tamper_$$.log 2>/dev/null | head -1 >/dev/null
+[ "${PIPESTATUS[0]}" -ne 0 ] \
+  && ok "and a closed pipe does not turn that verdict into a pass" \
+  || no "piping into head hid a tampered verdict" "exit ${PIPESTATUS[0]}"
+rm -f /tmp/acc_tamper_$$.log
+
 section "Answering \"would this index help\" without creating one"
 # The capability the leading alternative is known for — and it reaches it by defaulting to a
 # connection that can create real indexes. hypopg registers the index in backend memory only, so a
