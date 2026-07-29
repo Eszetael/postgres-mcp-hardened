@@ -902,6 +902,34 @@ GRANT CONNECT ON DATABASE postgres TO acc_posture;
 GRANT USAGE ON SCHEMA public TO acc_posture;
 GRANT SELECT ON customers TO acc_posture;
 SQL
+# Członkostwo w roli WŁASNEJ z niebezpiecznymi atrybutami. Pytaliśmy o osiem nazw wbudowanych
+# i o nic więcej — a atrybutów roli nie dziedziczy się tylko do chwili, w której użytkownik napisze
+# `SET ROLE`. Sprawdzone na ŻYWEJ bazie, bo to jedyny sposób odróżnić "zapytanie wygląda dobrze"
+# od "baza odpowiada tak, jak myślimy".
+docker exec -i acc_pg psql -U postgres -q -v ON_ERROR_STOP=1 <<'SQL' >/dev/null 2>&1 || true
+CREATE ROLE acc_custom_admin NOSUPERUSER CREATEROLE NOLOGIN;
+CREATE ROLE acc_member LOGIN PASSWORD 'm' NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS NOREPLICATION;
+GRANT acc_custom_admin TO acc_member;
+GRANT CONNECT ON DATABASE postgres TO acc_member;
+GRANT USAGE ON SCHEMA public TO acc_member;
+SQL
+CUSTOM_LOG=/tmp/acc_custom_$$.log
+env DATABASE_URL="postgres://acc_member:m@127.0.0.1:$PGPORT_ACC/postgres" \
+    MCP_ADDR=0.0.0.0:$(( PORT + 40 )) MCP_BEARER_TOKEN=t "$BIN" > "$CUSTOM_LOG" 2>&1
+if grep -q "acc_custom_admin" "$CUSTOM_LOG"; then
+  ok "membership in a custom role that may CREATEROLE is seen and named"
+else
+  no "a custom role with dangerous attributes stayed invisible" "$(grep -i 'role\|refus' "$CUSTOM_LOG" | head -3)"
+fi
+# I kontrolka: gdyby to blokowalo KAZDA role, kontrola bylaby bezuzyteczna.
+env DATABASE_URL="postgres://acc_reader:r@127.0.0.1:$PGPORT_ACC/postgres" \
+    MCP_ADDR=0.0.0.0:$(( PORT + 41 )) MCP_BEARER_TOKEN=t timeout 12 "$BIN" > /tmp/acc_plain_$$.log 2>&1 &
+sleep 6
+grep -q "REFUSING TO START" /tmp/acc_plain_$$.log \
+  && no "a plain reader was refused too — the check blocks everything" "$(head -3 /tmp/acc_plain_$$.log)" \
+  || ok "and a plain reader is still allowed to serve"
+{ kill -9 %1; } 2>/dev/null; rm -f "$CUSTOM_LOG" /tmp/acc_plain_$$.log
+
 PAUD=/tmp/acc_posture_$$.log; rm -f "$PAUD"
 start DATABASE_URL="$URL" MCP_AUDIT_LOG="$PAUD"
 r=$(tool security_posture '{}' | body)

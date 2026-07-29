@@ -24,6 +24,17 @@ alternative to the deprecated `@modelcontextprotocol/server-postgres`.
   runs the body decides about a different request — does not depend on which revision is in force,
   yet the check did. Requiring the headers early would break every current client, so they are held
   to agreement rather than presence: send them and they must match, send none and nothing changes.
+- **A truncated write-check no longer passes as a clean bill of health.** The query behind "this role
+  cannot write" stops at 5 000 relations and has no `ORDER BY`, so the sample is arbitrary — yet the
+  verdict ignored whether it had been truncated. A role writable only to tables outside that
+  arbitrary subset was reported as a reader, and the server exposed itself to the network on the
+  strength of it. Absence of a finding meant "we did not find", and it was reported as "there is
+  none". The unverified case is now named as unverified.
+- **Membership in a *custom* role with dangerous attributes is seen.** The check asked about eight
+  built-in role names and nothing else, while role attributes stop being un-inherited the moment a
+  user types `SET ROLE` — the same reasoning already written down for `NOINHERIT`, applied to a list
+  and not to the rest of the database. Both found by an independent reviewer, both proved against a
+  live database rather than by reading the query.
 - **The version refusal carries `requested`, not only `supported`.** The finalized draft puts both in
   `data`, and the shape matters more than it looks: its backward-compatibility rules tell a client to
   recognise a *modern* server by recognising this error object. A value carried only in the message is

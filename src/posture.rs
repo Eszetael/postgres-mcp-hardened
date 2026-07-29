@@ -57,6 +57,18 @@ impl RoleFacts {
         for r in &self.dangerous_roles {
             out.push(format!("is a member of {}", r));
         }
+        // Ucięta próbka NIE JEST dowodem. `LIMIT` w zapytaniu nie ma `ORDER BY`, więc te pięć
+        // tysięcy relacji to arbitralny, niepowtarzalny podzbiór — rola zapisywalna wyłącznie do
+        // tabel spoza niego przechodziła bramę z werdyktem „czytelnik" i serwer wystawiał się do
+        // sieci. `excessive()` w ogóle nie patrzyło na `sampled`, więc brak znaleziska znaczył
+        // „nie znaleźliśmy", a raportowaliśmy to jako „nie ma". To ta sama klasa co cichy limit
+        // w każdym innym pomiarze: niezmierzone trzeba nazwać niezmierzonym.
+        if self.sampled && self.writable == 0 {
+            out.push(format!(
+                "may or may not be able to write: the check stopped at {} relations and this schema                  has more, so \"cannot write\" is something we did not verify",
+                self.scanned
+            ));
+        }
         if self.writable > 0 {
             let sample = if self.writable_examples.is_empty() {
                 String::new()
@@ -86,6 +98,19 @@ fn as_u64(row: &Value, key: &str) -> u64 {
 }
 
 /// Asks the database what the connected role is allowed to do.
+/// Ta sama tresc co `MEMBERSHIPS` w `evaluate` — wystawiona, zeby test mogl sprawdzic, o co
+/// naprawde pytamy bazy. Bez tego "pytamy tez o role wlasne" byloby twierdzeniem, nie kontrola.
+#[cfg(test)]
+pub(crate) const MEMBERSHIPS_FOR_TEST: &str = MEMBERSHIPS_SQL;
+
+const MEMBERSHIPS_SQL: &str = "SELECT rolname FROM pg_roles \
+     WHERE ( rolname IN ('pg_write_all_data','pg_read_all_data','pg_read_server_files', \
+                         'pg_write_server_files','pg_execute_server_program','pg_maintain', \
+                         'pg_signal_backend','pg_checkpoint') \
+             OR rolsuper OR rolbypassrls OR rolcreatedb OR rolcreaterole OR rolreplication ) \
+       AND rolname <> current_user \
+       AND pg_has_role(current_user, oid, 'MEMBER')";
+
 pub(crate) fn evaluate(db: Option<&str>) -> Result<RoleFacts, String> {
     // `pg_roles`, deliberately, not `pg_authid`: `pg_authid` needs superuser, so basing the check on
     // it would return "cannot tell" for exactly the least-privileged roles we most want to confirm.
@@ -96,11 +121,8 @@ pub(crate) fn evaluate(db: Option<&str>) -> Result<RoleFacts, String> {
     // statement away from being unsafe. Asking about membership is asking the question that matters.
     //
     // Roles absent from older versions simply do not come back, so one query covers 13 through 17.
-    const MEMBERSHIPS: &str = "SELECT rolname FROM pg_roles \
-         WHERE rolname IN ('pg_write_all_data','pg_read_all_data','pg_read_server_files', \
-                           'pg_write_server_files','pg_execute_server_program','pg_maintain', \
-                           'pg_signal_backend','pg_checkpoint') \
-           AND pg_has_role(current_user, oid, 'MEMBER')";
+    // Jedno zrodlo tresci — patrz `MEMBERSHIPS_SQL` wyzej.
+    const MEMBERSHIPS: &str = MEMBERSHIPS_SQL;
     // Bounded: a schema with hundreds of thousands of relations must not turn a start-up check into
     // an outage. When the bound is hit we say so rather than reporting a partial count as the whole.
     const WRITABLE: &str = "WITH s AS ( \
@@ -666,6 +688,63 @@ mod tests {
         assert!(p.iter().any(|s| s.contains("BYPASSRLS")));
         assert!(p.iter().any(|s| s.contains("pg_write_all_data")));
         assert!(p.iter().any(|s| s.contains("public.orders")));
+    }
+
+    /// Ucięta próbka nie może uchodzić za dowód.
+    ///
+    /// `LIMIT` w zapytaniu o zapisywalne relacje nie ma `ORDER BY`, więc badane pięć tysięcy to
+    /// arbitralny podzbiór. Rola zapisywalna wyłącznie do tabel spoza niego przechodziła bramę
+    /// startową z werdyktem „czytelnik" i serwer wystawiał się do sieci — bo `excessive()` w ogóle
+    /// nie patrzyło na `sampled`. Brak znaleziska znaczył „nie znaleźliśmy", a raportowaliśmy to
+    /// jako „nie ma".
+    #[test]
+    fn a_truncated_scan_is_not_a_clean_bill_of_health() {
+        let truncated = RoleFacts {
+            user: "app".into(),
+            writable: 0,
+            scanned: 5000,
+            sampled: true,
+            ..Default::default()
+        };
+        let p = truncated.excessive();
+        assert_eq!(p.len(), 1, "niezmierzone musi byc nazwane: {p:?}");
+        assert!(p[0].contains("did not verify"), "{p:?}");
+
+        // A pełny skan bez zapisywalnych tabel nadal jest czysty — inaczej kontrola blokowalaby
+        // kazde uczciwe wdrozenie i zostalaby wylaczona.
+        let complete = RoleFacts {
+            user: "app".into(),
+            writable: 0,
+            scanned: 120,
+            sampled: false,
+            ..Default::default()
+        };
+        assert!(complete.excessive().is_empty());
+    }
+
+    /// Członkostwo w roli WŁASNEJ z niebezpiecznymi atrybutami było niewidzialne: pytaliśmy o osiem
+    /// nazw wbudowanych i o nic więcej. Atrybutów roli nie dziedziczy się tylko do momentu, w którym
+    /// użytkownik napisze `SET ROLE` — czyli członkostwo jest jedno polecenie od uprawnienia.
+    #[test]
+    fn membership_query_asks_about_custom_roles_too() {
+        let q = super::MEMBERSHIPS_FOR_TEST;
+        for attr in [
+            "rolsuper",
+            "rolbypassrls",
+            "rolcreatedb",
+            "rolcreaterole",
+            "rolreplication",
+        ] {
+            assert!(q.contains(attr), "zapytanie nie pyta o {attr}: {q}");
+        }
+        assert!(
+            q.contains("pg_write_all_data"),
+            "wbudowane role nadal objete"
+        );
+        assert!(
+            q.contains("rolname <> current_user"),
+            "wlasna rola uzytkownika liczona osobno"
+        );
     }
 
     #[test]
