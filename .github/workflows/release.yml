@@ -240,7 +240,7 @@ jobs:
           '
 
       - name: Test the wrapper against the artefacts it will ship with
-        run: cd npm && node --test test/
+        run: cd npm && npm test
 
       - name: Publish
         # A `-rc` tag rehearses the release; it must not land on the registry, where publishing is

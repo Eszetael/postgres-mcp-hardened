@@ -1,7 +1,7 @@
 {
   "name": "postgres-mcp-hardened",
   "version": "0.0.0",
-  "description": "Secure read-only PostgreSQL MCP server in Rust — a maintained alternative to the deprecated @modelcontextprotocol/server-postgres. Blocks writes at the AST, not with regexes.",
+  "description": "Secure read-only PostgreSQL MCP server in Rust \u2014 a maintained alternative to the deprecated @modelcontextprotocol/server-postgres. Blocks writes at the AST, not with regexes.",
   "keywords": [
     "mcp",
     "model-context-protocol",
@@ -37,7 +37,7 @@
   ],
   "scripts": {
     "postinstall": "node scripts/postinstall.js",
-    "test": "node --test test/"
+    "test": "node scripts/run-tests.js"
   },
   "engines": {
     "node": ">=18.17"
