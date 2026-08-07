@@ -29,21 +29,21 @@ pub(crate) enum Rev {
     V20250618,
     /// Current: tool execution errors, RFC 9728 discovery fallback, JSON Schema 2020-12.
     V20251125,
-    /// The next revision, still a draft upstream, reachable only behind `MCP_PROTOCOL_PREVIEW=1`.
-    ///
-    /// The identifier is not a release date and nobody has announced one. MCP versions are named for
-    /// "the last date a backwards-incompatible change was made", so `2026-07-28` describes something
-    /// that has already happened in the draft — and it MOVES if one more breaking change lands before
-    /// the revision is promoted. It is taken from `LATEST_PROTOCOL_VERSION` in the normative
-    /// schema.ts, which is the only place it is authoritative. Re-read that constant when the draft
-    /// becomes current, rather than trusting this line.
+    /// Current since upstream cut it on 2026-08-03: the newest revision, spoken by default.
     ///
     /// It is the largest break MCP has had: no `initialize`, no session header, no `ping`. Every
     /// request carries its own protocol version in `_meta`, and `server/discover` replaces the
-    /// handshake. We implement it early and behind a switch for one reason — a draft still moves,
-    /// and a server that announces support for a moving target will be wrong in public. Behind the
-    /// switch an operator can test against it today; with the switch off, nothing about our answers
-    /// changes.
+    /// handshake.
+    ///
+    /// We implemented it early, behind `MCP_PROTOCOL_PREVIEW=1`, because a draft still moves and a
+    /// server announcing support for a moving target will be wrong in public. That reasoning expired
+    /// the moment the specification repository cut a `schema/2026-07-28` directory: the released
+    /// schema and the draft we had verified against differ in four documentation URLs and nothing
+    /// else, so the implementation we had been testing IS the released revision.
+    ///
+    /// Keeping the switch after that point had a cost we were paying without seeing it: a client
+    /// speaking `2026-07-28` was negotiated DOWN to `2025-11-25` — the exact behaviour we criticise
+    /// in the unmaintained server we are replacing. Default since 2026-08-07.
     V20260728,
 }
 
@@ -59,41 +59,32 @@ impl Rev {
         match s.trim() {
             "2025-06-18" => Some(Rev::V20250618),
             "2025-11-25" => Some(Rev::V20251125),
-            // Only recognised when the operator asked for it. Otherwise a client offering the draft
-            // is answered with our stable revision, which is what the specification tells it to
-            // expect from a server that does not implement its version.
-            "2026-07-28" if preview_enabled() => Some(Rev::V20260728),
+            "2026-07-28" => Some(Rev::V20260728),
             _ => None,
         }
     }
     /// The newest we implement. A client asking for something later gets this, and decides whether
     /// it can work with it — which is what the specification tells it to do.
     pub(crate) fn latest() -> Rev {
-        if preview_enabled() {
-            Rev::V20260728
-        } else {
-            Rev::V20251125
-        }
+        Rev::V20260728
     }
     /// Every revision we would accept, newest first — the answer `server/discover` owes a client.
     pub(crate) fn supported() -> Vec<&'static str> {
-        if preview_enabled() {
-            vec!["2026-07-28", "2025-11-25", "2025-06-18"]
-        } else {
-            vec!["2025-11-25", "2025-06-18"]
-        }
+        vec!["2026-07-28", "2025-11-25", "2025-06-18"]
     }
 }
 
-/// Read once: the answer must not change between two requests of the same client.
-pub(crate) fn preview_enabled() -> bool {
-    static ON: Lazy<bool> = Lazy::new(|| {
-        matches!(
-            std::env::var("MCP_PROTOCOL_PREVIEW").as_deref(),
-            Ok("1") | Ok("true") | Ok("yes")
-        )
-    });
-    *ON
+/// True when the operator still sets the switch that used to gate `2026-07-28`.
+///
+/// The variable no longer changes anything, and it stays recognised on purpose: removing it from
+/// `KNOWN_VARS` would make an existing, harmless configuration line report as a misspelling, and
+/// that list exists to catch real typos. Startup says once that it is now redundant — silence would
+/// leave an operator believing a switch controls something it does not.
+pub(crate) fn preview_switch_still_set() -> bool {
+    matches!(
+        std::env::var("MCP_PROTOCOL_PREVIEW").as_deref(),
+        Ok("1") | Ok("true") | Ok("yes")
+    )
 }
 
 /// Error codes the draft allocates to itself. It renumbered them late — `HeaderMismatch` moved from
@@ -218,6 +209,21 @@ pub(crate) fn check_header_agreement(
     // almost everybody actually speaks.
     let headers_absent = hdr_method.is_none() && hdr_name.is_none();
     if rev < Rev::V20260728 && headers_absent {
+        return Ok(());
+    }
+    // The handshake is exempt from the REQUIREMENT, never from the agreement check below.
+    //
+    // `initialize` is where a client finds out what we speak. Refusing it for breaking a rule that
+    // belongs to the revision it is still trying to negotiate is a closed loop: the client cannot
+    // learn it should send the headers, because the only method that would have told it is the one
+    // we refused. We already exempt the handshake from the unsupported-version refusal for exactly
+    // this reason — this is the same rule, applied to the same method.
+    //
+    // Found on 2026-08-07, the day `2026-07-28` became our default: a client claiming that revision
+    // in `_meta` while calling `initialize` stopped being able to negotiate at all. Headers that ARE
+    // sent still have to match the body, because a gateway that authorised on a header we then
+    // contradict is the hole this function exists to close.
+    if body_method == "initialize" && headers_absent {
         return Ok(());
     }
     match hdr_method {
@@ -368,19 +374,43 @@ pub(crate) fn shape_tool_result(resp: Value, rev: Rev) -> Value {
 mod tests {
     use super::*;
 
-    // The draft is reached only through the switch. These run with it off, which is the state
-    // every user is in until they opt in — so they assert what a normal deployment answers.
+    // Upstream cut `schema/2026-07-28` on 2026-08-03, so the revision is current and answered by
+    // default. The switch that used to gate it changes nothing now; these assertions are the reason
+    // we would notice if someone reintroduced the gate.
     #[test]
-    fn draft_is_invisible_until_the_operator_asks_for_it() {
-        assert!(!preview_enabled(), "tests must run with the preview off");
-        assert_eq!(Rev::parse("2026-07-28"), None);
-        assert_eq!(Rev::latest(), Rev::V20251125);
-        assert!(!Rev::supported().contains(&"2026-07-28"));
-        // A client offering the draft is answered with our newest stable, not refused.
+    fn the_current_revision_is_spoken_without_asking_for_it() {
+        assert_eq!(Rev::parse("2026-07-28"), Some(Rev::V20260728));
+        assert_eq!(Rev::latest(), Rev::V20260728);
+        assert_eq!(
+            Rev::supported().first().copied(),
+            Some("2026-07-28"),
+            "server/discover must offer the newest revision first"
+        );
+        // A client speaking the current revision is answered with it — not negotiated down.
         assert_eq!(
             negotiate_initialize(&json!({"protocolVersion": "2026-07-28"})),
+            Rev::V20260728
+        );
+        // and the older revisions stay reachable for clients that have not moved
+        assert_eq!(
+            negotiate_initialize(&json!({"protocolVersion": "2025-11-25"})),
             Rev::V20251125
         );
+        assert_eq!(
+            negotiate_initialize(&json!({"protocolVersion": "2025-06-18"})),
+            Rev::V20250618
+        );
+    }
+
+    #[test]
+    fn the_retired_switch_does_not_change_what_we_speak() {
+        // Both states must answer identically: the variable is kept only so an existing config line
+        // is not reported as a typo. If someone re-wires it to gate a revision, this fails.
+        let before = (Rev::latest(), Rev::supported());
+        std::env::set_var("MCP_PROTOCOL_PREVIEW", "1");
+        assert_eq!((Rev::latest(), Rev::supported()), before);
+        std::env::remove_var("MCP_PROTOCOL_PREVIEW");
+        assert_eq!((Rev::latest(), Rev::supported()), before);
     }
 
     #[test]
@@ -553,5 +583,27 @@ mod tests {
     fn a_successful_result_is_untouched() {
         let ok = json!({"result": {"content": []}});
         assert_eq!(shape_tool_result(ok.clone(), Rev::V20251125), ok);
+    }
+
+    #[test]
+    fn the_handshake_can_still_negotiate_under_the_current_revision() {
+        // Regression for 2026-08-07. Making `2026-07-28` the default switched on its header
+        // requirement, and `initialize` stopped being answerable for a client that claimed that
+        // revision — the one method whose whole job is to let a client find out what we speak.
+        assert!(check_header_agreement(Rev::V20260728, "initialize", None, None, None).is_ok());
+        // The exemption is for ABSENT headers only: a header that is present must still match the
+        // body, or a gateway could authorise one method while we execute another.
+        assert!(check_header_agreement(
+            Rev::V20260728,
+            "initialize",
+            None,
+            Some("tools/call"),
+            None
+        )
+        .is_err());
+        // and it is an exemption for the handshake alone
+        assert!(check_header_agreement(Rev::V20260728, "tools/list", None, None, None).is_err());
+        // older revisions are untouched
+        assert!(check_header_agreement(Rev::V20251125, "tools/list", None, None, None).is_ok());
     }
 }

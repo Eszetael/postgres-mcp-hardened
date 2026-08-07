@@ -38,29 +38,32 @@ jobs:
             exit 1
           fi
           echo "identifiers agree"
-      - name: Fail the moment the draft becomes a released revision
+      - name: Fail when a NEWER revision is cut than the one we answer by default
         shell: bash
         run: |
           set -euo pipefail
-          # Promotion is the moment `MCP_PROTOCOL_PREVIEW` should stop being a switch and become the
-          # default. The previous version of this step scraped modelcontextprotocol.io and compared a
-          # date it grepped out of the page. That page answers with a JavaScript shell, so the grep
-          # found nothing, the variable was empty, and the comparison was false on every run since it
-          # was written. A control that cannot fire is worse than no control: it occupies the place
-          # where a real one would go.
+          # Rewritten 2026-08-07. The previous version of this step fired when `2026-07-28` appeared
+          # as a cut directory — which is exactly what happened on 2026-08-03, and it was right: we
+          # were still hiding that revision behind a switch. The switch is gone and the revision is
+          # our default, so the same check would now be red forever. A permanently red control is
+          # worse than no control: it trains everyone to scroll past the one place a real signal
+          # would appear.
           #
-          # The unambiguous signal is structural: the specification repository cuts a directory named
-          # after the revision when it ships. `draft` becoming `2026-07-28` is a fact, not a rendering.
+          # What matters from here on is the NEXT promotion: a directory newer than our default.
           ours=$(sed -n 's/.*Rev::V20260728 => "\([0-9-]*\)".*/\1/p' src/protocol.rs | head -1)
+          [ -n "$ours" ] || { echo "could not find our own identifier in src/protocol.rs"; exit 1; }
           dirs=$(curl -sSf --retry 3 \
                  https://api.github.com/repos/modelcontextprotocol/modelcontextprotocol/contents/schema \
                  | python3 -c 'import json,sys; print(" ".join(d["name"] for d in json.load(sys.stdin) if d["type"]=="dir"))')
           echo "schema directories upstream: $dirs"
-          echo "our preview revision:        $ours"
+          echo "our default revision:        $ours"
           for d in $dirs; do
-            if [ "$d" = "$ours" ]; then
-              echo "::error title=The preview is now a released revision::$ours has been cut upstream. Compare it with what we ship behind MCP_PROTOCOL_PREVIEW, then make it the default — a client speaking $ours is currently negotiated DOWN to 2025-11-25."
+            case "$d" in
+              draft) continue ;;
+            esac
+            if [ "$d" \> "$ours" ]; then
+              echo "::error title=A newer revision has been cut::$d is published upstream; this server still answers $ours by default. Read its changelog, implement what changed, then move the default."
               exit 1
             fi
           done
-          echo "still a draft — the preview switch stays a switch"
+          echo "no revision newer than ours has been cut"

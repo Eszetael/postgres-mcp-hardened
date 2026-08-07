@@ -170,6 +170,82 @@ jobs:
             dist/*.pem
             dist/*.bundle
 
+  # npm is where the users are. The package this replaces is fetched half a million times a month
+  # through `npx`, and none of those people have a Rust toolchain — a GitHub Release alone reaches
+  # almost none of them. The wrapper published here downloads the binary built above.
+  #
+  # It runs AFTER `build`, and not in parallel, because the checksums it bakes in are computed from
+  # the artefacts that job produced. A wrapper published with checksums from a different build would
+  # refuse to install — correctly, and confusingly.
+  npm:
+    needs: [checks, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write        # npm provenance: the registry records which workflow published this
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with: { path: dist, merge-multiple: true }
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Take the version from the tag
+        shell: bash
+        run: |
+          V="${GITHUB_REF_NAME#v}"
+          cd npm
+          node -e '
+            const fs=require("fs"), p=JSON.parse(fs.readFileSync("package.json"));
+            p.version=process.argv[1];
+            fs.writeFileSync("package.json", JSON.stringify(p,null,2)+"\n");
+          ' "$V"
+          echo "publishing npm version $V"
+
+      # The checksum list is the package's whole trust story: it travels inside the tarball, under
+      # npm's own integrity hash, so a swapped GitHub asset cannot pass. Built here from the real
+      # artefacts — never hand-written.
+      - name: Record the checksums of the artefacts just built
+        shell: bash
+        run: |
+          cd npm
+          : > /tmp/sums.txt
+          for f in ../dist/postgres-mcp-hardened-*.tar.gz ../dist/postgres-mcp-hardened-*.zip; do
+            [ -f "$f" ] || continue
+            printf '%s %s\n' "$(basename "$f")" "$(sha256sum "$f" | cut -d' ' -f1)" >> /tmp/sums.txt
+          done
+          node -e '
+            const fs=require("fs");
+            const out={};
+            for (const line of fs.readFileSync("/tmp/sums.txt","utf8").split("\n")) {
+              const [name,sum]=line.trim().split(/\s+/);
+              if (name && sum) out[name]=sum;
+            }
+            // Five targets are built; anything less means an artefact went missing and users on
+            // that platform would hit "no checksum recorded" instead of an install.
+            const n=Object.keys(out).length;
+            if (n !== 5) { console.error(`expected 5 archives, found ${n}`); process.exit(1); }
+            fs.writeFileSync("checksums.json", JSON.stringify(out,null,2)+"\n");
+            console.log(fs.readFileSync("checksums.json","utf8"));
+          '
+
+      - name: Test the wrapper against the artefacts it will ship with
+        run: cd npm && node --test test/
+
+      - name: Publish
+        # A `-rc` tag rehearses the release; it must not land on the registry, where publishing is
+        # irreversible (unpublish is a 72-hour window and a broken promise to anyone who installed).
+        if: ${{ !contains(github.ref, '-rc') }}
+        run: cd npm && npm publish --provenance --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - name: Rehearsal — show what would be published
+        if: ${{ contains(github.ref, '-rc') }}
+        run: cd npm && npm publish --dry-run --access public
+
   sbom:
     needs: [checks]
     runs-on: ubuntu-latest

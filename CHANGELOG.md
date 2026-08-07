@@ -5,12 +5,31 @@
 First release — a secure, read-only PostgreSQL MCP server in Rust; a hardened
 alternative to the deprecated `@modelcontextprotocol/server-postgres`.
 
-- **Speaks three MCP revisions:** `2025-06-18` (what shipping clients speak), `2025-11-25`
-  (current — refusals arrive as tool execution errors, so the model rewrites the query instead of
-  the user seeing a broken call), and `2026-07-28` behind `MCP_PROTOCOL_PREVIEW=1` while it is
-  still a draft upstream. `server/discover` answers under every revision, and carries the security
-  posture as structured data — so a client can learn it is talking to a superuser connection
-  before it sends a query.
+- **Speaks three MCP revisions, newest by default:** `2026-07-28` (current — stateless, no
+  handshake, no session header; every request carries its version in `_meta`), `2025-11-25`
+  (refusals arrive as tool execution errors, so the model rewrites the query instead of the user
+  seeing a broken call) and `2025-06-18`. `server/discover` answers under every revision, and
+  carries the security posture as structured data — so a client can learn it is talking to a
+  superuser connection before it sends a query.
+
+  `MCP_PROTOCOL_PREVIEW` gated the newest revision while it was a draft. Upstream cut
+  `schema/2026-07-28` on 2026-08-03 — the released schema differs from the draft we had verified
+  against in four documentation URLs and nothing else — so the switch is retired and the revision
+  is the default. A client speaking it was being negotiated *down* to `2025-11-25` until then,
+  which is the behaviour we exist to replace. The variable stays recognised so an existing config
+  line is not reported as a misspelling; startup says once that it no longer does anything.
+
+- **The handshake is exempt from the header requirement, never from header agreement.** From
+  `2026-07-28` a Streamable HTTP POST must carry `Mcp-Method`. Applying that to `initialize` closes
+  a loop: `initialize` is where a client learns what the server speaks, so refusing it for breaking
+  a rule of the revision it is still negotiating leaves the client no way to find out. Headers that
+  *are* sent must still match the body — a gateway that authorises on `Mcp-Method` while we execute
+  something else is the hole that check exists to close.
+
+- **Unknown command-line options are refused, and `--help`/`--version` answer.** The binary used to
+  scan for the flags it knew and ignore the rest: `--version` started an HTTP listener instead of
+  printing a version, and a typo in `--stdio` turned a local stdio server into a network listener —
+  a hang to the client that spawned it, and an unasked-for open port on a shared machine.
 - **Runs on a container platform without code changes (Apify Standby).** The assigned port is read
   from `ACTOR_WEB_SERVER_PORT` and wins over `MCP_ADDR` — said out loud on stderr, because binding
   elsewhere means the run is never marked ready and the symptom is an unexplained timeout. `GET /`

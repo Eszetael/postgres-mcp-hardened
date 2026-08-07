@@ -347,7 +347,7 @@ rather than being silently demoted.
 A header we cannot parse is a different matter from a header that is absent, and the specification
 is explicit about it: "If the server receives a request with an invalid or unsupported
 `MCP-Protocol-Version`, it **MUST** respond with `400 Bad Request`." A version we do not implement —
-`2025-03-26`, `not-a-date`, or the draft when `MCP_PROTOCOL_PREVIEW` is off — is refused with `400`
+`2025-03-26` or `not-a-date` — is refused with `400`
 and the list of revisions we do speak, rather than served under a contract the client never agreed
 to. Falling back is for silence, not for disagreement.
 
@@ -379,13 +379,14 @@ they have always been.
 `2026-07-28` is the largest break MCP has had: no `initialize`, no session header, no `ping`. That
 identifier comes from `LATEST_PROTOCOL_VERSION` in the draft schema, and it is not a release date —
 MCP names a revision for the last date a backwards-incompatible change was made, so it describes the
-draft's history rather than a schedule, and it moves if another breaking change lands. Every
-request carries its own protocol version in `_meta`, and a new `server/discover` replaces the
-handshake. We implement it behind `MCP_PROTOCOL_PREVIEW=1`, and it is off by default for a reason —
-a draft still moves, and a server that advertises support for a moving target will be wrong in
-public. With the switch off, nothing a current client sees changes.
+draft's history rather than a schedule. Every request carries its own protocol version in `_meta`,
+and a new `server/discover` replaces the handshake. We implemented it early behind a switch, because
+a draft moves and a server advertising support for a moving target will be wrong in public. Upstream
+cut `schema/2026-07-28` on 2026-08-03 — the released schema differs from the draft we had verified
+against in four documentation URLs and nothing else — so the switch is gone and this is what the
+server speaks by default. Clients on `2025-11-25` and `2025-06-18` are answered as before.
 
-`server/discover` answers under **every** revision, switch or no switch, because the specification
+`server/discover` answers under **every** revision, because the specification
 expects clients to use it as a backwards-compatibility probe — which only works if older servers
 answer it. Ours answers with the revisions we speak and, in `_meta`, the full security posture. That
 is deliberate: a client can learn it is talking to a server connected as a superuser *before* it
@@ -645,7 +646,7 @@ left resident memory flat and file descriptors unchanged.
 | `MCP_RESERVED_AUTH_SLOTS` | database slots kept for authenticated traffic so an anonymous flood cannot take the pool (default: a quarter) |
 | `MCP_PUBLIC_URL` | this server's public base URL, used in the OAuth discovery metadata |
 | `MCP_AUTH_SERVERS` | authorization server URLs advertised in that metadata |
-| `MCP_PROTOCOL_PREVIEW` | `1` to also speak the next MCP revision (`2026-07-28`) while it is still a draft upstream; off by default, and off changes nothing about what current clients see. **Read once at startup** — changing it needs a restart, and until then the server card and `server/discover` keep reporting what the running process actually speaks |
+| `MCP_PROTOCOL_PREVIEW` | **Retired.** It gated `2026-07-28` while that revision was a draft; upstream released it on 2026-08-03 and the server now speaks it by default. The name stays recognised so an existing config line is not reported as a misspelling, and startup says once that it no longer does anything |
 | `MCP_ALLOW_SCHEMAS` | schemas a query may reach, e.g. `public,analytics`; setting either this or the next turns the allowlist on |
 | `MCP_ALLOW_TABLES` | relations a query may reach, e.g. `public.orders,analytics.*` |
 | `MCP_ALLOW_CATALOG` | `1` to keep `pg_catalog` reachable while an allowlist is active |

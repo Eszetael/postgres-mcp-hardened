@@ -288,6 +288,17 @@ pub(crate) fn audit_startup(transport: &str) {
 pub(crate) fn preflight_config() {
     let mut fatal: Vec<String> = Vec::new();
 
+    // A switch that used to do something and now does nothing is a lie an operator keeps believing.
+    // `MCP_PROTOCOL_PREVIEW` gated `2026-07-28` until upstream cut the revision; it is the default
+    // now. The variable stays recognised so an existing config line is not reported as a typo, and
+    // says so once at startup rather than sitting there looking meaningful.
+    if crate::protocol::preview_switch_still_set() {
+        eprintln!(
+            "MCP_PROTOCOL_PREVIEW is set and no longer does anything: 2026-07-28 was released \
+             upstream and is now the default revision. You can remove the variable."
+        );
+    }
+
     // numbers: a typo must not silently change a threshold or switch a limit off
     for (var, allow_zero) in [
         ("MCP_RATE_RPM", true),

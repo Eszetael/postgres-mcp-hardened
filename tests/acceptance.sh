@@ -537,12 +537,15 @@ echo "$r" | grep -q 'non-read-only' && ok "and the reason is in it, where the mo
 r=$(curl -s -m 15 -H content-type:application/json -H 'mcp-protocol-version: 2025-11-25' "http://127.0.0.1:$PORT/mcp" \
      -d '{"jsonrpc":"2.0","id":1,"method":"no/such/method"}')
 echo "$r" | grep -q '"error"' && ok "an unknown method stays a protocol error" || no "protocol error reshaped" "$r"
-for v in 2025-06-18 2025-11-25 2099-01-01; do
+for v in 2025-06-18 2025-11-25 2026-07-28 2099-01-01; do
   got=$(curl -s -m 15 -H content-type:application/json "http://127.0.0.1:$PORT/mcp" \
         -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"$v\"}}" \
         | python3 -c 'import sys,json;print(json.load(sys.stdin)["result"]["protocolVersion"])')
   case "$v:$got" in
-    2025-06-18:2025-06-18|2025-11-25:2025-11-25|2099-01-01:2025-11-25) ok "initialize negotiates $v to $got";;
+    # A version we speak is answered with itself; one we do not is answered with our newest, which
+    # is what the specification tells a client to expect. The ceiling moved on 2026-08-07 when the
+    # revision behind it was released upstream — this line is where "our newest" is written down.
+    2025-06-18:2025-06-18|2025-11-25:2025-11-25|2026-07-28:2026-07-28|2099-01-01:2026-07-28) ok "initialize negotiates $v to $got";;
     *) no "bad negotiation for $v" "$got";;
   esac
 done
@@ -590,12 +593,19 @@ got=$(curl -s -m 15 -H content-type:application/json -H 'mcp-protocol-version: 2
 got=$(curl -s -m 15 -H content-type:application/json "http://127.0.0.1:$PORT/mcp" \
       -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28"}}}' \
       | python3 -c 'import sys,json;d=json.load(sys.stdin);print(d.get("result",{}).get("protocolVersion","ERROR"))' 2>/dev/null)
-[ "$got" = "2025-11-25" ] && ok "a client offering a revision we do not enable is negotiated down, not refused" \
-  || no "the handshake refused instead of negotiating" "got $got"
-# …and on any other method it IS refused, or the exemption above would be a hole rather than a rule.
+[ "$got" = "2026-07-28" ] && ok "a client offering the current revision is answered with it" \
+  || no "the current revision was negotiated DOWN" "got $got"
+# …and on any other method an unsupported version IS refused, or the exemption above would be a
+# hole rather than a rule. It must name a version we genuinely do not speak: pointing this at the
+# current revision would have quietly retired the control on the day that revision shipped.
+r=$(curl -s -m 15 -H content-type:application/json "http://127.0.0.1:$PORT/mcp" \
+    -d '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2099-01-01"}}}')
+echo "$r" | grep -q '\-32022' && ok "and outside the handshake an unsupported version is refused" || no "the _meta refusal stopped firing" "$r"
+# and a version we DO speak passes on that same path, so the check above is not satisfied by
+# refusing everything that carries a version
 r=$(curl -s -m 15 -H content-type:application/json "http://127.0.0.1:$PORT/mcp" \
     -d '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28"}}}')
-echo "$r" | grep -q '\-32022' && ok "and outside the handshake that same revision is refused" || no "the _meta refusal stopped firing" "$r"
+echo "$r" | grep -q '\-32022' && no "the current revision is refused in _meta" "$r" || ok "and the current revision passes on that same path"
 # A supported one must still pass, or the check above would be satisfied by refusing everything.
 code=$(curl -s -o /dev/null -w '%{http_code}' -m 15 -H content-type:application/json \
        -H 'mcp-protocol-version: 2025-11-25' "http://127.0.0.1:$PORT/mcp" \
@@ -604,10 +614,10 @@ code=$(curl -s -o /dev/null -w '%{http_code}' -m 15 -H content-type:application/
 # What a registry reads. It advertised only 2025-06-18 while the server has spoken 2025-11-25 since
 # it shipped: an agent scanning the card had no way to learn what we actually speak.
 card=$(curl -s -m 15 "http://127.0.0.1:$PORT/.well-known/mcp/server-card.json")
-echo "$card" | grep -q '"protocolVersion":"2025-11-25"' \
+echo "$card" | grep -q '"protocolVersion":"2026-07-28"' \
   && ok "the server card advertises the revision we actually speak" \
   || no "server card advertises the wrong revision" "$(echo "$card" | head -c 200)"
-echo "$card" | grep -q '"protocolVersions":\["2025-11-25","2025-06-18"\]' \
+echo "$card" | grep -q '"protocolVersions":\["2026-07-28","2025-11-25","2025-06-18"\]' \
   && ok "and lists every revision it would accept" || no "no revision list on the card" ""
 echo "$card" | grep -q "\"version\":\"$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)\"" \
   && ok "and the version on it comes from the manifest, not a literal" || no "card version drifted" ""
@@ -882,8 +892,10 @@ start DATABASE_URL="$URL"
 t=$(call '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}')
 echo "$t" | grep -q 'json-schema.org/draft/2020-12/schema' && ok "tool schemas say which JSON Schema dialect they are" || no "no dialect declared" "$(echo "$t" | head -c 300)"
 d=$(call '{"jsonrpc":"2.0","id":1,"method":"server/discover"}')
-echo "$d" | grep -q '2025-11-25' && ok "server/discover answers even with the preview off" || no "no discovery" "$d"
-echo "$d" | grep -q '2026-07-28' && no "the draft is advertised without being asked for" "$d" || ok "and does not advertise the draft nobody enabled"
+echo "$d" | grep -q '2025-11-25' && ok "server/discover still lists the revisions older clients speak" || no "no discovery" "$d"
+# Inverted 2026-08-07: upstream released this revision, so hiding it was the defect. A client that
+# reads the card must be able to learn we speak it without setting anything.
+echo "$d" | grep -q '2026-07-28' && ok "and advertises the current revision" || no "the current revision is missing from discovery" "$d"
 echo "$d" | grep -q 'securityPosture' && ok "discovery carries the posture as data, not prose" || no "no posture in discovery" "$d"
 # With the preview off the header requirement must not exist, or every current client breaks.
 c=$(curl -s -o /dev/null -w '%{http_code}' -m 15 -H content-type:application/json \

@@ -12,6 +12,7 @@
 use serde_json::{json, Value};
 mod audit_log;
 mod auth;
+mod cli;
 mod db;
 mod fuzz;
 mod http;
@@ -80,6 +81,17 @@ pub(crate) fn uptime_secs() -> u64 {
 #[tokio::main]
 pub(crate) async fn main() {
     let args: Vec<String> = std::env::args().collect();
+    // Answer `--help`/`--version`, and refuse an option we do not know, BEFORE anything starts.
+    //
+    // Until 2026-08-07 this binary scanned for the flags it recognised and ignored everything else.
+    // `--version` therefore started an HTTP listener instead of printing a version — the first
+    // command most people type after installing from npm. Worse, a typo in `--stdio` silently
+    // turned a local stdio server into a network listener: to an MCP client that looks like a hang,
+    // and on a shared machine it is an open port nobody asked for. Accepting a setting and quietly
+    // ignoring it is the failure mode this project refuses everywhere else in the code.
+    if let Some(code) = cli::handle_or_refuse(&args) {
+        std::process::exit(code);
+    }
     // Dev/CI: run one statement through the validator and exit.
     if let Some(pos) = args.iter().position(|a| a == "--validate") {
         let sql = args.get(pos + 1).map(|s| s.as_str()).unwrap_or("");

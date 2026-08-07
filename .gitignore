@@ -7,3 +7,7 @@ tests/bench/package-lock.json
 PLAN.local.md
 docs/SELF_HOSTED_RUNNER.md
 GATE_CARD.json
+
+# The npm wrapper downloads the native binary here at install time; it is a build product,
+# and at ~19 MB it is not something a clone should carry.
+npm/vendor/
