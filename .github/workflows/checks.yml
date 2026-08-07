@@ -210,6 +210,12 @@ jobs:
         run: |
           cargo install cargo-deny --locked
           cargo deny check
+      # A permissions change to release.yml cannot be validated by any job in release.yml — that
+      # workflow only runs on a tag, which is to say after it is too late. On 28.07 a hardening
+      # commit removed the write permission from the jobs that upload the release, and the next ten
+      # days of green CI said nothing, because no tag was pushed. This runs on every commit.
+      - name: Release permissions match what the jobs actually do
+        run: python3 scripts/check_release_permissions.py
 
   container:
     runs-on: ${{ vars.RUNNER_LABEL || 'ubuntu-latest' }}

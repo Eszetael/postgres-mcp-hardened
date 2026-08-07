@@ -27,6 +27,14 @@ jobs:
   build:
     needs: [checks]
     name: Build ${{ matrix.target }}
+    # This job uploads the archives, so it needs write. It was taken away on 28.07 by a
+    # least-privilege pass whose justification said "grep finds no release upload, no
+    # `gh release`" — true of the string, false of the job, which uploads through
+    # `softprops/action-gh-release`. Every tag since then would have produced a release with
+    # no binaries in it, and nobody saw it because no tag was pushed until the rc7 rehearsal.
+    # `scripts/check_release_permissions.py` now derives this from the workflow itself.
+    permissions:
+      contents: write
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -248,6 +256,9 @@ jobs:
 
   sbom:
     needs: [checks]
+    # Attaches the bill of materials to the release — same 403, same cause as `build`.
+    permissions:
+      contents: write
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

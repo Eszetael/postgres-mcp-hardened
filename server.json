@@ -1,0 +1,75 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.eszetael/postgres-mcp-hardened",
+  "title": "PostgreSQL (hardened, read-only)",
+  "description": "Read-only PostgreSQL over MCP. Writes refused at the parsed SQL, plus a READ ONLY transaction.",
+  "version": "0.1.0",
+  "websiteUrl": "https://github.com/Eszetael/postgres-mcp-hardened",
+  "repository": {
+    "url": "https://github.com/Eszetael/postgres-mcp-hardened",
+    "source": "github"
+  },
+  "packages": [
+    {
+      "registryType": "npm",
+      "identifier": "postgres-mcp-hardened",
+      "version": "0.1.0",
+      "transport": {
+        "type": "stdio"
+      },
+      "runtimeHint": "npx",
+      "runtimeArguments": [
+        {
+          "type": "positional",
+          "value": "--stdio",
+          "isRequired": true
+        }
+      ],
+      "environmentVariables": [
+        {
+          "name": "DATABASE_URL",
+          "description": "Connection string for the role the server connects as. Use a role that cannot write — the server refuses writes twice, but a read-only role is the layer that does not depend on us being correct. `--print-setup-sql` prints the SQL that creates one.",
+          "isRequired": true,
+          "isSecret": true
+        },
+        {
+          "name": "MCP_STATEMENT_TIMEOUT",
+          "description": "Server-side statement timeout, e.g. `5s`. A question that would pin the database is cancelled by PostgreSQL, not by hope.",
+          "isRequired": false
+        },
+        {
+          "name": "MCP_ALLOW_TABLES",
+          "description": "Comma-separated allowlist. A table off the list is refused by name, and hiding it inside a CTE, a view or a join does not help.",
+          "isRequired": false
+        },
+        {
+          "name": "MCP_AUDIT_LOG",
+          "description": "Path to the tamper-evident audit log. Entries are chained by hash and survive a restart; `--verify-audit` checks the chain against an off-host anchor.",
+          "isRequired": false
+        }
+      ]
+    },
+    {
+      "registryType": "oci",
+      "identifier": "ghcr.io/eszetael/postgres-mcp-hardened",
+      "version": "0.1.0",
+      "transport": {
+        "type": "streamable-http",
+        "url": "http://localhost:8080/mcp"
+      },
+      "environmentVariables": [
+        {
+          "name": "DATABASE_URL",
+          "description": "Connection string for a role that cannot write.",
+          "isRequired": true,
+          "isSecret": true
+        },
+        {
+          "name": "MCP_ADDR",
+          "description": "Address to bind, default 127.0.0.1:8080.",
+          "isRequired": false
+        }
+      ]
+    }
+  ]
+}
