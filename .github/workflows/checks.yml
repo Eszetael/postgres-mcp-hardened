@@ -360,6 +360,15 @@ jobs:
       - run: rustup show
       - name: The unit tests, which need nothing external
         run: cargo test --release --locked
+      # `cargo test` compiles test harnesses into target/release/deps; it does not reliably leave a
+      # plain `target/release/<name>` behind. Every step below execs exactly that path, so without
+      # this line the whole point of the job — starting the binary on a platform nobody has ever
+      # started it on — could not happen. It did not: the first time this job ever ran, 2026-08-07
+      # on the newly public repository, it died with `No such file or directory` and exit 127 after
+      # 103 green unit tests. The check had been written months earlier and was structurally
+      # incapable of doing what its own step name promised.
+      - name: Build the binary the steps below actually run
+        run: cargo build --release --locked
       - name: The binary starts and the validator answers, both ways
         shell: bash
         run: |
