@@ -29,6 +29,28 @@ fn quote_literal(value: &str) -> String {
     value.replace('\'', "''")
 }
 
+/// Text that goes into a `--` comment in the generated file.
+///
+/// A `--` comment ends at the first newline, so a name carrying one leaves the comment and becomes a
+/// statement in a file the operator runs as a superuser. Names read from the catalogue never pass
+/// `sane_ident` — they are what the database actually contains, and refusing them would refuse real
+/// tables — so the escaping has to happen where they are used. Inside `quote_ident` a newline is
+/// harmless; outside it is not, and this is the "outside".
+///
+/// Escaped visibly rather than dropped: `feedback` from a stripped character is silence, and a name
+/// that contains a newline is worth seeing.
+fn comment_safe(text: &str) -> String {
+    text.chars()
+        .map(|c| match c {
+            '\n' => "\\n".to_string(),
+            '\r' => "\\r".to_string(),
+            '\0' => "\\0".to_string(),
+            c if c.is_control() => format!("\\u{{{:x}}}", c as u32),
+            c => c.to_string(),
+        })
+        .collect()
+}
+
 /// Names this tool will put into generated SQL.
 ///
 /// The escaping below is what makes the output safe; this check is the second lock. A role or schema
@@ -238,7 +260,7 @@ fn render(
             "--\n-- NOTE: generated WITHOUT reading the database ({}), so table and column lists are\n\
              -- placeholders. Run this again with DATABASE_URL set and they will be filled in — that\n\
              -- matters most for redaction, where the columns to re-grant must come from the catalogue.\n",
-            why
+            comment_safe(why)
         ));
     }
     s.push_str("\n-- 1. A role that inherits nothing, bypasses nothing, creates nothing.\n");
@@ -321,14 +343,15 @@ fn render(
         if keep.is_empty() {
             s.push_str(&format!(
                 "-- every column of {}.{} is redacted; no GRANT follows, on purpose\n",
-                g.schema, g.table
+                comment_safe(&g.schema),
+                comment_safe(&g.table)
             ));
         } else {
             s.push_str(&format!(
                 "GRANT SELECT ({keep}) ON {0}.{1} TO {role};   -- hidden: {2}\n",
                 quote_ident(&g.schema),
                 quote_ident(&g.table),
-                g.hidden.join(", ")
+                comment_safe(&g.hidden.join(", "))
             ));
         }
     }
@@ -457,6 +480,101 @@ mod injection_tests {
         ] {
             assert!(sane_ident(ok).is_ok(), "rejected a legitimate name: {ok:?}");
         }
+    }
+
+    /// Removes every double-quoted span, so what remains is the text PostgreSQL would read as
+    /// syntax rather than as a name. A newline inside `"..."` is part of an identifier and harmless;
+    /// the same newline outside one starts a statement.
+    fn outside_identifiers(sql: &str) -> String {
+        let mut out = String::new();
+        let mut inside = false;
+        for c in sql.chars() {
+            if c == '"' {
+                inside = !inside;
+                continue;
+            }
+            if !inside {
+                out.push(c);
+            }
+        }
+        out
+    }
+
+    /// Names read from the catalogue are the database's reality, not user input: they never pass
+    /// `sane_ident`, because refusing them would refuse real tables. So they reach the file as they
+    /// are — and a `--` comment ends at the first newline. A table named with one used to end the
+    /// comment and put whatever followed on its own line, in a file the operator runs as a
+    /// superuser. Proven on PostgreSQL 16 on 2026-08-08: the role came out `rolsuper = true`.
+    ///
+    /// The anchor is generated from the benign render rather than eyeballed: outside quoted
+    /// identifiers, hostile names must add no lines at all.
+    #[test]
+    fn a_catalogue_name_cannot_leave_a_comment() {
+        let payload = "\nALTER ROLE mcp_reader SUPERUSER; -- ";
+        let opts = |redact: Vec<String>| Opts {
+            role: "mcp_reader".into(),
+            schemas: vec!["app".into()],
+            tables: vec![],
+            redact,
+            database: None,
+            owner: "postgres".into(),
+        };
+        // Every place a catalogue name reaches the file: the all-columns-redacted comment (schema and
+        // table), the `-- hidden:` list, and the offline note carrying a database error message.
+        let benign = vec![
+            Grant {
+                schema: "app".into(),
+                table: "secrets".into(),
+                columns: Some(vec![]),
+                hidden: vec!["email".into()],
+            },
+            Grant {
+                schema: "app".into(),
+                table: "people".into(),
+                columns: Some(vec!["id".into()]),
+                hidden: vec!["email".into()],
+            },
+        ];
+        let hostile = vec![
+            Grant {
+                schema: format!("app{payload}"),
+                table: format!("secrets{payload}"),
+                columns: Some(vec![]),
+                hidden: vec![format!("email{payload}")],
+            },
+            Grant {
+                schema: format!("app{payload}"),
+                table: format!("people{payload}"),
+                columns: Some(vec!["id".into()]),
+                hidden: vec![format!("email{payload}")],
+            },
+        ];
+        let o = opts(vec!["email".into()]);
+        let expected =
+            outside_identifiers(&render(&o, &o.schemas.clone(), &benign, "db", Some("x")))
+                .lines()
+                .count();
+        let got = outside_identifiers(&render(
+            &o,
+            &o.schemas.clone(),
+            &hostile,
+            "db",
+            Some(&format!("connection refused{payload}")),
+        ));
+        assert_eq!(
+            got.lines().count(),
+            expected,
+            "a hostile name added executable lines:\n{got}"
+        );
+        // The payload's *text* is still there, escaped, inside a comment — that is the point of
+        // escaping visibly rather than dropping. What must not happen is it starting a line, which
+        // is the only way PostgreSQL would read it as a statement.
+        assert!(
+            !got.lines().any(|l| l
+                .trim_start()
+                .starts_with("ALTER ROLE mcp_reader SUPERUSER")),
+            "the payload began a line, so it is syntax again:\n{got}"
+        );
     }
 
     /// Escaping is the fix; the character check is the second lock. This asserts the fix itself, so
