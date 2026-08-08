@@ -606,9 +606,18 @@ pub(crate) fn execute_readonly(final_sql: &str, db: Option<&str>) -> Result<Valu
         // result in RAM BEFORE the cap could act — query_raw pulls rows in batches through a portal, so
         // nothing is materialised at once and we stop before it grows.
         use postgres::fallible_iterator::FallibleIterator;
-        // A per-row SIZE cap computed IN POSTGRES: if a row exceeds the limit, PG returns a marker instead
-        // of the value — our process NEVER receives a giant cell (streaming bounds many rows, but one huge
-        // row would still materialise here).
+        // A per-row SIZE cap computed IN POSTGRES: if a row exceeds the limit, PG returns a marker
+        // instead of the value, so the RESULT stays bounded and the agent is told the row was
+        // omitted rather than handed something truncated.
+        //
+        // It bounds the RESULT, not our MEMORY, and the comment here used to claim otherwise
+        // ("our process NEVER receives a giant cell"). Measured 2026-08-08, PostgreSQL 16, one
+        // request, peak RSS: idle 10 MB · 4 MB cell 42 MB · 30 MB cell 128 MB · 60 MB cell 245 MB ·
+        // 200 MB cell 401 MB — and the last three were all OMITTED from the result. `psql` running
+        // the same wrapped statement gets 12 bytes back, so the growth is not the value arriving;
+        // where it is allocated is not yet established, and a fix written before the mechanism is
+        // understood is a guess. Recorded as measured, with the numbers, rather than left as a
+        // claim the measurement contradicts.
         // The trailing `::text` MATTERS: we take ready JSON TEXT from the database and parse it ourselves
         // instead of letting the driver deserialise jsonb its own way — that path lost digits from
         // `numeric` (avg(amount) 4.2006673312979002 → 4.2006673312979). Parsing the text with

@@ -293,22 +293,35 @@ pub(crate) fn handle_explain_query(args: &Value) -> Value {
     // With `analyze` the statement REALLY RUNS, and this path had none of the protections the query
     // tool applies: no cost guard, no row limit, no byte ceiling. `EXPLAIN (ANALYZE) SELECT` over a
     // cross join executed for the whole statement_timeout and returned whatever it produced —
-    // a denial of service and a way round the cost guard, available to any caller. Planning alone
-    // (`analyze: false`) is cheap and needs neither: running the guard there would double the work
-    // for no gain, since the guard is itself an EXPLAIN.
-    let inner = if analyze {
-        let capped = match validate::enforce_limit(sql, MAX_LIMIT) {
-            Ok(s) => s,
-            Err(e) => {
-                audit("explain_query", "denied_validation", Some(sql));
-                return err_content(-32602, e.to_string());
-            }
-        };
+    // a denial of service and a way round the cost guard, available to any caller.
+    //
+    // Planning alone stays exempt from the COST ceiling, deliberately: "why is this query slow" is
+    // the question this tool exists to answer, and refusing to plan an expensive statement refuses
+    // the diagnosis. It is NOT exempt from the SURFACE — and it used to be, because both checks live
+    // inside `cost_guard` and skipping the guard skipped both. Measured on PostgreSQL 16 on
+    // 2026-08-08 with `MCP_ALLOW_SCHEMAS=app`: `query` refused `tajne.pensje`, `explain_query` with
+    // `analyze: true` refused it, and `analyze: false` returned the plan — relation name, filter and
+    // row estimate, the last of which is a value oracle for anyone willing to vary the filter. The
+    // comment that used to sit here reasoned about cost and forgot the guard carries two things.
+    //
+    // `f64::MAX` says exactly that: enforce the surface, never refuse on price.
+    let capped = match validate::enforce_limit(sql, MAX_LIMIT) {
+        Ok(s) => s,
+        Err(e) => {
+            audit("explain_query", "denied_validation", Some(sql));
+            return err_content(-32602, e.to_string());
+        }
+    };
+    let inner = {
         if is_row_query(&capped) {
-            let max_cost: f64 = std::env::var("MCP_MAX_COST")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(1_000_000.0);
+            let max_cost: f64 = if analyze {
+                std::env::var("MCP_MAX_COST")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(1_000_000.0)
+            } else {
+                f64::MAX
+            };
             match cost_guard(&capped, max_cost, db) {
                 Ok(()) => {}
                 Err(CostErr::TooExpensive(e)) => {
@@ -328,9 +341,16 @@ pub(crate) fn handle_explain_query(args: &Value) -> Value {
                 }
             }
         }
-        capped
-    } else {
-        sql.to_string()
+        // The guard runs on the capped text because that is what `analyze` would execute. What gets
+        // PLANNED without `analyze` is the caller's own statement, uncapped: a plan for a query the
+        // caller did not write is a wrong answer to "why is this slow", and the added LIMIT can
+        // change the plan it was asked about. The surface is unaffected by the difference — a LIMIT
+        // does not change which relations the statement touches.
+        if analyze {
+            capped
+        } else {
+            sql.to_string()
+        }
     };
     let opts = if analyze {
         "FORMAT JSON, ANALYZE true, BUFFERS true"

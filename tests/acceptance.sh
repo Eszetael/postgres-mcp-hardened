@@ -1029,6 +1029,18 @@ r=$(tool query '{"sql":"EXPLAIN VERBOSE SELECT person FROM salaries"}' | body)
 case "$r" in *"outside the configured surface"*) ok "EXPLAIN cannot describe a table off the list";; *) no "EXPLAIN LEAKED AN UNLISTED TABLE" "$r";; esac
 r=$(tool query '{"sql":"EXPLAIN SELECT id FROM customers"}' | body)
 case "$r" in ERROR:*) no "EXPLAIN on a listed table was refused" "$r";; *) ok "EXPLAIN on a listed table still works";; esac
+# The neighbouring variant, which the fix above did not cover: the same leak through the
+# explain_query TOOL. `analyze: true` was guarded, `analyze: false` was not, because both the cost
+# check and the surface check live inside cost_guard and skipping the guard skipped both. Measured
+# 2026-08-08: query refused the table, analyze:true refused it, analyze:false returned the plan.
+r=$(tool explain_query '{"sql":"SELECT person FROM salaries","analyze":false}' | body)
+case "$r" in *"outside the configured surface"*) ok "explain_query cannot plan a table off the list";; *) no "explain_query LEAKED AN UNLISTED TABLE" "$r";; esac
+r=$(tool explain_query '{"sql":"SELECT person FROM salaries","analyze":true}' | body)
+case "$r" in *"outside the configured surface"*) ok "and neither can it with analyze";; *) no "explain_query analyze leaked an unlisted table" "$r";; esac
+# Planning stays exempt from the COST ceiling on purpose: "why is this slow" is the question the
+# tool answers, and refusing to plan an expensive statement refuses the diagnosis.
+r=$(tool explain_query '{"sql":"SELECT count(*) FROM customers c1, customers c2, customers c3, customers c4","analyze":false}' | body)
+case "$r" in *"too expensive"*) no "planning was refused on price, so the tool cannot diagnose slowness" "$r";; *) ok "planning an expensive query is still allowed";; esac
 # Schema tools run fixed queries, not caller SQL, so they keep working.
 r=$(tool list_tables '{"schema":"public"}' | body)
 case "$r" in ERROR:*) no "schema introspection broke under the allowlist" "$r";; *) ok "schema introspection is unaffected";; esac
