@@ -1,19 +1,22 @@
 # postgres-mcp-hardened
 
-> ### 🚧 Work in progress — nothing here is announced as finished
+> ### 🚧 Version 0.1.0 — released, not yet used by anyone but us
 >
-> No release has been announced and none is submitted to any registry.
+> The first release is out: binaries for five platforms, with checksums, Sigstore signatures and
+> build provenance. It is **not** in the MCP registry yet.
 >
 > **What is actually proven**, in the sense that something other than an opinion checks it: the
 > read-only rules (a fuzz harness over 200k mutations, an adversarial corpus of every bypass found
 > so far, PostgreSQL 13–18); the authorisation path end to end; protocol conformance, checked by the
-> official MCP SDK rather than by our own tests; and the release path, whose signatures have been
-> verified by hand — including that a tampered file and a wrong identity are both rejected.
+> official MCP SDK rather than by our own tests; the release path, whose signatures have been
+> verified by hand — including that a tampered file and a wrong identity are both rejected; and the
+> published binary itself, downloaded from the release page and run against a live database.
 >
-> **What is not**: nobody outside this project has run it in anger. The binaries for macOS and
-> Windows are built and signed but have never been *started* on those platforms. Every adversarial
-> round run against this code so far has found something real, including rounds run after the
-> previous one came back clean — so the honest reading is that the next one would find something too.
+> **What is not**: nobody outside this project has run it against their own data. That is the whole
+> reason this is 0.1.0 and not 1.0. Every adversarial round run against this code so far has found
+> something real, including rounds run after the previous one came back clean — the day of the
+> release itself produced four, one of which handed a superuser role to anyone who could create a
+> table. The honest reading is that the next round would find something too.
 >
 > Known limits, and the places we were wrong, are written down rather than tidied away:
 > [`THREAT_MODEL.md`](THREAT_MODEL.md), [`docs/AUDIT_2026-07-26.md`](docs/AUDIT_2026-07-26.md).
@@ -65,9 +68,33 @@ the original never had.
 
 ## Install
 
-```bash
-cargo install postgres-mcp-hardened   # (name pending final publish)
+Three ways in, in the order most people want them.
+
+**Through npm** — shortest, and the one your MCP client config can point at directly. There is no
+Node runtime involved at run time: the package is a launcher that fetches the native binary for your
+platform and verifies its checksum before running it.
+
+```jsonc
+{
+  "mcpServers": {
+    "postgres": {
+      "command": "npx",
+      "args": ["-y", "postgres-mcp-hardened", "--stdio"],
+      "env": { "DATABASE_URL": "postgres://readonly_user:PASSWORD@localhost:5432/mydb" }
+    }
+  }
+}
 ```
+
+The connection string goes in `env`, not in `args`, on purpose: arguments show up in `ps` output and
+in shell history on a shared machine, and a database password does not belong there.
+
+**A binary from the releases page** — one static file, nothing to keep up to date, and the option to
+take if your machine has no Node at all. Every release carries builds for Linux, macOS and Windows
+on x86-64 and arm64, each with a checksum and a signature; verifying them is the next section.
+
+**From source** — `cargo build --release` in a clone. Not `cargo install`: this crate is not on
+crates.io, and an instruction that fails is worse than one that is missing.
 
 ### Checking what you downloaded
 
@@ -225,7 +252,7 @@ Answers to the questions people actually asked about the deprecated server, so n
 an issue to find them.
 
 **`spawn npx ENOENT` / "which Node version do I need?"** — none. This is a single static binary.
-Download it from the releases page (or `cargo install postgres-mcp-hardened`) and point your client
+Download it from the releases page and point your client
 at the file. There is no `node_modules`, no `npx`, nothing to keep up to date.
 
 **"The server starts but nothing is listening on a port."** — that is stdio mode, which is correct

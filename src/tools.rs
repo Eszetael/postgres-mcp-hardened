@@ -199,7 +199,8 @@ pub(crate) fn resources_of(db: Option<&str>) -> Value {
                         // The database name is part of the URI so two instances (production and
                         // development, say) never produce colliding resource identifiers — the most
                         // upvoted complaint about the deprecated server was exactly this ambiguity.
-                        "uri": format!("postgres:///{}/{}/{}/schema", db, s, t),
+                        "uri": format!("postgres:///{}/{}/{}/schema",
+                                       uri_segment(&db), uri_segment(s), uri_segment(t)),
                         "name": format!("{}.{}", s, t),
                         "description": desc,
                         "mimeType": "application/json"
@@ -216,6 +217,50 @@ pub(crate) fn resources_of(db: Option<&str>) -> Value {
     }
 }
 
+/// Percent-encodes one path segment of a resource URI.
+///
+/// A relation name is whatever the database allows, and `/` is allowed. Sticking such a name into
+/// the URI unencoded produces an address that cannot be parsed back: measured 2026-08-09 on
+/// PostgreSQL 16, a table named `a/b/schema` was listed as `postgres:///p/app/a/b/schema/schema`
+/// and `resources/read` answered "unknown resource" — a resource offered and then refused, which is
+/// worse than one that was never offered. A space produced an invalid URI that happened to parse.
+///
+/// Encoded rather than rejected: the table is real and the caller has every right to read it.
+fn uri_segment(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{:02X}", b)),
+        }
+    }
+    out
+}
+
+/// Reverses `uri_segment`. Invalid escapes are left as written rather than guessed at — a name that
+/// does not decode is a name we do not have, and inventing one would look up the wrong table.
+fn uri_segment_decode(s: &str) -> Option<String> {
+    let b = s.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' {
+            if i + 2 >= b.len() {
+                return None;
+            }
+            let h = std::str::from_utf8(&b[i + 1..i + 3]).ok()?;
+            out.push(u8::from_str_radix(h, 16).ok()?);
+            i += 3;
+        } else {
+            out.push(b[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).ok()
+}
+
 /// Odczyt zasobu: `postgres:///<schemat>/<tabela>/schema` → ten sam opis kolumn co `describe_table`.
 pub(crate) fn handle_resources_read(params: &Value) -> Value {
     let uri = params.get("uri").and_then(|v| v.as_str()).unwrap_or("");
@@ -230,12 +275,30 @@ pub(crate) fn handle_resources_read(params: &Value) -> Value {
                 "unknown resource — expected postgres:///<database>/<schema>/<table>/schema" } })
         }
     };
+    // Decoded here, not at the call sites: `describe_table` takes real names, and a name that
+    // still carries `%2F` would miss the table as surely as one split on the slash.
+    let (Some(schema), Some(table)) = (uri_segment_decode(schema), uri_segment_decode(table))
+    else {
+        return json!({ "error": { "code": -32602, "message":
+            "unknown resource — the schema or table part is not valid percent-encoding" } });
+    };
+    let db = match db {
+        Some(d) => match uri_segment_decode(d) {
+            Some(d) => Some(d),
+            None => {
+                return json!({ "error": { "code": -32602, "message":
+                    "unknown resource — the database part is not valid percent-encoding" } })
+            }
+        },
+        None => None,
+    };
+    let (schema, table) = (schema.as_str(), table.as_str());
     if schema.is_empty() || table.is_empty() {
         return json!({ "error": { "code": -32602, "message": "unknown resource — empty schema or table" } });
     }
     let mut a = json!({ "schema": schema, "table": table });
     if let Some(d) = db {
-        a["database"] = Value::String(d.to_string());
+        a["database"] = Value::String(d);
     }
     // Audited under its own name: this is a second entry point to the same data, and a log that
     // records it as `describe_table` cannot answer "how did the caller get here".
@@ -780,6 +843,49 @@ mod tests {
             !stmt.contains("\"sales, warehouse\""),
             "that would be one schema with an odd name"
         );
+    }
+
+    /// Nazwa relacji to cokolwiek dopuszcza baza — w tym `/`, spacja i `%`. Adres zasobu, który tego
+    /// nie koduje, wskazuje na coś innego niż tabela, którą wymienił: 09-08 na PG16 tabela `a/b/schema`
+    /// trafiała na listę jako `postgres:///p/app/a/b/schema/schema`, a `resources/read` odpowiadał
+    /// „unknown resource". Zasób zaoferowany i zaraz odmówiony jest gorszy niż taki, którego nie było.
+    ///
+    /// Test jest OKRĘŻNY (nazwa → adres → nazwa), bo tylko to sprawdza obie strony naraz; porównanie
+    /// z ręcznie wpisanym adresem sprawdzałoby moją literówkę ([[feedback_control_anchor_not_heuristic]]).
+    #[test]
+    fn a_name_survives_the_round_trip_through_a_resource_uri() {
+        for nazwa in [
+            "zwykla",
+            "a/b/schema",
+            "z spacja",
+            "pro%cent",
+            "zażółć",
+            "a?b#c",
+            "kropka.",
+        ] {
+            let zakodowana = uri_segment(nazwa);
+            assert!(
+                !zakodowana.contains('/'),
+                "ukośnik przetrwał kodowanie i rozbije ścieżkę: {nazwa:?} -> {zakodowana:?}"
+            );
+            assert_eq!(
+                uri_segment_decode(&zakodowana).as_deref(),
+                Some(nazwa),
+                "nazwa nie wróciła w całości: {nazwa:?} -> {zakodowana:?}"
+            );
+        }
+    }
+
+    /// Zepsute kodowanie ma ODMÓWIĆ, nie zgadywać: nazwa, która się nie dekoduje, to nazwa, której
+    /// nie mamy, a zgadnięta wskazałaby inną tabelę ([[feedback_silent_data_lies]]).
+    #[test]
+    fn a_broken_escape_is_refused_rather_than_guessed() {
+        for zle in ["a%ZZb", "konczy%", "urwane%A"] {
+            assert!(
+                uri_segment_decode(zle).is_none(),
+                "przyjęto adres, którego nie da się odczytać: {zle:?}"
+            );
+        }
     }
 
     #[test]

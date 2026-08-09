@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.1.1 — 2026-08-09
+
+Everything here was found on the day 0.1.0 went out, by reading the code rather than by a test
+noticing. None of it changes what the server refuses; all of it changes what it tells you.
+
+- **Resource URIs encode the names they carry.** A table named `a/b/schema` was listed as
+  `postgres:///db/app/a/b/schema/schema` and then refused with "unknown resource" — a resource
+  offered and immediately withdrawn. Names are percent-encoded on the way out and decoded on the way
+  in; a malformed escape is refused rather than guessed at, because a guessed name reads a different
+  table.
+- **`cargo install postgres-mcp-hardened` was in the README and does not work** — the crate is not
+  on crates.io. Removed from both places it appeared, and the installation section now describes the
+  three routes that do exist.
+- **Release path took every artefact of the run**, not just the binaries. Which artefacts exist
+  depends on what has finished, so a re-run saw one more than the first attempt and stopped before
+  publishing. Both the signing and the npm jobs now name what they need.
+
 ## 0.1.0 — 2026-08-09
 
 First release — a secure, read-only PostgreSQL MCP server in Rust; a hardened

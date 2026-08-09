@@ -49,7 +49,7 @@ npm install -g postgres-mcp-hardened       # or keep it around
 The package fetches a prebuilt binary for your platform from the matching GitHub release:
 Linux (x64, arm64), macOS (Intel, Apple Silicon) and Windows (x64). Alpine/musl is not among them —
 the Linux builds link against glibc; use the container image `ghcr.io/eszetael/postgres-mcp-hardened`
-or build from source with `cargo install`.
+or build from source with `cargo build --release` in a clone.
 
 Full documentation, configuration reference and the security model:
 **https://github.com/Eszetael/postgres-mcp-hardened**

@@ -3,7 +3,7 @@
   "name": "io.github.eszetael/postgres-mcp-hardened",
   "title": "PostgreSQL (hardened, read-only)",
   "description": "Read-only PostgreSQL over MCP. Writes refused at the parsed SQL, plus a READ ONLY transaction.",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "websiteUrl": "https://github.com/Eszetael/postgres-mcp-hardened",
   "repository": {
     "url": "https://github.com/Eszetael/postgres-mcp-hardened",
@@ -13,7 +13,7 @@
     {
       "registryType": "npm",
       "identifier": "postgres-mcp-hardened",
-      "version": "0.1.0",
+      "version": "0.1.1",
       "transport": {
         "type": "stdio"
       },
@@ -28,7 +28,7 @@
       "environmentVariables": [
         {
           "name": "DATABASE_URL",
-          "description": "Connection string for the role the server connects as. Use a role that cannot write — the server refuses writes twice, but a read-only role is the layer that does not depend on us being correct. `--print-setup-sql` prints the SQL that creates one.",
+          "description": "Connection string for the role the server connects as. Use a role that cannot write \u2014 the server refuses writes twice, but a read-only role is the layer that does not depend on us being correct. `--print-setup-sql` prints the SQL that creates one.",
           "isRequired": true,
           "isSecret": true
         },
@@ -52,7 +52,7 @@
     {
       "registryType": "oci",
       "identifier": "ghcr.io/eszetael/postgres-mcp-hardened",
-      "version": "0.1.0",
+      "version": "0.1.1",
       "transport": {
         "type": "streamable-http",
         "url": "http://localhost:8080/mcp"
