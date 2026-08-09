@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.1.2 — 2026-08-09
+
+- **Every GitHub Action is pinned to a commit, not a tag.** These workflows hold `contents: write`
+  and publish binaries under our name; a tag can be moved to a different commit by whoever controls
+  the action, which makes it an unreviewed dependency with permission to publish. Dependabot still
+  proposes the bumps — they now arrive as reviewable pull requests instead of arriving silently.
+  Pinned to the versions already in use (checkout 4.3.0, upload-artifact 4.6.2 and so on), verified
+  against each action's own `package.json`: this is a pin, not a hidden upgrade.
+- **The release now registers itself with the official MCP registry**, authenticated by OIDC rather
+  than a stored secret, and only after the npm registry confirms the version is installable.
+
 ## 0.1.1 — 2026-08-09
 
 Everything here was found on the day 0.1.0 went out, by reading the code rather than by a test

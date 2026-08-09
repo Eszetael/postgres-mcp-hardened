@@ -53,7 +53,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.3.0
 
       # The toolchain comes from rust-toolchain.toml — one file, read by rustup, so the version
       # cannot differ between a laptop, the test matrix and the artefacts people download. The
@@ -114,7 +114,7 @@ jobs:
       # sign files it has never seen. Without this the signing job would download nothing and
       # succeed at signing zero files — a green build producing an unsigned release.
       - name: Hand the artefacts to the signing job
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: dist-${{ matrix.target }}
           path: postgres-mcp-hardened-${{ matrix.target }}.*
@@ -139,7 +139,7 @@ jobs:
       # pętla poniżej podpisuje WSZYSTKO, co wpadnie do `dist/`, więc nieodfiltrowane pobranie
       # oznacza podpisywanie cudzych artefaktów przebiegu — a przy ponowieniu także własnej
       # atestacji z poprzedniego podejścia. Bierzemy binaria po nazwie.
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           path: dist
           pattern: dist-*
@@ -199,7 +199,7 @@ jobs:
       contents: read
       id-token: write        # npm provenance: the registry records which workflow published this
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.3.0
       # `pattern` NIE jest ozdobnikiem: bez niego krok bierze WSZYSTKIE artefakty przebiegu, a to
       # nie jest stała lista. Zadanie `sign` dokłada artefakt atestacji, więc ile ich jest, zależy
       # od tego, co zdążyło się skończyć. 09-08 przy pierwszym uruchomieniu było ich pięć i przeszło;
@@ -209,12 +209,12 @@ jobs:
       # ([[feedback_never_executed_path]]).
       #
       # To zadanie potrzebuje binariów i niczego więcej — bierze więc binaria po nazwie.
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           path: dist
           pattern: dist-*
           merge-multiple: true
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: '22'
           registry-url: 'https://registry.npmjs.org'
@@ -288,7 +288,7 @@ jobs:
       contents: write
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.3.0
       # rustup honours rust-toolchain.toml, so the version stays in exactly one file.
       - run: rustup show
       - run: cargo install cargo-cyclonedx --locked
@@ -307,7 +307,7 @@ jobs:
       contents: read
       packages: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.3.0
       - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           registry: ghcr.io
@@ -350,7 +350,7 @@ jobs:
       contents: read
       id-token: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.3.0
 
       # Wersja w manifeście musi zgadzać się z tagiem I z tym, co poszło na npm. Bez tej kontroli
       # rejestr kierowałby ludzi do wersji, której nie ma — dokładnie ten rodzaj cichej nieprawdy,
