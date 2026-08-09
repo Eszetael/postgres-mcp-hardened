@@ -11,6 +11,11 @@ RUN cargo build --locked --release
 
 # ── runtime: distroless, non-root, minimalna powierzchnia ──
 FROM gcr.io/distroless/cc-debian12:nonroot
+# Ownership marker the MCP registry checks on the IMAGE itself, not on our word for it: the value
+# must equal `name` in server.json, which in turn must equal the account the OIDC token comes from.
+# Without it the registry refuses the OCI package with "registry validation failed". Kept next to
+# the binary it describes rather than in the workflow, so a build from any context carries it.
+LABEL io.modelcontextprotocol.server.name="io.github.Eszetael/postgres-mcp-hardened"
 COPY --from=builder /build/target/release/postgres-mcp-hardened /usr/local/bin/mcp
 USER nonroot
 EXPOSE 8080

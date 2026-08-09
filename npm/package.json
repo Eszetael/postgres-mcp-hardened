@@ -1,7 +1,8 @@
 {
   "name": "postgres-mcp-hardened",
+  "mcpName": "io.github.Eszetael/postgres-mcp-hardened",
   "version": "0.0.0",
-  "description": "Secure read-only PostgreSQL MCP server in Rust \u2014 a maintained alternative to the deprecated @modelcontextprotocol/server-postgres. Blocks writes at the AST, not with regexes.",
+  "description": "Secure read-only PostgreSQL MCP server in Rust — a maintained alternative to the deprecated @modelcontextprotocol/server-postgres. Blocks writes at the AST, not with regexes.",
   "keywords": [
     "mcp",
     "model-context-protocol",

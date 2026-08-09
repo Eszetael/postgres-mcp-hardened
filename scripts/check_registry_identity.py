@@ -90,11 +90,31 @@ def main() -> int:
             problems.append(f"packages[{i}] ma wersję {p.get('version')}, a serwer {sv}")
         ident = p.get("identifier", "")
         if p.get("registryType") == "npm":
-            npm_name = json.loads((ROOT / "npm" / "package.json").read_text()).get("name")
-            if ident != npm_name:
-                problems.append(f"packages[{i}] wskazuje pakiet {ident!r}, a npm publikuje {npm_name!r}")
-        if p.get("registryType") == "oci" and ident != ident.lower():
-            problems.append(f"packages[{i}] obraz {ident!r} musi być zapisany małymi literami")
+            pkg = json.loads((ROOT / "npm" / "package.json").read_text())
+            if ident != pkg.get("name"):
+                problems.append(
+                    f"packages[{i}] wskazuje pakiet {ident!r}, a npm publikuje {pkg.get('name')!r}")
+            # Znacznik własności, który rejestr czyta z OPUBLIKOWANEJ paczki. Paczek npm nie da się
+            # zmienić po publikacji, więc brak tego pola kosztuje CAŁY numer wersji — tak zginęło
+            # 0.1.3. Sprawdzamy przy commicie, bo tu poprawka jest darmowa.
+            if pkg.get("mcpName") != srv.get("name"):
+                problems.append(
+                    f"npm/package.json ma mcpName={pkg.get('mcpName')!r}, a serwer nazywa się "
+                    f"{srv.get('name')!r} — rejestr odrzuci pakiet npm")
+        if p.get("registryType") == "oci":
+            if ident != ident.lower():
+                problems.append(f"packages[{i}] obraz {ident!r} musi być zapisany małymi literami")
+            # Ten sam dowód własności, inny nośnik: rejestr czyta etykietę z warstwy obrazu.
+            dockerfile = (ROOT / "Dockerfile").read_text() if (ROOT / "Dockerfile").exists() else ""
+            m = re.search(
+                r'LABEL\s+io\.modelcontextprotocol\.server\.name\s*=\s*"([^"]+)"', dockerfile)
+            if not m:
+                problems.append(
+                    "Dockerfile nie ma etykiety io.modelcontextprotocol.server.name — "
+                    "rejestr odrzuci pakiet OCI")
+            elif m.group(1) != srv.get("name"):
+                problems.append(
+                    f"etykieta obrazu mówi {m.group(1)!r}, a serwer nazywa się {srv.get('name')!r}")
 
     if problems:
         print("BŁĄD — manifest rejestru nie zgadza się z rzeczywistością:")

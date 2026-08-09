@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.1.4 — 2026-08-09
+
+The registry has three ownership checks, not one. 0.1.3 fixed the first and was refused by the
+second; the third was found by reading the specification instead of waiting for the next tag.
+
+- **`mcpName` in the published npm package.** The registry reads the marker from the package on
+  npm, not from this repository — and npm packages are immutable, so a missing field costs a whole
+  version number. That is what happened to 0.1.3.
+- **`io.modelcontextprotocol.server.name` on the container image.** Same proof, different carrier:
+  a `LABEL` in the Dockerfile rather than a flag in the workflow, so a build from any context
+  carries it. Verified empirically that it survives alongside the labels the release adds.
+- **`scripts/check_registry_identity.py` now checks all three markers** — manifest name, npm
+  `mcpName`, image label — against one source, on every commit.
+
 ## 0.1.3 — 2026-08-09
 
 The registry entry 0.1.2 promised, and a defect the registry failure led me to while I was in there.
