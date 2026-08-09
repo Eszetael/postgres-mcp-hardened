@@ -362,6 +362,26 @@ pub(crate) fn handle_explain_query(args: &Value) -> Value {
         Ok(mut v) => {
             audit("explain_query", "allowed", Some(sql));
             attach_plan_summary(&mut v);
+            // `analyze` really runs the statement, so it runs a capped one — but until now nothing
+            // said so. Measured 2026-08-08 on a 300 000-row table: `EXPLAIN ANALYZE SELECT id, h
+            // FROM duza` came back with `Execution Time: 2.015` and `Actual Rows: 10000`. The
+            // question asked was about 300 000 rows; the answer describes 10 000, and a caller
+            // reading it concludes the query is fast. The `Limit` node is visible in the plan, which
+            // is enough for a human who reads plans for a living and not enough for the audience
+            // this tool is written for — our own `query` tool reports `appliedLimit` explicitly for
+            // exactly that reason. A number that quietly answers a different question is the failure
+            // this project exists to refuse.
+            if analyze && inner != sql {
+                v["analyzedStatementCapped"] = json!({
+                    "appliedLimit": MAX_LIMIT,
+                    "note": format!(
+                        "these timings are for your statement with LIMIT {} applied, not for the \
+                         statement as written — running it whole could take far longer. Ask again \
+                         with analyze:false for the plan of the statement exactly as you sent it",
+                        MAX_LIMIT
+                    )
+                });
+            }
             ok_content(&v)
         }
         Err(e) => {

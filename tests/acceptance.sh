@@ -323,6 +323,16 @@ r=$(tool query '{"sql":"SELECT id FROM orders","limit":1,"offset":1}' | body)
 echo "$r" | grep -q pagingNote && ok "paging without ORDER BY says the pages are unstable" || no "no paging warning" "$r"
 r=$(tool explain_query '{"sql":"SELECT count(*) FROM orders","analyze":true}' | body)
 echo "$r" | grep -q '"most_time_in"' && ok "explain_query says where the time went" || no "no plan summary" "$r"
+# With analyze the statement really runs, so it runs a CAPPED one. Measured 2026-08-08 on 300 000
+# rows: Execution Time 2.015 ms, Actual Rows 10000 — an answer to a different question than the one
+# asked, delivered without saying so. The Limit node is in the plan; that is enough for a human who
+# reads plans for a living and not for the agent this tool is written for.
+r=$(tool explain_query '{"sql":"SELECT id FROM orders","analyze":true}' | body)
+echo "$r" | grep -q 'analyzedStatementCapped' && ok "explain_query says the analyzed statement was capped" || no "EXPLAIN ANALYZE TIMED A DIFFERENT QUERY IN SILENCE" "$r"
+# ...and does not cry wolf when nothing was changed: a statement already inside the cap is timed as
+# written, so the warning must be absent. A notice that is always there is read as never there.
+r=$(tool explain_query '{"sql":"SELECT id FROM orders LIMIT 5","analyze":true}' | body)
+echo "$r" | grep -q 'analyzedStatementCapped' && no "warned about a cap that was not applied" "$r" || ok "and stays quiet when the statement ran as written"
 r=$(tool database_health '{}' | body)
 echo "$r" | grep -q 'tables_never_analyzed' && ok "never-analysed tables are reported (no planner statistics)" || no "missing statistics check" "$r"
 echo "$r" | grep -q 'statistics_window' && ok "the window the counters cover is stated" || no "no statistics window" "$r"
