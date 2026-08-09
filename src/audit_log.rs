@@ -26,10 +26,15 @@ fn hwm_path() -> Option<String> {
         .map(|p| format!("{}.hwm", p))
 }
 
+/// Ścieżka znacznika dla WSKAZANEGO logu — bez sięgania po zmienną środowiskową.
+fn hwm_path_of(log: &str) -> String {
+    format!("{}.hwm", log)
+}
+
 /// Last entry recorded in the log itself: `(seq, hash)`.
 /// `None` = the file does not exist. `Some(None)` = it exists but its last line is unusable.
-fn last_entry_in_log() -> Option<Option<(u64, String)>> {
-    let path = std::env::var("MCP_AUDIT_LOG").ok()?;
+fn last_entry_of(path: &str) -> Option<Option<(u64, String)>> {
+    let path = path.to_string();
     if !std::path::Path::new(&path).exists() {
         return None; // genuinely a first run — silence is correct here
     }
@@ -86,16 +91,40 @@ pub(crate) struct Resume {
 }
 
 pub(crate) fn resume_state() -> Resume {
-    let in_log = last_entry_in_log();
-    let hwm = hwm_path()
-        .and_then(|p| std::fs::read_to_string(p).ok())
-        .and_then(|c| serde_json::from_str::<Value>(&c).ok())
-        .and_then(|v| {
-            Some((
-                v.get("seq")?.as_u64()?,
-                v.get("hash")?.as_str()?.to_string(),
-            ))
-        });
+    match std::env::var("MCP_AUDIT_LOG") {
+        Ok(p) => resume_state_of(&p),
+        Err(_) => resume_state_of(""),
+    }
+}
+
+/// Stan wznowienia dla WSKAZANEGO logu.
+///
+/// Istnieje, bo `resume_state()` czyta `MCP_AUDIT_LOG` — zmienną GLOBALNĄ dla procesu — a `cargo test`
+/// uruchamia testy równolegle w wątkach jednego procesu. Test, który tę zmienną ustawiał, kierował na
+/// swój plik KAŻDE wywołanie `audit()` z innego wątku, więc dopisywały mu one wpisy w trakcie
+/// sprawdzania. Objaw: 105 przechodzi, jeden oblewa, i tylko czasem — u nas pięć przebiegów pod rząd
+/// było czyste, a CI oblało za pierwszym razem.
+///
+/// Ten wariant nie dotyka niczego globalnego, więc test może liczyć wpisy, które sam zapisał.
+pub(crate) fn resume_state_of(log: &str) -> Resume {
+    let in_log = if log.is_empty() {
+        None
+    } else {
+        last_entry_of(log)
+    };
+    let hwm = (if log.is_empty() {
+        None
+    } else {
+        Some(hwm_path_of(log))
+    })
+    .and_then(|p| std::fs::read_to_string(p).ok())
+    .and_then(|c| serde_json::from_str::<Value>(&c).ok())
+    .and_then(|v| {
+        Some((
+            v.get("seq")?.as_u64()?,
+            v.get("hash")?.as_str()?.to_string(),
+        ))
+    });
     match (&in_log, &hwm) {
         // First run: no log, no mark. Nothing to say.
         (None, None) => Resume {
@@ -649,8 +678,14 @@ mod tests {
         )
         .unwrap();
 
-        std::env::set_var("MCP_AUDIT_LOG", log.to_str().unwrap());
-        let intact = resume_state();
+        // NIE ustawiamy `MCP_AUDIT_LOG`: to zmienna globalna dla procesu, a `cargo test` biegnie
+        // równolegle w wątkach. Ustawienie jej kierowało na TEN plik każde wywołanie `audit()`
+        // z innego testu, więc dopisywały mu one wpisy w trakcie sprawdzania. CI oblało za pierwszym
+        // razem, u nas pięć przebiegów pod rząd było czyste — testu, który psuje się losowo, nie da
+        // się odróżnić od kodu, który psuje się losowo ([[feedback_never_executed_path]] od drugiej
+        // strony: ścieżka wykonywana, ale nie ta, o której myślę).
+        let sciezka = log.to_str().unwrap().to_string();
+        let intact = resume_state_of(&sciezka);
         assert!(
             intact.anomaly.is_none(),
             "an intact log must not raise: {:?}",
@@ -660,7 +695,7 @@ mod tests {
         // Cut the last entry — the log stays internally consistent, which is the whole problem.
         let lines: Vec<&str> = c.lines().collect();
         std::fs::write(&log, format!("{}\n{}\n", lines[0], lines[1])).unwrap();
-        let cut = resume_state();
+        let cut = resume_state_of(&sciezka);
         let a = cut.anomaly.expect("a shortened log MUST be reported");
         assert!(a.contains("MISSING FROM"), "{a}");
         assert!(
@@ -673,7 +708,7 @@ mod tests {
         tampered["hash"] =
             json!("0000000000000000000000000000000000000000000000000000000000000000");
         std::fs::write(&log, format!("{}\n{}\n{}\n", lines[0], lines[1], tampered)).unwrap();
-        let rew = resume_state();
+        let rew = resume_state_of(&sciezka);
         assert!(
             rew.anomaly.as_deref().unwrap_or("").contains("rewritten"),
             "{:?}",
