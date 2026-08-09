@@ -262,6 +262,12 @@ fn render(
              -- matters most for redaction, where the columns to re-grant must come from the catalogue.\n",
             comment_safe(why)
         ));
+        // A header asking to be read is not a gate. Run as-is, this file creates the role, applies
+        // the limits, and then fails on every `<PLACEHOLDER>` — leaving a login role with no grants
+        // and a screen of errors. Stopping at the first one leaves less to undo. Only on this
+        // branch: with the catalogue read there are no placeholders, and ON_ERROR_STOP would then
+        // turn a re-run ("CREATE ROLE ... already exists") into a refusal to refresh the grants.
+        s.push_str("\\set ON_ERROR_STOP on\n");
     }
     s.push_str("\n-- 1. A role that inherits nothing, bypasses nothing, creates nothing.\n");
     s.push_str(&format!(
@@ -281,9 +287,19 @@ fn render(
     s.push_str(&format!(
         "ALTER ROLE {role} SET default_transaction_read_only = on;\n"
     ));
+    // Each schema is its OWN literal. Joining them into one — `SET search_path = 'a,b'` — is
+    // accepted by PostgreSQL and names a single schema called `a,b`, verified against a live
+    // server: `SHOW search_path` answers `"s_alfa,s_beta"` and an unqualified table then fails
+    // with "relation does not exist". The operator reads that as a missing grant or an empty
+    // database, and this file is the thing that was supposed to prevent both. Single-schema
+    // setups never saw it, which is why it survived: the bug needs a comma to exist.
     s.push_str(&format!(
-        "ALTER ROLE {role} SET search_path = '{}';\n",
-        quote_literal(&schemas.join(","))
+        "ALTER ROLE {role} SET search_path = {};\n",
+        schemas
+            .iter()
+            .map(|sc| format!("'{}'", quote_literal(sc)))
+            .collect::<Vec<_>>()
+            .join(", ")
     ));
 
     s.push_str("\n-- 3. Nothing by default. USAGE on the schema, not CREATE.\n");
@@ -508,6 +524,44 @@ mod injection_tests {
     ///
     /// The anchor is generated from the benign render rather than eyeballed: outside quoted
     /// identifiers, hostile names must add no lines at all.
+    /// Verified against PostgreSQL 16 on 2026-08-09, because the two spellings differ in a way no
+    /// amount of reading the grammar settles. With `SET search_path = 's_alfa,s_beta'` the server
+    /// answers `SHOW search_path` with `"s_alfa,s_beta"` — one schema, quoted — and an unqualified
+    /// `SELECT ... FROM t_alfa` fails with "relation does not exist". With `'s_alfa','s_beta'` it
+    /// answers `s_alfa, s_beta` and the same query returns rows.
+    ///
+    /// The generated file is what an operator runs to make the server usable; handing them a role
+    /// whose search_path points at nothing turns our own setup script into the fault report.
+    #[test]
+    fn each_schema_in_the_generated_setup_is_its_own_literal() {
+        let sql = render(
+            &Opts {
+                role: "mcp_reader".into(),
+                schemas: vec!["s_alfa".into(), "s_beta".into()],
+                tables: vec![],
+                redact: vec![],
+                database: None,
+                owner: "postgres".into(),
+            },
+            &["s_alfa".to_string(), "s_beta".to_string()],
+            &[],
+            "appdb",
+            None,
+        );
+        let line = sql
+            .lines()
+            .find(|l| l.contains("SET search_path"))
+            .expect("the generated file sets a search_path");
+        assert!(
+            line.contains("'s_alfa', 's_beta'"),
+            "each schema its own literal, or the role's search_path names nothing: {line}"
+        );
+        assert!(
+            !line.contains("'s_alfa,s_beta'"),
+            "one literal with a comma is a single schema with an odd name: {line}"
+        );
+    }
+
     #[test]
     fn a_catalogue_name_cannot_leave_a_comment() {
         let payload = "\nALTER ROLE mcp_reader SUPERUSER; -- ";

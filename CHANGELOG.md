@@ -10,6 +10,11 @@ The registry entry 0.1.2 promised, and a defect the registry failure led me to w
   tag — after the version number was already spent. `scripts/check_registry_identity.py` now runs on
   every commit and compares the manifest against the repository itself, along with the versions in
   `Cargo.toml`, `npm/package.json` and every package entry.
+- **The generated `setup.sql` gives the role a `search_path` that resolves.** Every schema is now
+  its own literal. Joining them — `SET search_path = 'a,b'` — is accepted by PostgreSQL and names a
+  single schema called `a,b`; the role then fails every unqualified query with "relation does not
+  exist", which reads as a missing grant or an empty database. Verified against PostgreSQL 16 both
+  ways. Anyone with one schema never saw it: the defect needs a comma to exist.
 - **A quote in `MCP_SEARCH_PATH` is doubled, not deleted.** Deleting it produced a statement that
   PostgreSQL accepts and that names a *different* schema than the one configured — `we"ird` silently
   became `weird`, and the queries then answered from the wrong data without an error anywhere.
