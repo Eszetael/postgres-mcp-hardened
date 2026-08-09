@@ -86,7 +86,33 @@ def main() -> int:
     if cv and sv != cv:
         problems.append(f"server.json ma wersję {sv}, a Cargo.toml {cv}")
     for i, p in enumerate(srv.get("packages", [])):
-        if p.get("version") != sv:
+        typ = p.get("registryType")
+        # Reguły kształtu wyczytane z `internal/validators/registries/*.go` w repozytorium rejestru,
+        # nie z domysłu. Endpoint `/v0/validate` ich NIE uruchamia — sprawdzone 9.08: odpowiedział
+        # `valid: true` na manifest, który publikacja odrzuciła. Zieleń walidatora jest warunkiem
+        # koniecznym, nie wystarczającym, więc reguły muszą stać także tutaj.
+        if p.get("fileSha256"):
+            problems.append(f"packages[{i}] ({typ}) nie może mieć pola fileSha256")
+        if typ == "oci":
+            # Wersja mieszka w identyfikatorze jako znacznik; pole `version` jest ZABRONIONE.
+            if "version" in p:
+                problems.append(
+                    f"packages[{i}] (oci) ma pole version — wersja OCI należy do identyfikatora "
+                    f"(np. ghcr.io/owner/image:{sv})")
+            if p.get("registryBaseUrl"):
+                problems.append(f"packages[{i}] (oci) nie może mieć registryBaseUrl")
+            ident = p.get("identifier", "")
+            host = ident.split("/")[0]
+            if host not in ("docker.io", "ghcr.io", "quay.io", "mcr.microsoft.com") and not (
+                    host.endswith(".pkg.dev") or host.endswith(".azurecr.io")):
+                problems.append(f"packages[{i}] (oci) rejestr {host!r} nie jest wspierany")
+            if ":" not in ident.rsplit("/", 1)[-1]:
+                problems.append(f"packages[{i}] (oci) identyfikator {ident!r} nie ma znacznika wersji")
+            elif ident.rsplit(":", 1)[-1] != sv:
+                problems.append(
+                    f"packages[{i}] (oci) znacznik obrazu to {ident.rsplit(':',1)[-1]!r}, "
+                    f"a serwer wydaje {sv!r} — rejestr pobierze NIE TĘ wersję")
+        elif p.get("version") != sv:
             problems.append(f"packages[{i}] ma wersję {p.get('version')}, a serwer {sv}")
         ident = p.get("identifier", "")
         if p.get("registryType") == "npm":

@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.1.5 — 2026-08-09
+
+Three releases were spent discovering the registry's rules one refusal at a time. This one stops
+that: the rules were read out of the registry's own validator source and encoded as a check that
+runs on every commit.
+
+- **The OCI package carries its version in the identifier**, `ghcr.io/…/postgres-mcp-hardened:0.1.5`,
+  and no longer has a `version` field — the registry refuses one that does.
+- **The registry job now waits for the container job.** It *downloads* the image to read the
+  ownership label, so the image for the version being released has to exist; with `needs: [npm]` it
+  started while arm64 was still compiling under emulation, and would have failed on an image that
+  was not there yet. Found by reading the job graph, not by spending a fourth version on it.
+- **`check_registry_identity.py` now encodes the full rule set** for both package types: forbidden
+  fields, supported registries, the image tag matching the released version, and the ownership
+  markers. Each rule was verified to fail on its own violation.
+- Worth recording, because it looks like a control and is not: `POST /v0/validate` answered
+  `valid: true` for the manifest publishing rejected. It runs schema and semantic checks; the
+  per-registry rules only run during publish. A green there is necessary, not sufficient.
+
 ## 0.1.4 — 2026-08-09
 
 The registry has three ownership checks, not one. 0.1.3 fixed the first and was refused by the

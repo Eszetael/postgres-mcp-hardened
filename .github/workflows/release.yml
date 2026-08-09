@@ -357,7 +357,11 @@ jobs:
   # przyszło z workflow w repozytorium `Eszetael/*`, i na tej podstawie daje prawo do przestrzeni
   # `io.github.eszetael/*`. To ta sama tożsamość, którą podpisujemy artefakty.
   registry:
-    needs: [npm]
+    # `container` też, nie tylko `npm`: rejestr POBIERA obraz, żeby przeczytać z niego etykietę
+    # własności, więc obraz tej wersji musi już istnieć. Przy `needs: [npm]` zadanie startowało,
+    # gdy arm64 kompilował się jeszcze pod emulacją — i dostałoby "OCI image does not exist"
+    # o wersji, którą właśnie wydajemy.
+    needs: [npm, container]
     if: ${{ !contains(github.ref, '-rc') }}
     runs-on: ubuntu-latest
     permissions:
