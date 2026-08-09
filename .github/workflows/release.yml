@@ -279,7 +279,16 @@ jobs:
 
       - name: Rehearsal — show what would be published
         if: ${{ contains(github.ref, '-rc') }}
-        run: cd npm && npm publish --dry-run --access public
+        # `--tag rc` is required, not decorative: the version here comes from the tag, so a `-rc`
+        # rehearsal carries a prerelease version, and npm refuses to publish one without an explicit
+        # dist-tag — it will not let a prerelease silently become `latest`.
+        #
+        # This step PASSED through twelve rehearsals before v0.1.0 and started failing at the first
+        # rehearsal after v0.1.1. Nothing changed here; the package began to EXIST in the registry.
+        # npm only enforces the rule for a package it already knows, so the check was green for as
+        # long as there was nothing to get wrong — a rehearsal that only rehearses while the stage
+        # is empty ([[feedback_never_executed_path]]).
+        run: cd npm && npm publish --dry-run --access public --tag rc
 
   sbom:
     needs: [checks]
