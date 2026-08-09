@@ -221,6 +221,10 @@ jobs:
       # job knew about, and therefore learned about after the version number was already spent.
       - name: Registry manifest names the identity that may publish it
         run: python3 scripts/check_registry_identity.py
+      # Third of the same shape: a rule that was real, written down, and applied to one publishing
+      # channel out of three. `latest` on the container registry pointed at `0.1.2-rc3`.
+      - name: No rehearsal moves a pointer users follow
+        run: python3 scripts/check_prerelease_guards.py
 
   container:
     runs-on: ${{ vars.RUNNER_LABEL || 'ubuntu-latest' }}

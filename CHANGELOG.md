@@ -10,6 +10,11 @@ The registry entry 0.1.2 promised, and a defect the registry failure led me to w
   tag — after the version number was already spent. `scripts/check_registry_identity.py` now runs on
   every commit and compares the manifest against the repository itself, along with the versions in
   `Cargo.toml`, `npm/package.json` and every package entry.
+- **A rehearsal no longer moves the container tag people pull.** `type=raw,value=latest` carried no
+  condition, so every `-rc` run retagged `latest`: on 9.08 it pointed at `0.1.2-rc3`. The npm job
+  had the guard and a comment explaining it — the rule existed and was applied to one of the three
+  channels we publish through. `scripts/check_prerelease_guards.py` now checks all of them on every
+  commit, and fails just as loudly if a channel disappears from the file entirely.
 - **The generated `setup.sql` gives the role a `search_path` that resolves.** Every schema is now
   its own literal. Joining them — `SET search_path = 'a,b'` — is accepted by PostgreSQL and names a
   single schema called `a,b`; the role then fails every unqualified query with "relation does not
