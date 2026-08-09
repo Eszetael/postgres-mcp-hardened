@@ -402,6 +402,43 @@ pub(crate) fn cost_guard(sql: &str, max_cost: f64, db: Option<&str>) -> Result<(
         // boundary this project calls the real one. While a surface is configured, a call to
         // anything outside pg_catalog is refused unless the operator named it in MCP_ALLOW_FUNCTIONS.
         let called = crate::validate::functions_called(sql);
+        // Built-in functions that read the SERVER rather than the data. The check below deliberately
+        // exempts everything in pg_catalog — a surface that refused `lower()` would be useless — but
+        // that exemption also carried `current_setting('data_directory')`, which answers the same
+        // question as `pg_settings`. Measured 2026-08-09: with `MCP_ALLOW_SCHEMAS=app`, `SHOW
+        // data_directory` was refused, `pg_settings` went through, and so did `current_setting`.
+        // Closing one of three doors is the failure mode this project keeps meeting, so all three
+        // close together, and `MCP_ALLOW_CATALOG=1` opens all three at once.
+        //
+        // The `pg_` prefix is a family, not a list. The three named below carry no prefix and there
+        // is no rule that finds them — they are named, and the reasoning is written down so the next
+        // reader can extend it: what leaks the machine (paths, address, port), not what identifies
+        // the caller. `current_user`, `session_user`, `current_database` and `version` stay allowed
+        // on purpose: an agent already knows what it connected to and as whom.
+        if !crate::surface::catalog_allowed() {
+            let state: Vec<&String> = called
+                .iter()
+                .filter(|f| {
+                    f.starts_with("pg_")
+                        || matches!(
+                            f.as_str(),
+                            "current_setting" | "inet_server_addr" | "inet_server_port"
+                        )
+                })
+                .collect();
+            if !state.is_empty() {
+                return Err(CostErr::OutsideSurface(format!(
+                    "reads server configuration rather than data: {}. While a surface allowlist is \
+                     configured the catalogue is out of reach — set MCP_ALLOW_CATALOG=1 if the \
+                     operator wants it readable",
+                    state
+                        .iter()
+                        .map(|s| s.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )));
+            }
+        }
         if !called.is_empty() {
             let v = query_catalog(
                 "SELECT p.proname AS name, n.nspname AS schema, p.prosecdef AS definer \

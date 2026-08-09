@@ -1024,6 +1024,21 @@ r=$(tool query '{"sql":"SELECT * FROM events"}' | body)
 case "$r" in ERROR:*) no "a partitioned table was refused" "$r";; *) ok "a partition is covered by its parent";; esac
 r=$(tool query '{"sql":"SELECT * FROM pg_stat_activity"}' | body)
 case "$r" in *"outside the configured surface"*) ok "the catalog is outside the surface by default";; *) no "pg_catalog reachable under an allowlist" "$r";; esac
+# pg_stat_activity plans to scans over real relations, so the walker saw it. pg_settings plans to a
+# single Function Scan on pg_show_all_settings — no relation in the plan at all — and went straight
+# through, as did current_setting(). Measured 2026-08-09: three ways to the server's configuration,
+# one of them guarded. README documents MCP_ALLOW_CATALOG=1 as the way to open the catalogue, which
+# means nothing unless it is shut without it.
+r=$(tool query '{"sql":"SELECT * FROM pg_settings LIMIT 2"}' | body)
+case "$r" in *"surface"*|*"server configuration"*) ok "a catalogue view built on a function is refused too";; *) no "PG_SETTINGS LEAKED THE SERVER CONFIGURATION" "$r";; esac
+r=$(tool query "{\"sql\":\"SELECT current_setting('data_directory')\"}" | body)
+case "$r" in *"surface"*|*"server configuration"*) ok "and so is the same fact through current_setting";; *) no "current_setting LEAKED THE DATA DIRECTORY" "$r";; esac
+# The rule is the pg_ prefix, so ordinary set-returning functions have to keep working — a surface
+# that refused generate_series would be a surface nobody switches on.
+r=$(tool query '{"sql":"SELECT * FROM generate_series(1,3)"}' | body)
+case "$r" in ERROR:*) no "generate_series was refused by the catalogue rule" "$r";; *) ok "ordinary set-returning functions are unaffected";; esac
+r=$(tool query "{\"sql\":\"SELECT * FROM regexp_split_to_table('a b',' ')\"}" | body)
+case "$r" in ERROR:*) no "regexp_split_to_table was refused" "$r";; *) ok "and so are the text ones";; esac
 # A function body is invisible to the planner: `SELECT f()` plans to a bare Result node while the
 # body reads whatever it likes. With SECURITY DEFINER it reads it as the owner, defeating the role
 # privileges this project calls the real boundary. Both demonstrated in review; both refused now.

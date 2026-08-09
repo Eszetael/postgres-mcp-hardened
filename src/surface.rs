@@ -55,7 +55,7 @@ pub(crate) fn active() -> bool {
 
 /// Catalogs are excluded unless asked for: with an allowlist configured, an agent that can still
 /// read `pg_catalog` can enumerate everything the allowlist was meant to hide.
-fn catalog_allowed() -> bool {
+pub(crate) fn catalog_allowed() -> bool {
     std::env::var("MCP_ALLOW_CATALOG").is_ok_and(|v| v == "1" || v == "true")
 }
 
@@ -100,8 +100,48 @@ pub(crate) fn relations_in_plan(plan: &Value) -> Vec<(String, String)> {
             _ => {}
         }
     }
+    out.append(&mut catalog_functions_in_plan(plan));
     out.sort();
     out.dedup();
+    out
+}
+
+/// Catalogue views that read server state through a set-returning function, reported as if they were
+/// relations so the surface can refuse them.
+///
+/// `pg_stat_activity` plans to scans over real relations, so the walker above sees it and the
+/// allowlist refuses it. `pg_settings` plans to a single `Function Scan` on `pg_show_all_settings` —
+/// no relation anywhere in the plan — so the walker returned nothing and the query went through.
+/// Measured 2026-08-09 with `MCP_ALLOW_SCHEMAS=app`: `SHOW data_directory` was refused while
+/// `SELECT * FROM pg_settings` and `SELECT current_setting('data_directory')` both returned
+/// `/var/lib/postgresql/data`. Three ways to the same fact, one of them guarded. README documents
+/// `MCP_ALLOW_CATALOG=1` as the way to make the catalogue reachable, which only means anything if it
+/// is unreachable without it.
+///
+/// The rule is the `pg_` PREFIX, not a list of names: a list is a filter that a new PostgreSQL
+/// release walks past on its own ([[feedback_name_filter_not_a_boundary]]). It separates cleanly —
+/// `generate_series`, `jsonb_each`, `regexp_split_to_table` and `unnest` carry no prefix and keep
+/// working; `pg_show_all_settings`, `pg_ls_dir` and `pg_stat_file` do and are refused. Functions
+/// outside `pg_catalog` are already handled elsewhere, by reading the catalogue rather than the name.
+fn catalog_functions_in_plan(plan: &Value) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let mut stack: Vec<&Value> = vec![plan];
+    while let Some(node) = stack.pop() {
+        match node {
+            Value::Object(map) => {
+                if let Some(Value::String(f)) = map.get("Function Name") {
+                    if f.starts_with("pg_") {
+                        out.push(("pg_catalog".to_string(), f.clone()));
+                    }
+                }
+                for v in map.values() {
+                    stack.push(v);
+                }
+            }
+            Value::Array(items) => stack.extend(items.iter()),
+            _ => {}
+        }
+    }
     out
 }
 
