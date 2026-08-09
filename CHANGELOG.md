@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.1.0 (unreleased)
+## 0.1.0 — 2026-08-09
 
 First release — a secure, read-only PostgreSQL MCP server in Rust; a hardened
 alternative to the deprecated `@modelcontextprotocol/server-postgres`.
