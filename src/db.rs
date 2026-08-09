@@ -610,14 +610,28 @@ pub(crate) fn execute_readonly(final_sql: &str, db: Option<&str>) -> Result<Valu
         // instead of the value, so the RESULT stays bounded and the agent is told the row was
         // omitted rather than handed something truncated.
         //
-        // It bounds the RESULT, not our MEMORY, and the comment here used to claim otherwise
-        // ("our process NEVER receives a giant cell"). Measured 2026-08-08, PostgreSQL 16, one
-        // request, peak RSS: idle 10 MB · 4 MB cell 42 MB · 30 MB cell 128 MB · 60 MB cell 245 MB ·
-        // 200 MB cell 401 MB — and the last three were all OMITTED from the result. `psql` running
-        // the same wrapped statement gets 12 bytes back, so the growth is not the value arriving;
-        // where it is allocated is not yet established, and a fix written before the mechanism is
-        // understood is a guess. Recorded as measured, with the numbers, rather than left as a
-        // claim the measurement contradicts.
+        // What it costs us, measured 2026-08-09 on the RELEASE build, PostgreSQL 16, one request,
+        // `VmHWM` of THIS process only (kernel high-water mark, so polling cannot miss the peak),
+        // against a 64 MB INCOMPRESSIBLE cell (`STORAGE EXTERNAL`, random md5 text — `repeat('x')`
+        // compresses away and would have measured nothing):
+        //
+        //     idle                        10 MB
+        //     64 MB cell, row OMITTED     11 MB      <- bounded; the cap does its job
+        //     7 MB payload, DELIVERED     57 MB      <- ~6.7x the payload
+        //
+        // So the omitted path does not grow with the cell, and the real characteristic is the
+        // DELIVERED one: JSON text plus the parsed `Value` tree costs several times the payload,
+        // which with an 8 MB cap bounds a request at roughly +55 MB. The instrument was checked
+        // against a case that MUST grow (the 7 MB row) before the flat readings were believed.
+        //
+        // The note previously here recorded 2026-08-08 numbers — 4 MB cell 42 MB · 30 MB 128 MB ·
+        // 60 MB 245 MB — claiming growth on the OMITTED path. They do not reproduce. Two candidate
+        // explanations were tested and both failed: `VmPeak` is ~1.4 GB regardless of payload
+        // (allocator arenas, not the value), and the PostgreSQL backend reading was unreliable.
+        // What that run measured is not established, so it is not asserted here; what is asserted
+        // is reproducible with the harness above. Note that 4 MB is UNDER the cap and therefore
+        // was delivered, and 42 MB is exactly the amplification measured today — the only one of
+        // those four numbers that is consistent with this code.
         // The trailing `::text` MATTERS: we take ready JSON TEXT from the database and parse it ourselves
         // instead of letting the driver deserialise jsonb its own way — that path lost digits from
         // `numeric` (avg(amount) 4.2006673312979002 → 4.2006673312979). Parsing the text with
