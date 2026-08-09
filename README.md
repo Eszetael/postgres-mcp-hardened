@@ -510,6 +510,17 @@ Two consequences worth knowing before you turn it on:
 that can still read the catalog can enumerate exactly what the allowlist was meant to hide. The
 schema tools keep working, because they run fixed queries rather than caller SQL.
 
+That covers three routes to the same facts, because for a while it covered only one. A catalogue view
+plans to scans over real relations and the plan names them — but `pg_settings` plans to a single
+`Function Scan` on `pg_show_all_settings`, naming no relation at all, and `current_setting()` is a
+scalar call that never appears as a scan. Both used to return the server's configuration under an
+active allowlist. Functions whose name begins with `pg_`, plus `current_setting`, `inet_server_addr`
+and `inet_server_port`, are now refused alongside the catalogue relations, and `MCP_ALLOW_CATALOG=1`
+opens all of them together. Ordinary set-returning functions — `generate_series`, `jsonb_each`,
+`unnest`, `regexp_split_to_table` — carry no such prefix and are unaffected. `current_user`,
+`session_user`, `current_database` and `version` stay readable on purpose: an agent already knows what
+it connected to and as whom.
+
 ## The corpus of things that got through
 
 Every shape that defeated a control during review lives in `tests/adversarial/`, with the round in
