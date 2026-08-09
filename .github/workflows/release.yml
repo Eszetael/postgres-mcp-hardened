@@ -334,3 +334,51 @@ jobs:
           # that has to be re-run is exactly the moment nobody wants to wait an hour.
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+  # Ostatni kanał: oficjalny rejestr MCP. Osobne zadanie, a nie krok w `npm`, bo publikacja do
+  # rejestru ma się wydarzyć TYLKO wtedy, gdy pakiet naprawdę wszedł — wpis wskazujący wersję npm,
+  # której nie ma, jest gorszy niż brak wpisu ([[feedback_silent_data_lies]]).
+  #
+  # Uwierzytelnienie przez OIDC: żadnego sekretu w ustawieniach. Rejestr sprawdza, że żądanie
+  # przyszło z workflow w repozytorium `Eszetael/*`, i na tej podstawie daje prawo do przestrzeni
+  # `io.github.eszetael/*`. To ta sama tożsamość, którą podpisujemy artefakty.
+  registry:
+    needs: [npm]
+    if: ${{ !contains(github.ref, '-rc') }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      # Wersja w manifeście musi zgadzać się z tagiem I z tym, co poszło na npm. Bez tej kontroli
+      # rejestr kierowałby ludzi do wersji, której nie ma — dokładnie ten rodzaj cichej nieprawdy,
+      # którego ten serwer odmawia w danych, więc tym bardziej nie może go produkować o sobie.
+      - name: Wersje muszą się zgadzać
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          SRV=$(python3 -c "import json;print(json.load(open('server.json'))['version'])")
+          PKG=$(python3 -c "import json;print(json.load(open('server.json'))['packages'][0]['version'])")
+          echo "tag=$TAG server.json=$SRV pakiet-w-manifescie=$PKG"
+          [ "$SRV" = "$TAG" ] || { echo "server.json ma $SRV, a tag mówi $TAG"; exit 1; }
+          [ "$PKG" = "$TAG" ] || { echo "manifest wskazuje pakiet $PKG, a tag mówi $TAG"; exit 1; }
+          # I sprawdzenie u ŹRÓDŁA, nie u siebie: czy ta wersja faktycznie jest w rejestrze npm.
+          for i in $(seq 1 10); do
+            W=$(curl -sf "https://registry.npmjs.org/postgres-mcp-hardened" | python3 -c "import sys,json;print(json.load(sys.stdin)['dist-tags']['latest'])" 2>/dev/null || true)
+            [ "$W" = "$TAG" ] && { echo "npm potwierdza $W"; exit 0; }
+            echo "npm pokazuje '${W:-nic}', czekam na $TAG ($i/10)"; sleep 15
+          done
+          echo "npm nie pokazuje $TAG — nie wpisuję do rejestru wersji, której nie da się zainstalować"
+          exit 1
+
+      - name: Zainstaluj mcp-publisher
+        run: |
+          curl -fsSL "https://github.com/modelcontextprotocol/registry/releases/latest/download/mcp-publisher_linux_amd64.tar.gz" \
+            | tar xz mcp-publisher
+          ./mcp-publisher --version
+
+      - name: Zaloguj przez OIDC i opublikuj
+        run: |
+          ./mcp-publisher login github-oidc
+          ./mcp-publisher publish
