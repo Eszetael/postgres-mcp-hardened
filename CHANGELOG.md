@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.1.3 — 2026-08-09
+
+The registry entry 0.1.2 promised, and a defect the registry failure led me to while I was in there.
+
+- **The registry manifest names the account that may publish it.** `0.1.2` reached npm, was signed,
+  and was then refused by the MCP registry: the manifest said `io.github.eszetael`, the permission
+  reads `io.github.Eszetael`. One capital letter, and the only check that knew the rule ran on a
+  tag — after the version number was already spent. `scripts/check_registry_identity.py` now runs on
+  every commit and compares the manifest against the repository itself, along with the versions in
+  `Cargo.toml`, `npm/package.json` and every package entry.
+- **A quote in `MCP_SEARCH_PATH` is doubled, not deleted.** Deleting it produced a statement that
+  PostgreSQL accepts and that names a *different* schema than the one configured — `we"ird` silently
+  became `weird`, and the queries then answered from the wrong data without an error anywhere.
+  Startup already refuses such a value, so no shipped build could reach this; it is fixed as the
+  second layer, because the first one is a single call site that a future early-return would skip.
+
 ## 0.1.2 — 2026-08-09
 
 - **Every GitHub Action is pinned to a commit, not a tag.** These workflows hold `contents: write`

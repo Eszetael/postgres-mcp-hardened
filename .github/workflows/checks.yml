@@ -216,6 +216,11 @@ jobs:
       # days of green CI said nothing, because no tag was pushed. This runs on every commit.
       - name: Release permissions match what the jobs actually do
         run: python3 scripts/check_release_permissions.py
+      # Same shape, different manifest. `v0.1.2` was published to npm and signed before the registry
+      # refused it over one capital letter in the owner's name — a rule that only the tag-triggered
+      # job knew about, and therefore learned about after the version number was already spent.
+      - name: Registry manifest names the identity that may publish it
+        run: python3 scripts/check_registry_identity.py
 
   container:
     runs-on: ${{ vars.RUNNER_LABEL || 'ubuntu-latest' }}

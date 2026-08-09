@@ -99,13 +99,27 @@ pub(crate) fn statement_timeout() -> String {
 /// Optional `search_path`, so a database whose tables live in a custom schema works without
 /// qualifying every name — a reported failure mode of at least one alternative.
 pub(crate) fn search_path_stmt() -> String {
-    match std::env::var("MCP_SEARCH_PATH") {
+    search_path_stmt_from(std::env::var("MCP_SEARCH_PATH").ok().as_deref())
+}
+
+/// The statement for a given value, with no environment in it. Split out so the tests can state
+/// what the value produces without writing to process-global state: `set_var` inside a threaded
+/// test run is shared with every other test, and that is how a green suite starts failing one run
+/// in ten for reasons that have nothing to do with the change under test.
+fn search_path_stmt_from(value: Option<&str>) -> String {
+    match value {
         // Each schema is quoted separately: `SET search_path='a,b'` would name ONE schema called
         // "a,b" and silently find nothing.
-        Ok(p) if !p.trim().is_empty() => {
+        Some(p) if !p.trim().is_empty() => {
+            // A quote inside the name is DOUBLED, not deleted. Deleting it produced a valid
+            // statement naming a DIFFERENT schema than the operator asked for — the query then
+            // succeeds against the wrong data, which is worse than failing. `preflight_config`
+            // refuses such a value before the server serves anyone, so this is the second layer;
+            // it exists because the first one is a single call site in `main`, and a mode that
+            // returns before it would take this one with it.
             let list = p
                 .split(',')
-                .map(|s| format!("\"{}\"", s.trim().replace('"', "")))
+                .map(|s| format!("\"{}\"", s.trim().replace('"', "\"\"")))
                 .collect::<Vec<_>>()
                 .join(", ");
             format!(" SET search_path TO {};", list)
@@ -832,9 +846,7 @@ mod tests {
     fn every_schema_in_the_search_path_is_quoted_on_its_own() {
         // `SET search_path='a,b'` names ONE schema called "a,b" and then quietly finds nothing.
         // A failure of that kind looks like an empty database, not like a configuration mistake.
-        std::env::set_var("MCP_SEARCH_PATH", "sales, warehouse");
-        let stmt = search_path_stmt();
-        std::env::remove_var("MCP_SEARCH_PATH");
+        let stmt = search_path_stmt_from(Some("sales, warehouse"));
         assert!(
             stmt.contains("\"sales\"") && stmt.contains("\"warehouse\""),
             "each schema quoted on its own: {stmt}"
@@ -842,6 +854,22 @@ mod tests {
         assert!(
             !stmt.contains("\"sales, warehouse\""),
             "that would be one schema with an odd name"
+        );
+    }
+
+    #[test]
+    fn a_quote_in_a_schema_name_is_doubled_not_deleted() {
+        // Deleting the quote leaves a statement that PostgreSQL accepts and that names a schema
+        // nobody asked for: `we"ird` became `weird`. The query then answers from the wrong data,
+        // which no error message ever mentions. Doubling names exactly what was configured.
+        let stmt = search_path_stmt_from(Some("we\"ird"));
+        assert!(
+            stmt.contains("\"we\"\"ird\""),
+            "the name is preserved by doubling the quote: {stmt}"
+        );
+        assert!(
+            !stmt.contains("\"weird\""),
+            "deleting the quote would silently ask for a different schema: {stmt}"
         );
     }
 
