@@ -135,8 +135,15 @@ jobs:
       id-token: write
       attestations: write
     steps:
+      # Ten sam filtr i z tego samego powodu co w zadaniu `npm` niżej. Tutaj jest dodatkowa ostrość:
+      # pętla poniżej podpisuje WSZYSTKO, co wpadnie do `dist/`, więc nieodfiltrowane pobranie
+      # oznacza podpisywanie cudzych artefaktów przebiegu — a przy ponowieniu także własnej
+      # atestacji z poprzedniego podejścia. Bierzemy binaria po nazwie.
       - uses: actions/download-artifact@v4
-        with: { path: dist, merge-multiple: true }
+        with:
+          path: dist
+          pattern: dist-*
+          merge-multiple: true
       - uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3
       - name: Sign every artefact and its checksum file
         run: |
@@ -193,8 +200,20 @@ jobs:
       id-token: write        # npm provenance: the registry records which workflow published this
     steps:
       - uses: actions/checkout@v4
+      # `pattern` NIE jest ozdobnikiem: bez niego krok bierze WSZYSTKIE artefakty przebiegu, a to
+      # nie jest stała lista. Zadanie `sign` dokłada artefakt atestacji, więc ile ich jest, zależy
+      # od tego, co zdążyło się skończyć. 09-08 przy pierwszym uruchomieniu było ich pięć i przeszło;
+      # przy PONOWIENIU sześć — piąte pobrało się poprawnie, szóste padło po pięciu próbach
+      # i zatrzymało publikację, choć poświadczenie było już w porządku. Dwanaście prób generalnych
+      # tego nie złapało, bo atestacja zawsze powstawała PO npm, nigdy przed
+      # ([[feedback_never_executed_path]]).
+      #
+      # To zadanie potrzebuje binariów i niczego więcej — bierze więc binaria po nazwie.
       - uses: actions/download-artifact@v4
-        with: { path: dist, merge-multiple: true }
+        with:
+          path: dist
+          pattern: dist-*
+          merge-multiple: true
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
