@@ -7,6 +7,10 @@ tests/bench/package-lock.json
 PLAN.local.md
 docs/SELF_HOSTED_RUNNER.md
 GATE_CARD.json
+# Materiał, z którego karta powstaje. Nieśledzony z tego samego powodu co karta: wiąże się ze
+# skrótem kodu w chwili wydania, więc w repozytorium starzeje się przy pierwszym commicie i stałby
+# się dokumentem twierdzącym coś, co przestało być prawdą.
+factory_result.json
 
 # The npm wrapper downloads the native binary here at install time; it is a build product,
 # and at ~19 MB it is not something a clone should carry.
