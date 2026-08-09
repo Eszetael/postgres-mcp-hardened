@@ -200,6 +200,14 @@ jobs:
           node-version: '22'
           registry-url: 'https://registry.npmjs.org'
 
+      # Node 22 ships npm 10, and trusted publishing (OIDC) needs 11.5.1 or newer. Raised here so
+      # the switch away from a long-lived token is a change of ONE step rather than a change of the
+      # runtime: npm deprecated bypass-2FA tokens for publishing from around January 2027, and a
+      # release path that only works with the credential being retired is a deadline we would meet
+      # by surprise. Harmless while we still publish with a token — the flags are the same.
+      - name: npm new enough for trusted publishing
+        run: npm install -g npm@latest && npm --version
+
       - name: Take the version from the tag
         shell: bash
         run: |
