@@ -24,6 +24,9 @@
 > Known limits, and the places we were wrong, are written down rather than tidied away:
 > [`THREAT_MODEL.md`](THREAT_MODEL.md), [`docs/AUDIT_2026-07-26.md`](docs/AUDIT_2026-07-26.md).
 > If you find something, [`SECURITY.md`](SECURITY.md) says how to say so.
+>
+> The design, and the two defects the first day in public turned up, are written up here:
+> [**Rebuilding the Deprecated PostgreSQL MCP Server in Rust**](https://dev.to/eszetael/rebuilding-the-deprecated-postgresql-mcp-server-in-rust-safe-by-default-1eb).
 
 
 **The official Postgres MCP server was deprecated in 2024 and still gets ~476k downloads a month. Its entire defence is one database-level read-only transaction — and that alone does not stop every write. This is a maintained Rust replacement with defence in depth.**

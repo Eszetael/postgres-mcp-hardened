@@ -7,6 +7,17 @@ which was deprecated by its authors and last released in December 2024.
 Writes are refused by walking the parsed SQL, not by matching strings. Comments, dollar-quoting and
 Unicode tricks do not survive the parse, so they cannot smuggle a statement past the check.
 
+**Try to break it without installing anything** — the guard has an offline mode:
+
+```sh
+npx postgres-mcp-hardened --validate "/* comment */ DROP TABLE users"
+# REJECT: non-read-only statement: Drop
+```
+
+If something that writes comes back `ALLOW`, that is the most useful thing anyone can report. The
+design and the defects found so far are written up in
+[**Rebuilding the Deprecated PostgreSQL MCP Server in Rust**](https://dev.to/eszetael/rebuilding-the-deprecated-postgresql-mcp-server-in-rust-safe-by-default-1eb).
+
 ## Replace the deprecated server
 
 ```diff
