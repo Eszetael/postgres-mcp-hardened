@@ -149,17 +149,34 @@ pub(crate) fn handle_resources_list() -> Value {
     let names = database_names();
     if names.len() > 1 {
         let mut all: Vec<Value> = Vec::new();
+        // One database being unreachable must not hide the others, and all of them being
+        // unreachable must not look like an empty schema. Reasons are kept per database.
+        let mut unavailable: serde_json::Map<String, Value> = serde_json::Map::new();
         for n in &names {
-            if let Some(Value::Array(items)) = resources_of(Some(n))
+            let answer = resources_of(Some(n));
+            if let Some(Value::Array(items)) = answer
                 .get("result")
                 .and_then(|r| r.get("resources"))
                 .cloned()
             {
                 all.extend(items);
             }
+            if let Some(why) = answer
+                .get("result")
+                .and_then(|r| r.get("_meta"))
+                .and_then(|m| m.get(RESOURCES_UNAVAILABLE_META))
+                .cloned()
+            {
+                unavailable.insert(n.clone(), why);
+            }
         }
         audit("resources/list", "allowed", None);
-        return json!({ "result": { "resources": all } });
+        if unavailable.is_empty() {
+            return json!({ "result": { "resources": all } });
+        }
+        return json!({ "result": { "resources": all, "_meta": {
+            RESOURCES_UNAVAILABLE_META: Value::Object(unavailable)
+        } } });
     }
     resources_of(None)
 }
@@ -224,12 +241,32 @@ pub(crate) fn resources_of(db: Option<&str>) -> Value {
             audit("resources/list", "allowed", None);
             json!({ "result": { "resources": list } })
         }
+        // The database never answered. Every MCP host and catalogue starts a server, calls
+        // `initialize` and then `resources/list`, long before anyone attaches a real database —
+        // and 0.1.5 answered that probe with a protocol error, which reads as a server that does
+        // not work. Found on 2026-08-15 by the first directory that inspected this one.
+        //
+        // An empty list is not a claim that the database has no tables. The reason travels with
+        // the answer in `_meta`, `initialize` already says the database has not answered, and
+        // `security_posture` gives the detail — so nothing is being hidden, it is being said
+        // somewhere a list response is allowed to say it.
+        Err(e) if e.starts_with(UNREACHABLE_PREFIX) => {
+            audit("resources/list", "degraded", None);
+            json!({ "result": { "resources": [], "_meta": { RESOURCES_UNAVAILABLE_META: e } } })
+        }
+        // Anything else is the database answering — a missing privilege, a bad catalog query — and
+        // that must stay an error. Reporting "no resources" for a permission problem would be the
+        // silent-failure this project refuses everywhere else.
         Err(e) => {
             audit("resources/list", "error", None);
             json!({ "error": { "code": -32000, "message": e } })
         }
     }
 }
+
+/// `_meta` key carrying why a resource list came back empty. Namespaced per the MCP specification,
+/// which reserves unprefixed `_meta` keys for the protocol itself.
+pub(crate) const RESOURCES_UNAVAILABLE_META: &str = "io.github.eszetael/databaseUnavailable";
 
 /// Percent-encodes one path segment of a resource URI.
 ///

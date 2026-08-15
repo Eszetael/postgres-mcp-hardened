@@ -328,6 +328,15 @@ Every table and view is exposed as an MCP **resource** (`postgres:///<schema>/<t
 client can browse the schema without issuing a query — the same capability the deprecated server
 offered, plus column comments, primary keys and **foreign keys** in the payload.
 
+When the database has not answered, `resources/list` returns an **empty list with the reason in
+`_meta`** rather than a protocol error. A catalogue inspecting this server starts it with no
+database at all and calls `resources/list` straight after `initialize`; answering that with an error
+reads as a server that does not work. The empty list is not a claim that there are no tables —
+`initialize` says the database has not answered, `security_posture` gives the detail, and the reason
+travels with the list itself. A database that *does* answer and refuses is still an error, because
+reporting "no resources" for a missing privilege is the silent failure this server exists to avoid.
+*verified* (acceptance: "a host can inspect the server with no database and mcp-proxy in front")
+
 ## Tools
 
 - **`explain_query`** — the execution plan; with `analyze` it runs the statement and reports real
@@ -628,9 +637,13 @@ defeated in review and are therefore described as depth rather than as boundarie
   cannot be written, `sslmode=disable` to a database on another machine, a metrics token that is also
   the database credential, a boolean spelt `yes` — each used to be accepted and quietly do something
   other than what was meant. Startup now stops and names the setting.
-- **A misspelt setting is fatal:** `MCP_REDACT_COLUMN` (singular) used to start the server with
-  redaction quietly switched off. Unknown `MCP_*` variables now stop startup and name the intended
-  spelling; `MCP_X_*` is reserved for the operator's own use.
+- **A misspelt setting is fatal — somebody else's setting is not:** `MCP_REDACT_COLUMN` (singular)
+  used to start the server with redaction quietly switched off, so a near miss of a real setting
+  still stops startup and names the intended spelling. A name that resembles nothing we define was
+  set by another program sharing the environment: it is reported and ignored. `mcp-proxy`, which
+  every catalogue puts in front of a server to inspect it, exports `MCP_PROXY_DEBUG` — until 0.1.6
+  that one variable made this server exit before reading a request. `MCP_X_*` remains reserved for
+  the operator's own use. *verified* (acceptance: "a misspelling is still fatal")
 - **No schema leaks:** database errors are mapped to structured, actionable messages that never echo table/column names.
 - **OAuth 2.1:** optional RS256 bearer-token validation (signature, `exp`, `aud`, `iss`) with scope enforcement; disabled when unconfigured for local/self-host use.
 - **Audit:** every tool decision is logged as a tamper-evident, hash-chained JSON line (no raw SQL).

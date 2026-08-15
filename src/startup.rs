@@ -110,7 +110,9 @@ pub(crate) fn spawn_redaction_verification() {
 /// about a misspelling is to know every correct spelling.
 ///
 /// `MCP_X_*` is reserved for whoever needs their own variables in the same environment (another MCP
-/// server in the same compose file, say) and is never rejected.
+/// server in the same compose file, say) and is never rejected. That reservation only helps people
+/// who have read this file, which is why `classify_unknown` also has to cope with programs that
+/// never will — see the note there.
 pub(crate) const KNOWN_VARS: &[&str] = &[
     "DATABASE_URL",
     "JWT_AUD",
@@ -172,24 +174,50 @@ fn edit_distance(a: &str, b: &str) -> usize {
     prev[b.len()]
 }
 
-fn unknown_vars() -> Vec<String> {
-    std::env::vars()
-        .map(|(k, _)| k)
-        .filter(|k| k.starts_with("MCP_") && !k.starts_with("MCP_X_"))
-        .filter(|k| !KNOWN_VARS.contains(&k.as_str()))
-        .map(|k| {
-            match KNOWN_VARS
-                .iter()
-                .map(|known| (edit_distance(&k, known), *known))
-                .min()
-            {
-                Some((d, known)) if d <= 3 => {
-                    format!("unknown setting {}: did you mean {}?", k, known)
-                }
-                _ => format!("unknown setting {} (no similar name exists)", k),
+/// Prefixes belonging to programs that legitimately share this process's environment.
+///
+/// `mcp-proxy` is the stdio bridge that Glama, Smithery and every other catalogue puts in front of
+/// a server in order to inspect it; it exports `MCP_PROXY_DEBUG`. Until 0.1.6 that one variable was
+/// enough to make this server exit 2 before it read a single request, which meant it could not be
+/// listed anywhere at all. Found on 2026-08-15 by the first host that ever tried.
+const FOREIGN_PREFIXES: &[&str] = &["MCP_X_", "MCP_PROXY_"];
+
+/// Splits unknown `MCP_*` names into the ones that are ours-misspelled and the ones that are not
+/// ours at all: `(fatal, ignored)`.
+///
+/// The distinction is the whole point. `MCP_REDACT_COLUMN` — singular, one letter short — is a
+/// misspelling of a protection, and starting with redaction silently off is exactly the outcome
+/// this check exists to prevent, so it still refuses to start. `MCP_PROXY_DEBUG` resembles nothing
+/// we define; it was set by a program that has never heard of us, and refusing to start because
+/// somebody else's variable exists is our bug, not their misconfiguration.
+///
+/// Takes the names rather than reading the environment so it can be tested without setting a
+/// process-global variable — a parallel test that mutates the environment is a test that fails on
+/// somebody else's schedule, which this suite has already paid for once.
+fn classify_unknown(names: impl Iterator<Item = String>) -> (Vec<String>, Vec<String>) {
+    let (mut fatal, mut ignored) = (Vec::new(), Vec::new());
+    let candidates = names.filter(|k| {
+        k.starts_with("MCP_")
+            && !FOREIGN_PREFIXES.iter().any(|p| k.starts_with(p))
+            && !KNOWN_VARS.contains(&k.as_str())
+    });
+    for k in candidates {
+        match KNOWN_VARS
+            .iter()
+            .map(|known| (edit_distance(&k, known), *known))
+            .min()
+        {
+            Some((d, known)) if d <= 3 => {
+                fatal.push(format!("unknown setting {}: did you mean {}?", k, known))
             }
-        })
-        .collect()
+            _ => ignored.push(k),
+        }
+    }
+    (fatal, ignored)
+}
+
+fn unknown_vars() -> (Vec<String>, Vec<String>) {
+    classify_unknown(std::env::vars().map(|(k, _)| k))
 }
 
 /// Variables whose value must never reach the log — recorded as a fingerprint so a rotation is
@@ -525,7 +553,19 @@ pub(crate) fn preflight_config() {
         }
     }
 
-    fatal.extend(unknown_vars());
+    let (misspelled, foreign) = unknown_vars();
+    fatal.extend(misspelled);
+
+    // Said out loud rather than swallowed: if one of these was meant for us, the operator is
+    // watching a setting do nothing, and the only clue they will get is this line.
+    for k in &foreign {
+        eprintln!(
+            "NOTE: {} is not a setting of this server and is being ignored. \
+             If you meant one of ours it is spelled differently; if it belongs to another program \
+             sharing this environment, nothing is wrong.",
+            k
+        );
+    }
 
     if !fatal.is_empty() {
         eprintln!("CONFIGURATION ERROR — the server will not start:");
@@ -534,5 +574,66 @@ pub(crate) fn preflight_config() {
         }
         eprintln!("Fix the above and restart (to disable a limit deliberately, set it to 0).");
         std::process::exit(2);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn classify(names: &[&str]) -> (Vec<String>, Vec<String>) {
+        classify_unknown(names.iter().map(|s| s.to_string()))
+    }
+
+    #[test]
+    fn a_misspelled_protection_still_refuses_to_start() {
+        // The reason this check exists at all: one letter short and redaction is off, silently.
+        let (fatal, ignored) = classify(&["MCP_REDACT_COLUMN"]);
+        assert_eq!(ignored, Vec::<String>::new());
+        assert_eq!(fatal.len(), 1);
+        assert!(
+            fatal[0].contains("did you mean MCP_REDACT_COLUMNS?"),
+            "{:?}",
+            fatal
+        );
+    }
+
+    #[test]
+    fn mcp_proxy_debug_does_not_stop_the_server() {
+        // 0.1.5 exited 2 on this, which made the server impossible to list in any catalogue.
+        let (fatal, ignored) = classify(&["MCP_PROXY_DEBUG"]);
+        assert_eq!(fatal, Vec::<String>::new());
+        assert_eq!(
+            ignored,
+            Vec::<String>::new(),
+            "a known foreign prefix is not even worth a note"
+        );
+    }
+
+    #[test]
+    fn an_unrelated_mcp_variable_is_noted_but_not_fatal() {
+        let (fatal, ignored) = classify(&["MCP_SOMEBODY_ELSES_GATEWAY_FLAG"]);
+        assert_eq!(fatal, Vec::<String>::new());
+        assert_eq!(ignored, vec!["MCP_SOMEBODY_ELSES_GATEWAY_FLAG".to_string()]);
+    }
+
+    #[test]
+    fn the_reserved_prefix_and_known_settings_are_untouched() {
+        let (fatal, ignored) =
+            classify(&["MCP_X_ANYTHING", "MCP_MAX_COST", "DATABASE_URL", "PATH"]);
+        assert_eq!(fatal, Vec::<String>::new());
+        assert_eq!(ignored, Vec::<String>::new());
+    }
+
+    #[test]
+    fn both_kinds_are_reported_separately_in_one_pass() {
+        let (fatal, ignored) = classify(&[
+            "MCP_RATE_RPMM",
+            "MCP_PROXY_DEBUG",
+            "MCP_WHATEVER_ELSE_ENTIRELY",
+        ]);
+        assert_eq!(fatal.len(), 1, "only the near miss is fatal: {:?}", fatal);
+        assert!(fatal[0].contains("MCP_RATE_RPMM"));
+        assert_eq!(ignored, vec!["MCP_WHATEVER_ELSE_ENTIRELY".to_string()]);
     }
 }

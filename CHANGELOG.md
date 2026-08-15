@@ -1,5 +1,37 @@
 # Changelog
 
+## 0.1.6 — 2026-08-15
+
+The first outside environment to run this server found two defects in an afternoon, and both had
+the same shape: the server was hostile to being *inspected*. Every catalogue, registry and gateway
+starts a server with no database attached, puts `mcp-proxy` in front of it, and asks `initialize`,
+`tools/list`, `resources/list` before a human ever sees it. This server failed that sequence twice,
+which is why it could not be listed anywhere — including in the directory that reported it.
+
+- **Somebody else's environment variable no longer stops startup.** `mcp-proxy` exports
+  `MCP_PROXY_DEBUG`; 0.1.5 saw an unknown `MCP_*` name and exited 2 before reading a request. The
+  check that did this is worth keeping — `MCP_REDACT_COLUMN`, one letter short of the real setting,
+  would start the server with redaction silently off — so the two cases are now separated by the
+  distinction the code was already computing. A near miss of a known setting (edit distance ≤ 3)
+  is still fatal and still names the intended spelling. A name that resembles nothing we define is
+  reported and ignored. `MCP_X_*` was supposed to cover this, but a reservation only helps programs
+  that have read our source, and `mcp-proxy` never will.
+- **`resources/list` answers when the database does not.** It returned a protocol error, which a
+  host reads as a dead server. It now returns an empty list with the reason under a namespaced
+  `_meta` key. This is not a claim that the schema is empty: `initialize` already reports that the
+  database has not answered, `security_posture` gives the detail, and the reason now travels with
+  the list itself. A database that answers and *refuses* — a missing privilege, say — is still an
+  error, because reporting "no resources" for a permission problem is exactly the silent failure
+  this project refuses everywhere else.
+- **The acceptance suite now runs that inspection.** One case drives the whole sequence with
+  `MCP_PROXY_DEBUG` set and a connection string pointing at a closed port, and asserts the empty
+  list carries its reason. A second case asserts the misspelling still exits 2, so the fix cannot
+  quietly loosen the check it came from.
+- Worth recording, because it is the argument for publishing at all: none of this was findable from
+  here. Six releases, 113 unit tests, an adversarial corpus and 2.4 million fuzzed mutations all
+  passed on a machine where the environment was ours and the database was up. The defects needed
+  somebody else's environment, and they appeared within a day of asking for one.
+
 ## 0.1.5 — 2026-08-09
 
 Three releases were spent discovering the registry's rules one refusal at a time. This one stops

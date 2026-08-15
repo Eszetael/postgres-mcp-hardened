@@ -336,6 +336,14 @@ fn url_for(name: Option<&str>) -> Option<String> {
     database_url()
 }
 
+/// The opening of every `pool_error_detail` message that means "the database never answered", as
+/// opposed to "the database answered and said no".
+///
+/// Callers that must tell those apart match on this rather than re-deriving the distinction: an
+/// unreachable database is a fact about the deployment, while a permission error is a fact about
+/// the query, and the two deserve different answers.
+pub(crate) const UNREACHABLE_PREFIX: &str = "cannot connect to PostgreSQL";
+
 pub(crate) fn pool_error_detail(db: Option<&str>) -> String {
     let Some(url) = url_for(db) else {
         return "no connection string: set DATABASE_URL, MCP_DATABASE_URLS, or pass it as the first \

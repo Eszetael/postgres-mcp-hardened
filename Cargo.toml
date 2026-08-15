@@ -1,6 +1,6 @@
 [package]
 name = "postgres-mcp-hardened"
-version = "0.1.5"
+version = "0.1.6"
 edition = "2021"
 description = "Secure read-only PostgreSQL MCP server in Rust — a hardened alternative to the deprecated @modelcontextprotocol/server-postgres. AST-validated SELECT-only, timeouts, EXPLAIN cost guard, OAuth 2.1."
 license = "MIT"

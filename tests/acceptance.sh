@@ -154,6 +154,48 @@ done
 out=$(env -u DATABASE_URL timeout 5 "$BIN" --validate "SELECT 1")
 [ "$out" = "ALLOW" ] && ok "validator works without a database" || no "offline validator" "$out"
 
+# Every catalogue inspects a server before anyone hands it a database: it starts the binary behind
+# `mcp-proxy`, calls initialize, then tools/list and resources/list. 0.1.5 failed that twice over —
+# it exited 2 because mcp-proxy exports MCP_PROXY_DEBUG, and once that was worked around it answered
+# resources/list with a protocol error. Both were found on 2026-08-15 by the first directory that
+# tried, and both read to a host as "this server does not work".
+section "Inspectable without a database"
+DEADDB="postgres://introspect:introspect@127.0.0.1:1/introspect"
+probe=$(printf '%s\n%s\n%s\n' \
+  '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"acceptance","version":"0"}}}' \
+  '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}' \
+  '{"jsonrpc":"2.0","id":3,"method":"resources/list","params":{}}' \
+  | env MCP_PROXY_DEBUG=1 DATABASE_URL="$DEADDB" timeout 90 "$BIN" --stdio 2>/dev/null)
+verdict=$(printf '%s' "$probe" | python3 -c "
+import sys,json
+got={}
+for line in sys.stdin:
+    line=line.strip()
+    if not line: continue
+    try: d=json.loads(line)
+    except Exception: continue
+    if 'id' in d: got[d['id']]=d
+if 1 not in got or 'result' not in got[1]: print('no initialize response'); raise SystemExit
+if 2 not in got or 'result' not in got[2]: print('tools/list did not answer'); raise SystemExit
+if not got[2]['result'].get('tools'): print('tools/list was empty'); raise SystemExit
+r3=got.get(3)
+if r3 is None: print('resources/list did not answer'); raise SystemExit
+if 'error' in r3: print('resources/list returned an error: '+r3['error']['message'][:60]); raise SystemExit
+if r3['result'].get('resources') != []: print('expected an empty resource list'); raise SystemExit
+if 'io.github.eszetael/databaseUnavailable' not in (r3['result'].get('_meta') or {}):
+    print('empty list did not say why'); raise SystemExit
+print('OK')")
+[ "$verdict" = OK ] \
+  && ok "a host can inspect the server with no database and mcp-proxy in front" \
+  || no "inspection without a database" "$verdict"
+
+# The other half of that fix must not have loosened the check it came from: a misspelling of a
+# protection is still fatal, because starting with redaction off is the failure this guards.
+env MCP_REDACT_COLUMN=ssn DATABASE_URL="$DEADDB" timeout 10 "$BIN" --stdio </dev/null >/dev/null 2>&1
+rc=$?
+[ $rc -eq 2 ] && ok "refuses to start: MCP_REDACT_COLUMN (a misspelling is still fatal)" \
+              || no "misspelled setting no longer refuses to start" "rc=$rc"
+
 section "Audit trail"
 AUD=$(mktemp); start DATABASE_URL="$URL" MCP_AUDIT_LOG="$AUD" MCP_AUDIT_HMAC_KEY=acc_key
 tool query '{"sql":"SELECT 1"}' >/dev/null; tool query '{"sql":"DROP TABLE orders"}' >/dev/null

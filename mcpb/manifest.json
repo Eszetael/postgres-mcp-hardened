@@ -2,7 +2,7 @@
   "manifest_version": "0.3",
   "name": "postgres-mcp-hardened",
   "display_name": "PostgreSQL (read-only, hardened)",
-  "version": "0.1.5",
+  "version": "0.1.6",
   "description": "Read-only PostgreSQL MCP server in Rust: AST-enforced read-only queries plus database-level read-only transaction, per-session statement_timeout, schema inspection.",
   "author": {
     "name": "Eszetael",
