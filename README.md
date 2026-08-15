@@ -1,6 +1,6 @@
 # postgres-mcp-hardened
 
-> ### 🚧 Version 0.1.5 — on every channel, not yet used by anyone but us
+> ### 🚧 Version 0.1.6 — on every channel, not yet used by anyone but us
 >
 > Published: binaries for five platforms with checksums, Sigstore signatures and build provenance;
 > an image on `ghcr.io` for amd64 and arm64; a package on npm; and an entry in the official MCP
@@ -26,14 +26,55 @@
 > If you find something, [`SECURITY.md`](SECURITY.md) says how to say so.
 
 
-**The official Postgres MCP server was deprecated in 2024 and still gets ~440k downloads a month. Its entire defence is one database-level read-only transaction — and that alone does not stop every write. This is a maintained Rust replacement with defence in depth.**
+**The official Postgres MCP server was deprecated in 2024 and still gets ~476k downloads a month. Its entire defence is one database-level read-only transaction — and that alone does not stop every write. This is a maintained Rust replacement with defence in depth.**
 
 A drop-in [Model Context Protocol](https://modelcontextprotocol.io) server that lets an AI agent query PostgreSQL — **read-only, enforced at the database level**, with real SQL validation, timeouts, cost limits, OAuth 2.1, and an audit trail. Speaks **Streamable HTTP** and stdio, and negotiates the MCP revision: `2025-11-25` (current), `2025-06-18` (what shipping clients speak today), and `2026-07-28` behind a switch while it is still a draft.
+
+## Try to break it — one command, no database
+
+The read-only guard has an offline mode. Hand it a statement and it says what it decided: no
+database, no configuration, nothing installed permanently.
+
+```sh
+npx postgres-mcp-hardened --validate "/* comment */ DROP TABLE users"
+# REJECT: non-read-only statement: Drop
+
+npx postgres-mcp-hardened --validate "SELECT 1; DROP TABLE users"
+# REJECT: multiple statements are forbidden
+
+npx postgres-mcp-hardened --validate "WITH d AS (DELETE FROM t RETURNING *) SELECT * FROM d"
+# REJECT: non-read-only statement: non-read-only query (CTE / SELECT INTO / FOR UPDATE)
+
+npx postgres-mcp-hardened --validate "SELECT * FROM orders WHERE id = 1"
+# ALLOW
+```
+
+**If something that writes comes back `ALLOW`, that is the most valuable thing anyone can send us.**
+It needs no working exploit and no write-up — one line of SQL and "this should not be allowed" is a
+complete report. Anything that gets past the guard goes through [`SECURITY.md`](SECURITY.md);
+everything else is an ordinary issue, and the bar for opening one is *this looks wrong to me*, not
+*I am certain*.
+
+The fuzzer is deterministic and prints its seed, so whatever it finds reproduces on a machine that
+has never seen yours — a million mutations take about a minute:
+
+```sh
+npx postgres-mcp-hardened --fuzz 1000000
+# fuzz: 1000000 iterations, seed 1592594996, slowest validation 8 ms
+# RESULT: 0 invariant violations
+```
+
+For the whole thing against a real database, `docker compose -f examples/docker-compose.yml up -d`
+brings up PostgreSQL with sample data and the server in front of it, connecting as a role that holds
+`SELECT` and nothing else.
+
+Every bypass found so far lives in the `MUST_REJECT` corpus in `src/validate.rs` and runs on every
+commit, recorded with what it cost rather than tidied away. Yours would join them.
 
 ## Why
 
 `@modelcontextprotocol/server-postgres` is **deprecated on npm** (last publish December 2024) and
-still sees **~440,000 downloads a month**. Credit where it is due: its approach is not naive — it
+still sees **475,790 downloads in the 30 days to 9 August 2026**. Credit where it is due: its approach is not naive — it
 wraps each query in `BEGIN TRANSACTION READ ONLY` and always `ROLLBACK`s, which is a real defence
 and one this server now adopts as well.
 
