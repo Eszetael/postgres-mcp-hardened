@@ -1,9 +1,12 @@
 # postgres-mcp-hardened
 
-> ### 🚧 Version 0.1.0 — released, not yet used by anyone but us
+> ### 🚧 Version 0.1.5 — on every channel, not yet used by anyone but us
 >
-> The first release is out: binaries for five platforms, with checksums, Sigstore signatures and
-> build provenance. It is **not** in the MCP registry yet.
+> Published: binaries for five platforms with checksums, Sigstore signatures and build provenance;
+> an image on `ghcr.io` for amd64 and arm64; a package on npm; and an entry in the official MCP
+> registry. Five of those versions went out in a single day, because three of them were spent
+> learning the registry's ownership rules one refusal at a time — that story is in
+> [`CHANGELOG.md`](CHANGELOG.md).
 >
 > **What is actually proven**, in the sense that something other than an opinion checks it: the
 > read-only rules (a fuzz harness over 200k mutations, an adversarial corpus of every bypass found
@@ -13,7 +16,7 @@
 > published binary itself, downloaded from the release page and run against a live database.
 >
 > **What is not**: nobody outside this project has run it against their own data. That is the whole
-> reason this is 0.1.0 and not 1.0. Every adversarial round run against this code so far has found
+> reason this is 0.1.x and not 1.0. Every adversarial round run against this code so far has found
 > something real, including rounds run after the previous one came back clean — the day of the
 > release itself produced four, one of which handed a superuser role to anyone who could create a
 > table. The honest reading is that the next round would find something too.
@@ -698,4 +701,16 @@ left resident memory flat and file descriptors unchanged.
 
 ## License
 
-MIT — see [LICENSE](./LICENSE).
+MIT — see [LICENSE](./LICENSE). The core is MIT and stays that way.
+
+## Commercial and team use
+
+Pointing this at a production database *inside an organisation* raises questions the MIT core does
+not answer: policy bound to an identity rather than to a scope, an audit log shipped somewhere it
+cannot be quietly edited, evidence a compliance reviewer will accept, a deployment somebody is on
+the hook for.
+
+A team edition covering those is being scoped right now, and what goes into it is not decided. If
+that is what your organisation needs, write to <eskulapstudio@gmail.com> and say what would have
+to be in it. There is nothing to buy yet — the answers are what decides whether it gets built at
+all, and in what order.
