@@ -91,7 +91,7 @@ The problem is that it is the *only* defence, and it is not complete:
   semantics.
 - **No statement timeout, no cost guard, no row limit** — one query can run until the server gives up.
 - **No authentication, no audit trail, no handling of prompt injection** through returned row data.
-- 113 lines, unmaintained since 2024, no test suite.
+- One source file of 143 lines, unmaintained since December 2024, no test suite.
 
 This server keeps the rollback, adds AST validation in front of it, and adds the operational layers
 the original never had.
