@@ -4,6 +4,11 @@
 # false failures. A check pinned to a filename tests the layout, not the claim.
 # Control A: Ensure every "verified" claim in docs references an existing acceptance test or unit test.
 # Control B: Keep documented environment variables in sync with the canonical list in source code.
+# Control E: Claims about OTHER people's repositories. Controls A-D all guard statements about our
+#   own code, and on 2026-08-16 a review found eight errors — every one of them about something
+#   external: a fabricated snippet attributed to the archived server, a mistitled OWASP category,
+#   reaction counts that had drifted. Those are the claims a hostile reader checks first, because
+#   checking them needs nothing from us.
 
 fail=0
 tmpdir=$(mktemp -d) || exit 1
@@ -97,6 +102,79 @@ done
 if grep -q '<[A-Z_]*>' mcpb/manifest.json; then
     printf "FAIL mcpb/manifest.json still contains a placeholder\n"
     fail=1
+fi
+
+# CONTROL E: every issue cited in docs/COMMUNITY_ISSUES.md must exist, and its 👍 count must match.
+#
+# Two different failures, deliberately treated differently. A cited issue that does not exist is OUR
+# mistake and fails the build. A count that has drifted is the WORLD moving — people add and remove
+# reactions — so it warns and prints the correction rather than turning the build red for something
+# nobody here did. A red build that is not the author's fault teaches people to ignore red builds.
+#
+# Needs network and a token. Without either it SKIPS loudly: a check that silently does nothing is
+# worse than no check, because it reports green.
+if [ -z "${GITHUB_TOKEN:-}" ] && [ -f /etc/brain/config.env ]; then
+    GITHUB_TOKEN=$(sed -n 's/^GITHUB_TOKEN=//p' /etc/brain/config.env | tr -d '"')
+    export GITHUB_TOKEN
+fi
+if [ -z "${GITHUB_TOKEN:-}" ]; then
+    echo "SKIP Control E: no GITHUB_TOKEN, cannot verify claims about other repositories"
+elif ! curl -sf -m 10 -o /dev/null https://api.github.com/rate_limit \
+        -H "Authorization: Bearer $GITHUB_TOKEN"; then
+    echo "SKIP Control E: GitHub API unreachable"
+else
+    python3 - "$tmpdir" <<'PYEOF' || fail=1
+import io, json, re, sys, time, urllib.request
+
+tok = __import__("os").environ["GITHUB_TOKEN"]
+h = {"Authorization": "Bearer " + tok, "Accept": "application/vnd.github+json",
+     "User-Agent": "docs-claims"}
+doc = "docs/COMMUNITY_ISSUES.md"
+try:
+    text = io.open(doc, encoding="utf-8").read()
+except OSError:
+    print("FAIL Control E: %s is missing" % doc)
+    raise SystemExit(1)
+
+bad, drift, rows = [], [], 0
+for line in text.splitlines():
+    if not line.startswith("|"):
+        continue
+    cells = [c.strip() for c in line.strip("|").split("|")]
+    if len(cells) < 2:
+        continue
+    ids = re.findall(r"github\.com/([^/]+)/([^/)]+)/issues/(\d+)", cells[0])
+    if not ids:
+        continue
+    try:
+        claimed = int(cells[1])
+    except ValueError:
+        continue
+    rows += 1
+    total, missing = 0, False
+    for owner, repo, num in ids:
+        url = "https://api.github.com/repos/%s/%s/issues/%s" % (owner, repo, num)
+        try:
+            req = urllib.request.Request(url, headers=h)
+            with urllib.request.urlopen(req, timeout=20) as r:
+                total += (json.load(r).get("reactions") or {}).get("+1", 0)
+        except Exception as e:
+            bad.append("%s/%s#%s (%s)" % (owner, repo, num, str(e)[:40]))
+            missing = True
+        time.sleep(0.1)
+    if not missing and total != claimed:
+        drift.append("%s: says %d, actually %d" %
+                     (", ".join("#" + i[2] for i in ids), claimed, total))
+
+for b in bad:
+    print("FAIL Control E: cited issue cannot be reached: %s" % b)
+for d in drift:
+    print("WARN Control E: reaction count drifted — %s" % d)
+if not bad:
+    print("PASS Control E: all %d cited external issues exist%s"
+          % (rows, " (%d counts drifted, see above)" % len(drift) if drift else ""))
+raise SystemExit(1 if bad else 0)
+PYEOF
 fi
 
 if [ "$fail" -eq 0 ]; then

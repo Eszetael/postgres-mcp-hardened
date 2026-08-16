@@ -194,7 +194,12 @@ jobs:
     runs-on: ${{ vars.RUNNER_LABEL || 'ubuntu-latest' }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.3.0
+      # Control E reads other people's public issues, so it needs a token or it skips itself into
+      # uselessness. The workflow-level `contents: read` is enough: these are public repositories,
+      # and nothing here writes anything anywhere.
       - run: sh tests/docs_claims.sh
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   audit:
     runs-on: ${{ vars.RUNNER_LABEL || 'ubuntu-latest' }}
