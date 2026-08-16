@@ -5,7 +5,10 @@ MCP server should do. Below is the complete ledger: every problem reported again
 `@modelcontextprotocol/server-postgres`, and every open issue against the actively maintained
 alternatives, with what happens here.
 
-Reaction counts are from the source tracker and indicate how many people hit the same thing.
+Reaction counts are 👍 on the linked issues, summed per row where a row cites several, and they
+indicate how many other people hit the same thing. **Counted on 2026-08-16.** They drift: between
+26 July and 16 August four of the thirty-eight moved by one, and one of those moved *up*. The date
+is here so the number can be checked against something rather than trusted.
 Where a row says “verified”, it names the check in `tests/acceptance.sh` that proves it on every CI
 run. `tests/docs_claims.sh` fails the build if a claim names a check that does not exist.
 
@@ -21,8 +24,8 @@ run. `tests/docs_claims.sh` fails the build if a claim names a check that does n
 | [#1014](https://github.com/modelcontextprotocol/servers/issues/1014) `Unexpected end of JSON input` | 4 | Multi-line messages are buffered until complete; malformed input returns a parse error instead of silence. *verified* (acceptance: "multi-line message is assembled") |
 | [#845](https://github.com/modelcontextprotocol/servers/issues/845) / [#842](https://github.com/modelcontextprotocol/servers/issues/842) Connection string from the environment | 3 | `DATABASE_URL`, the positional argument, or `MCP_PASSWORD_FILE` for the password alone. |
 | [#1121](https://github.com/modelcontextprotocol/servers/issues/1121) / [#1885](https://github.com/modelcontextprotocol/servers/issues/1885) / [#1873](https://github.com/modelcontextprotocol/servers/issues/1873) Self-signed certificate, unable to verify the first certificate | 3 | `MCP_SSLROOTCERT` takes the provider CA bundle, and the error names the exact step for your provider (Supabase, RDS, Cloud SQL, DigitalOcean) instead of "TLS handshake failed". Verified against a live Supabase instance. A Supabase host that never answers also gets told that the direct endpoint is IPv6-only and the pooler is the IPv4 route. |
-| [#1047](https://github.com/modelcontextprotocol/servers/issues/1047) `-32601 Method not found` | 2 | `ping` and resources implemented; an unknown method returns a clean, correct error. *verified* (acceptance: "ping") |
-| [#102](https://github.com/modelcontextprotocol/servers/issues/102) "Could not attach to MCP server" | 1 | A configuration mistake exits with status 2 and prints its reason; a connection problem is reported on the first query with the cause. *verified* (acceptance: "refuses to start:") |
+| [#1047](https://github.com/modelcontextprotocol/servers/issues/1047) `-32601 Method not found` | 1 | `ping` and resources implemented; an unknown method returns a clean, correct error. *verified* (acceptance: "ping") |
+| [#102](https://github.com/modelcontextprotocol/servers/issues/102) "Could not attach to MCP server" | 0 | A configuration mistake exits with status 2 and prints its reason; a connection problem is reported on the first query with the cause. *verified* (acceptance: "refuses to start:") |
 | [#1063](https://github.com/modelcontextprotocol/servers/issues/1063) Partition tables flood the resource list | 0 | Children hidden by default, parent listed; `MCP_SHOW_PARTITIONS=1` restores them. *verified* (acceptance: "partition children hidden") |
 | [#1310](https://github.com/modelcontextprotocol/servers/issues/1310) `npx` start "works" but nothing listens on a port | 0 | A single binary, no npx. stdio has no port by design; HTTP mode prints its address. Explained in Troubleshooting. |
 | [#1929](https://github.com/modelcontextprotocol/servers/issues/1929) `INVALID_URL` in Docker | 0 | The real cause is a password containing `@ : / #`; the error names the characters and their encodings. |
@@ -39,9 +42,9 @@ Their trackers describe what still goes wrong in this space. Each was checked ag
 |---|---|---|
 | [crystaldba#98](https://github.com/crystaldba/postgres-mcp/issues/98) A new connection pool per client, never cleaned up | 10 | One pool per configured database, shared by every session: 20 client sessions used one connection. *verified* (acceptance: "20 client sessions share one pool") |
 | [crystaldba#141](https://github.com/crystaldba/postgres-mcp/issues/141) / [#162](https://github.com/crystaldba/postgres-mcp/issues/162) The published image lags the code | 14 | The container is built and pushed from the same tag that produces the binaries, amd64 and arm64. |
-| [crystaldba#99](https://github.com/crystaldba/postgres-mcp/issues/99) Hardcoded query timeout | 8 | `MCP_STATEMENT_TIMEOUT`, validated at startup. |
+| [crystaldba#99](https://github.com/crystaldba/postgres-mcp/issues/99) Hardcoded query timeout | 9 | `MCP_STATEMENT_TIMEOUT`, validated at startup. |
 | [crystaldba#71](https://github.com/crystaldba/postgres-mcp/issues/71) Table and column comments missing from metadata | 3 | `describe_table` and the resources return `COMMENT ON` text, primary keys and foreign keys. *verified* (acceptance: "column comments are exposed") |
-| [crystaldba#171](https://github.com/crystaldba/postgres-mcp/issues/171) / [dbhub#66](https://github.com/bytebase/dbhub/issues/66) Is there a bearer token for the server itself? | 2 | `MCP_BEARER_TOKEN`, compared in constant time, alongside or instead of OAuth 2.1. *verified* (acceptance: "request with the token is served") |
+| [crystaldba#171](https://github.com/crystaldba/postgres-mcp/issues/171) / [dbhub#66](https://github.com/bytebase/dbhub/issues/66) Is there a bearer token for the server itself? | 1 | `MCP_BEARER_TOKEN`, compared in constant time, alongside or instead of OAuth 2.1. *verified* (acceptance: "request with the token is served") |
 | [crystaldba#164](https://github.com/crystaldba/postgres-mcp/issues/164) Default unrestricted mode allows arbitrary SQL | 2 | There is no write path to enable. |
 | [crystaldba#97](https://github.com/crystaldba/postgres-mcp/issues/97) / [#176](https://github.com/crystaldba/postgres-mcp/issues/176) Keep the password out of the config | 2 | `MCP_PASSWORD_FILE` reads it from a file (a mounted secret, for instance). |
 | [crystaldba#167](https://github.com/crystaldba/postgres-mcp/issues/167) Redact sensitive columns so they never reach the model | 1 | `MCP_REDACT_COLUMNS`: masked in results *and* refused if referenced — renaming or wrapping the column does not get past it. *verified* (acceptance: "renaming a redacted column is refused") |
