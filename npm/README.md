@@ -16,7 +16,7 @@ npx postgres-mcp-hardened --validate "/* comment */ DROP TABLE users"
 
 If something that writes comes back `ALLOW`, that is the most useful thing anyone can report. The
 design and the defects found so far are written up in
-[**Rebuilding the Deprecated PostgreSQL MCP Server in Rust**](https://dev.to/eszetael/rebuilding-the-deprecated-postgresql-mcp-server-in-rust-safe-by-default-1eb).
+[**Rebuilding the Deprecated PostgreSQL MCP Server in Rust**](https://dev.to/eszetael_lab/rebuilding-the-deprecated-postgresql-mcp-server-in-rust-safe-by-default-1eb).
 
 ## Replace the deprecated server
 
