@@ -770,8 +770,15 @@ shipped to every user. Setting `strip`, `lto` and `codegen-units = 1` took it to
 The container image line is still the 0.1.6 measurement and says so; a footprint table that quietly
 restates its own history is not evidence of anything.
 
-A twelve-minute soak of mixed traffic (reads, refusals, errors, aborted requests, session churn)
-left resident memory flat and file descriptors unchanged.
+A twelve-minute soak of mixed traffic (reads, refusals, errors, aborted requests, session churn,
+unauthenticated requests) served **51,499 requests** and ended with **the same 15 open file
+descriptors it started with**. Resident memory went from 8.1 MB to 11.2 MB, and the shape of that is
+the interesting part: 8.1 to 10.7 happened inside the first 400 requests, and the remaining 51,000
+added 0.5 MB in a curve that flattened as it went. That is an allocator settling, not a leak. This
+page used to say memory stayed "flat", which was true of everything after the first few seconds and
+not true of the number, so here is the number.
+
+Reproduce it with `tests/soak.sh` rather than believing the paragraph.
 
 ## Configuration
 
