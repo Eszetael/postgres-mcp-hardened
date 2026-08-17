@@ -255,6 +255,49 @@ print("PASS Control G: the download figure matches npm today (%s claimed, %s rep
 PYEOF
 fi
 
+# Control H: the four --validate examples in the README are the most-read code this project has —
+# the opening section asks a stranger to paste them before installing anything, and each carries its
+# expected output in a comment. A README that promises REJECT and delivers ALLOW would do more damage
+# than a bug, because it is the demonstration that the guard works at all. So the promised output is
+# compared against what the binary actually prints.
+BIN_H="${BIN:-target/release/postgres-mcp-hardened}"
+if [ ! -x "$BIN_H" ]; then
+    echo "SKIP Control H: no release binary at $BIN_H, cannot check the README's --validate examples"
+else
+    python3 - "$BIN_H" <<'PYEOF' || fail=1
+import io, re, subprocess, sys
+binary = sys.argv[1]
+lines = io.open("README.md", encoding="utf-8").read().splitlines()
+pairs, bad = [], 0
+for i, ln in enumerate(lines):
+    m = re.match(r'^npx postgres-mcp-hardened --validate "(.*)"$', ln.strip())
+    if not m:
+        continue
+    want = ""
+    for nxt in lines[i + 1:i + 3]:
+        if nxt.startswith("# "):
+            want = nxt[2:].strip()
+            break
+        if nxt.strip():
+            break
+    if want:
+        pairs.append((m.group(1), want))
+if not pairs:
+    print("FAIL Control H: the README no longer shows any --validate example with its output")
+    sys.exit(1)
+for sql, want in pairs:
+    got = subprocess.run([binary, "--validate", sql], capture_output=True, text=True)
+    got = (got.stdout + got.stderr).strip().splitlines()
+    got = got[0].strip() if got else "<nic>"
+    if got != want:
+        print("FAIL Control H: README promises %r for %r, binary prints %r" % (want, sql, got))
+        bad += 1
+if bad:
+    sys.exit(1)
+print("PASS Control H: all %d README --validate examples print what the README promises" % len(pairs))
+PYEOF
+fi
+
 if [ "$fail" -eq 0 ]; then
     echo "PASS Control A: every 'verified' claim names a test that exists"
     echo "PASS Control B: the documented settings and the source agree"
