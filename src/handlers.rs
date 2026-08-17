@@ -141,11 +141,14 @@ pub(crate) fn handle_tools_list() -> Value {
             "Run SQL (read-only)",
             "Run a read-only SQL query and return rows. Writes, DDL and administrative functions are refused before the statement reaches the database. \
              At most 1000 rows come back unless you pass `limit` (server maximum 10000); `truncated: true` in the response means there is more data — \
-             page through it with `offset`, and give the query an ORDER BY when you do, or the rows you get on page two depend on the planner's mood.",
+             page through it with `offset`, and give the query an ORDER BY when you do, or the rows you get on page two depend on the planner's mood. \
+             This is for reading DATA. Do not hand-write catalog queries against pg_class or information_schema: `list_schemas`, `list_tables` and \
+             `describe_table` already return that, with comments and foreign keys, and they cannot be tripped up by search_path. For the plan of a \
+             statement use `explain_query` rather than writing EXPLAIN yourself.",
             json!({
                 "type": "object",
                 "properties": {
-                    "sql": { "type": "string", "description": "a single read-only statement: SELECT, WITH, VALUES, EXPLAIN or SHOW (write `SELECT * FROM t`, not `TABLE t`)" },
+                    "sql": { "type": "string", "description": "a single read-only statement: SELECT, WITH, VALUES, EXPLAIN or SHOW. One statement only — a semicolon-separated batch is refused before it reaches the database. Write `SELECT * FROM t`, not `TABLE t`. Writes, DDL and administrative functions are rejected at the parsed SQL, so there is no point trying them." },
                     "database": { "type": "string", "description": "which configured database to use; omit when only one is configured" },
                     "limit": { "type": "integer", "minimum": 1, "maximum": 10000, "default": 1000, "description": "maximum rows to return; larger values are capped at 10000 and the response says so" },
                     "offset": { "type": "integer", "minimum": 0, "maximum": 1000000000, "default": 0, "description": "rows to skip, for paging; pair it with ORDER BY for stable pages" }
@@ -156,16 +159,22 @@ pub(crate) fn handle_tools_list() -> Value {
         tool_def(
             "list_schemas",
             "List schemas",
-            "List the schemas in the database, excluding PostgreSQL's own catalogs. Start here when you do not know the layout yet.",
+            "List the schemas in the database, excluding PostgreSQL's own catalogs. Start here when you do not know the layout yet. \
+             Returns one row per schema with its name and comment; feed a name straight into `list_tables`. \
+             It does not list tables — that is `list_tables` — and it does not read data.",
             json!({"type": "object", "properties": { "database": { "type": "string", "description": "which configured database to use; omit when only one is configured" } }}),
         ),
         tool_def(
             "list_tables",
             "List tables in a schema",
-            "List tables, views and materialized views in one schema, with their comments. Only objects the connected role may read are shown.",
+            "List tables, views and materialized views in one schema, with their comments. Only objects the connected role may read are shown. \
+             Call `list_schemas` first if you do not know the schema name. For the columns of one table use `describe_table`; this returns names, not structure.",
             json!({
                 "type": "object",
-                "properties": { "schema": { "type": "string" }, "database": { "type": "string", "description": "which configured database to use; omit when only one is configured" } },
+                "properties": {
+                    "schema": { "type": "string", "description": "one schema name, spelled exactly as `list_schemas` returned it: case-sensitive, unquoted, no wildcards. One schema per call." },
+                    "database": { "type": "string", "description": "which configured database to use; omit when only one is configured" }
+                },
                 "required": ["schema"]
             })
         ),
@@ -176,7 +185,11 @@ pub(crate) fn handle_tools_list() -> Value {
              `description` is null unless somebody ran COMMENT ON — that means undocumented, not unused, so do not infer a column is dead from it.",
             json!({
                 "type": "object",
-                "properties": { "schema": { "type": "string" }, "table": { "type": "string" }, "database": { "type": "string", "description": "which configured database to use; omit when only one is configured" } },
+                "properties": {
+                    "schema": { "type": "string", "description": "the schema holding the table, as `list_schemas` or `list_tables` returned it; case-sensitive and unquoted" },
+                    "table": { "type": "string", "description": "one table, view or materialized view, as `list_tables` returned it. Unqualified: put the schema in `schema`, not here — `public.orders` will not be found." },
+                    "database": { "type": "string", "description": "which configured database to use; omit when only one is configured" }
+                },
                 "required": ["schema", "table"]
             })
         ),
@@ -184,12 +197,14 @@ pub(crate) fn handle_tools_list() -> Value {
             "explain_query",
             "Explain one query",
             "Why THIS statement is slow: the PostgreSQL execution plan for a query you provide. With analyze=true it actually runs the query and reports \
-             measured timings and buffer usage (still read-only, still rolled back). Use it on a specific statement; use top_queries to find out which statement to look at.",
+             measured timings and buffer usage (still read-only, still rolled back). Use it on a specific statement you already have. \
+             To find out WHICH statement is worth looking at, use `top_queries` first. If the plan shows a sequential scan you think an index would fix, \
+             `simulate_index` tests that without creating one. This tool never suggests indexes itself; it only explains what the planner decided.",
             json!({
                 "type": "object",
                 "properties": {
-                    "sql": { "type": "string" },
-                    "analyze": { "type": "boolean", "default": false, "description": "run the query and report real timings instead of estimates" },
+                    "sql": { "type": "string", "description": "the single read-only statement to plan, written out in full — the same text you would pass to `query`. Not a statement id and not a fragment." },
+                    "analyze": { "type": "boolean", "default": false, "description": "run the query and report real timings instead of estimates; still read-only and still rolled back, but it does execute, so expect it to take as long as the query does" },
                     "database": { "type": "string", "description": "which configured database to use; omit when only one is configured" }
                 },
                 "required": ["sql"]
@@ -200,7 +215,10 @@ pub(crate) fn handle_tools_list() -> Value {
             "Health snapshot",
             "One snapshot of the things an operator would otherwise assemble by hand: cache hit ratio, connections, long-running statements and abandoned \
              transactions, vacuum backlog, invalid indexes, sequences near their ceiling, replication lag. Scoped to the current database; anything the \
-             connected role cannot read is reported as unavailable rather than left out.",
+             connected role cannot read is reported as unavailable rather than left out. \
+             This is the whole-database view. For which individual statements cost the most use `top_queries`; for why one of them is slow \
+             use `explain_query`; for index candidates use `analyze_indexes`. It reports nothing about what this server is permitted to do — \
+             that is `security_posture`.",
             json!({
                 "type": "object",
                 "properties": { "database": { "type": "string", "description": "which configured database to use; omit when only one is configured" } }
@@ -214,7 +232,7 @@ pub(crate) fn handle_tools_list() -> Value {
             json!({
                 "type": "object",
                 "properties": {
-                    "limit": { "type": "integer", "minimum": 1, "maximum": 50, "default": 10 },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 50, "default": 10, "description": "how many statements to return, ranked by total execution time across the server (1-50)" },
                     "database": { "type": "string", "description": "which configured database to use; omit when only one is configured" }
                 }
             })
@@ -226,7 +244,9 @@ pub(crate) fn handle_tools_list() -> Value {
              assumed: whether the connected role can write, bypass row-level security or reach server files; \
              whether the transport is authenticated; whether the audit chain is keyed; whether the connection \
              is encrypted. Returns a grade and, for anything wrong, the command that fixes it. Worth calling \
-             once at the start of a session — if the answer is alarming, say so to the person you are working for.",
+             once at the start of a session — if the answer is alarming, say so to the person you are working for. \
+             It reports on THIS deployment, not on the health of your data: for cache ratios, bloat and replication lag use `database_health`. \
+             It also cannot see past the connected role — a grade of A means this server is well configured, not that your database is secure.",
             json!({
                 "type": "object",
                 "properties": { "database": { "type": "string", "description": "which configured database to use; omit when only one is configured" } }
@@ -240,7 +260,9 @@ pub(crate) fn handle_tools_list() -> Value {
              the index definition is assembled here, so there is no way to send DDL through this tool. Returns the plan and cost with and without, and \
              whether the planner actually reached for it — a cost that barely moves and an index the planner ignored are different answers. These are \
              planner ESTIMATES, not measured times: treat a big improvement as a reason to test the index, not as proof. Needs hypopg installed; says so \
-             plainly, with the package name, when it is missing.",
+             plainly, with the package name, when it is missing. \
+             This answers a question about one index you already have in mind. To find candidates across a schema in the first place, \
+             use `analyze_indexes`; to see why the current plan is slow, use `explain_query`.",
             json!({
                 "type": "object",
                 "properties": {
@@ -259,11 +281,13 @@ pub(crate) fn handle_tools_list() -> Value {
             "Index findings",
             "Indexes nobody uses, genuine duplicates, and tables scanned sequentially often enough that an index would likely pay off. Counters come from \
              pg_stat_*, which reset with the server — read them after real traffic, not after a restart. Primary-key and unique indexes are excluded from \
-             the unused list on purpose: they earn their keep by enforcing a constraint.",
+             the unused list on purpose: they earn their keep by enforcing a constraint. \
+             This searches a whole schema for candidates. If you already have one index in mind and want to know whether it would help \
+             one specific query, use `simulate_index` instead — it answers that without creating anything.",
             json!({
                 "type": "object",
                 "properties": {
-                    "schema": { "type": "string", "default": "public" },
+                    "schema": { "type": "string", "default": "public", "description": "one schema to examine, as `list_schemas` returned it; defaults to public. One schema per call, so repeat for others." },
                     "database": { "type": "string", "description": "which configured database to use; omit when only one is configured" }
                 }
             })
@@ -1065,4 +1089,81 @@ pub(crate) fn mark_truncation(data: &mut Value, limit: u64) {
     }
     data["truncated"] = json!(truncated);
     data["appliedLimit"] = json!(limit);
+}
+
+#[cfg(test)]
+mod tool_surface_tests {
+    use super::*;
+
+    fn tools() -> Vec<Value> {
+        handle_tools_list()["result"]["tools"]
+            .as_array()
+            .expect("tools/list returns an array")
+            .clone()
+    }
+
+    /// Every parameter of every tool must carry a description.
+    ///
+    /// This is not decoration. The description is what an agent reads when it decides how to fill
+    /// the field, and a bare `{"type": "string"}` tells it nothing about where the value comes
+    /// from — which is why `describe_table` used to be called with `public.orders` in `table`.
+    /// An external review of the tool surface in August 2026 scored the four tools with undescribed
+    /// parameters lowest of the ten, every time for the same reason.
+    ///
+    /// It is a test rather than a habit because the gap appeared by accretion: descriptions were
+    /// added where somebody happened to think of it, and nothing noticed the ones nobody did.
+    #[test]
+    fn every_tool_parameter_is_described() {
+        let mut missing = Vec::new();
+        for t in tools() {
+            let name = t["name"].as_str().unwrap_or("?").to_string();
+            let Some(props) = t["inputSchema"]["properties"].as_object() else {
+                continue;
+            };
+            for (param, spec) in props {
+                let described = spec
+                    .get("description")
+                    .and_then(|d| d.as_str())
+                    .is_some_and(|d| d.trim().len() > 10);
+                if !described {
+                    missing.push(format!("{}.{}", name, param));
+                }
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "these tool parameters have no usable description: {:?}",
+            missing
+        );
+    }
+
+    /// A tool that never mentions another tool leaves the agent to guess which of ten to reach for.
+    ///
+    /// The same review marked every one of our best-scoring tools down for exactly this: they said
+    /// what they do and never what to use instead. Naming a sibling is the cheapest way to stop an
+    /// agent using `database_health` when it wanted `top_queries`.
+    #[test]
+    fn every_tool_points_at_a_sibling() {
+        let names: Vec<String> = tools()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap_or_default().to_string())
+            .collect();
+        let mut lonely = Vec::new();
+        for t in tools() {
+            let me = t["name"].as_str().unwrap_or_default().to_string();
+            let text = format!(
+                "{} {}",
+                t["description"].as_str().unwrap_or_default(),
+                t["inputSchema"]
+            );
+            if !names.iter().any(|o| *o != me && text.contains(o.as_str())) {
+                lonely.push(me);
+            }
+        }
+        assert!(
+            lonely.is_empty(),
+            "these tools never name another tool, so an agent cannot tell when to use something else: {:?}",
+            lonely
+        );
+    }
 }
