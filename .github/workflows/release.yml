@@ -91,6 +91,27 @@ jobs:
             tar -czf "${BIN}-${{ matrix.target }}.tar.gz" -C "${DIR}" "${BIN}"
           fi
 
+      # A one-click installer for clients that accept .mcpb bundles. The manifest has existed since
+      # July and nobody ever packed it — which meant nobody discovered that it failed the official
+      # schema validation (`repository` was a string where an object is required), so the one-click
+      # path was broken for its whole life. It is built here, per platform, from the binary this job
+      # just produced, and validated before packing so a broken manifest fails the release rather
+      # than shipping an archive that no client will open.
+      - name: Bundle for one-click install (.mcpb)
+        shell: bash
+        run: |
+          BIN=postgres-mcp-hardened
+          DIR="target/${{ matrix.target }}/release"
+          mkdir -p mcpb/bin
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            cp "${DIR}/${BIN}.exe" mcpb/bin/${BIN}.exe
+          else
+            cp "${DIR}/${BIN}" mcpb/bin/${BIN}
+          fi
+          npx -y @anthropic-ai/mcpb validate mcpb/manifest.json
+          ( cd mcpb && npx -y @anthropic-ai/mcpb pack . )
+          mv mcpb/*.mcpb "${BIN}-${{ matrix.target }}.mcpb"
+
       # Checksums — the compliance document promises them, so they must actually be produced.
       - name: Checksums
         shell: bash

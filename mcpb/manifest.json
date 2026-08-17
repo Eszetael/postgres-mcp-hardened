@@ -8,7 +8,10 @@
     "name": "Eszetael",
     "url": "https://github.com/Eszetael"
   },
-  "repository": "https://github.com/Eszetael/postgres-mcp-hardened",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Eszetael/postgres-mcp-hardened"
+  },
   "homepage": "https://github.com/Eszetael/postgres-mcp-hardened",
   "license": "MIT",
   "keywords": [

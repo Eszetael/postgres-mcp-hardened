@@ -15,3 +15,9 @@ factory_result.json
 # The npm wrapper downloads the native binary here at install time; it is a build product,
 # and at ~19 MB it is not something a clone should carry.
 npm/vendor/
+
+# The .mcpb bundle is built per platform at release time, from the binary CI just produced.
+# Neither the binary nor the archive belongs in git: one is 19 MB and platform-specific, the other
+# is a build artefact whose whole point is to be downloadable from the release page.
+mcpb/bin/
+mcpb/*.mcpb

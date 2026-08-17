@@ -117,6 +117,12 @@ the original never had.
 
 Three ways in, in the order most people want them.
 
+**One click**, for a client that accepts `.mcpb` bundles: download
+`postgres-mcp-hardened-<your-platform>.mcpb` from the
+[latest release](https://github.com/Eszetael/postgres-mcp-hardened/releases/latest) and open it. The
+bundle asks for the connection string and stores it in the OS keychain rather than in a plain-text
+config file. Nothing to install, nothing to edit.
+
 **Through npm** — shortest, and the one your MCP client config can point at directly. There is no
 Node runtime involved at run time: the package is a launcher that fetches the native binary for your
 platform and verifies its checksum before running it.

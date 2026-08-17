@@ -4,6 +4,10 @@
 # false failures. A check pinned to a filename tests the layout, not the claim.
 # Control A: Ensure every "verified" claim in docs references an existing acceptance test or unit test.
 # Control B: Keep documented environment variables in sync with the canonical list in source code.
+# Control F: The .mcpb manifest must satisfy the official schema. It did not, from the day it was
+#   written until 2026-08-17, because nobody ever packed the bundle — so the one-click install path
+#   was broken for its whole life and no test noticed. Control C compares its tool list to ours,
+#   which is a different question from "will any client open this".
 # Control E: Claims about OTHER people's repositories. Controls A-D all guard statements about our
 #   own code, and on 2026-08-16 a review found eight errors — every one of them about something
 #   external: a fabricated snippet attributed to the archived server, a mistitled OWASP category,
@@ -175,6 +179,21 @@ if not bad:
           % (rows, " (%d counts drifted, see above)" % len(drift) if drift else ""))
 raise SystemExit(1 if bad else 0)
 PYEOF
+fi
+
+# CONTROL F: the .mcpb manifest against the official schema.
+#
+# Needs npx. Skips loudly without it, for the same reason as Control E: a check that quietly does
+# nothing reports green.
+if ! command -v npx >/dev/null 2>&1; then
+    echo "SKIP Control F: npx not available, cannot validate the .mcpb manifest"
+else
+    if out=$(npx -y @anthropic-ai/mcpb validate mcpb/manifest.json 2>&1); then
+        echo "PASS Control F: the .mcpb manifest satisfies the official schema"
+    else
+        printf 'FAIL Control F: mcpb/manifest.json is rejected by the official validator\n%s\n' "$out"
+        fail=1
+    fi
 fi
 
 if [ "$fail" -eq 0 ]; then
