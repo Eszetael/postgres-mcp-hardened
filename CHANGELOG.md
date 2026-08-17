@@ -86,6 +86,29 @@ schedules arbitrary SQL to run later, outside any transaction this server opens,
 job — and it is offered by RDS, Cloud SQL, Azure, Supabase and Neon, so this is not an exotic setup.
 `repack.repack_table`, which rewrites a table in place, went through the same hole.
 
+**And the same round, pushed further, found a redaction bypass — the more serious of the two.**
+`SELECT get_raw_page('people', 0)` returns 8192 bytes of the table as the disk holds it. Every value
+on that page is in those bytes, including a column the operator redacted. This was demonstrated end
+to end rather than argued: with `MCP_REDACT_COLUMNS=ssn`, `SELECT ssn FROM people` came back
+"column ssn is redacted by configuration", and the raw page came back carrying both social security
+numbers in plain ASCII. Redaction reasons about column names. A page of bytes has no column names,
+so there was nothing for it to catch.
+
+`pageinspect` and its relatives are now a verdict of their own, `RawStorage`, with a message that
+says what actually went wrong — "it returns pages or tuples as bytes, which column controls cannot
+inspect" — because that is a different failure from "this writes" and an operator deserves to know
+which one they hit. These functions need superuser, and the start-up gate refuses superuser roles
+for network listeners; over stdio it does not, that being the ordinary desktop setup, and the README
+already said that a superuser connection leaves you relying on the validator alone. This is the
+validator doing that job.
+
+The same sweep found the schema hole was wider than `pg_cron`. TimescaleDB and PostGIS install into
+`public`, so `drop_chunks(...)` — which deletes data — reads like any other call and matched nothing;
+`AddGeometryColumn` and `DropGeometryColumn` are thin wrappers over `ALTER TABLE`. `pg_partman`,
+`pglogical` (subscriptions to somewhere else entirely) and `pg_squeeze` each have a schema of their
+own. All refused now, while the read-only halves survive and are pinned by a test:
+`timescaledb_information` views, `ST_AsText`, and `SELECT * FROM cron.job`.
+
 The cause is worth stating precisely, because it says something about how the deny list was
 conceived. Every rule in `validate.rs` reasons about the *catalog namespace* — `pg_*`, `lo_*`,
 `dblink*`. Extensions do not live there. `pg_cron` installs into a schema of its own, so its

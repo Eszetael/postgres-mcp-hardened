@@ -695,8 +695,18 @@ defeated in review and are therefore described as depth rather than as boundarie
   naming the column as a string rather than an identifier (`to_jsonb(t) ->> 'password'`,
   `#>> '{password}'`, `$.password`), whole-row wildcards (`ROW(t.*)::text`) and positional renaming
   (`(SELECT * FROM staff) AS x(c1, …, c9)`). It is still name-based filtering, and name-based
-  filtering cannot be a boundary against the whole SQL language — three adversarial rounds each got
+  filtering cannot be a boundary against the whole SQL language — four adversarial rounds each got
   past it through a shape nobody had listed.
+
+  The fourth, in 0.1.7, did not find a new *shape* of name. It went around names altogether:
+  `SELECT get_raw_page('people', 0)` hands back 8192 bytes of the table as the disk holds it, and
+  every value on that page is in there, including the redacted one. Demonstrated, not theorised —
+  with `MCP_REDACT_COLUMNS=ssn`, `SELECT ssn FROM people` was refused while the raw page came back
+  with the social security numbers in plain ASCII. `pageinspect` and its relatives are now refused
+  as a category of their own, because "this returns storage rather than columns" is a different
+  problem from "this writes", and telling an operator which one they hit is worth a separate
+  message. It also shows the shape of the limit better than any sentence here can: a column filter
+  protects columns, and anything that reads underneath columns is outside what it can promise.
 
   So the server stops asserting and **asks the database**: at startup it reports every table where
   the connected role can still read a redacted column, with the exact statements that fix it, and

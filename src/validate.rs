@@ -661,7 +661,68 @@ pub enum FnVerdict {
     SideEffect,
     /// A function from the PostgreSQL catalog namespace that we do NOT know to be read-only.
     UnknownCatalog,
+    /// Reads real data, but in a shape column-level controls cannot see: raw pages, raw tuples.
+    RawStorage,
 }
+
+/// Functions that hand back storage instead of columns.
+///
+/// This is not a write, which is why it needed its own name. `pageinspect` reads a table the way
+/// the disk sees it: `SELECT get_raw_page('people', 0)` returns 8192 bytes, and every value on that
+/// page is in them — including the column an operator redacted. Demonstrated on 2026-08-17 against
+/// this server with `MCP_REDACT_COLUMNS=ssn`: `SELECT ssn FROM people` was refused with "column ssn
+/// is redacted by configuration", and the raw page came back with both social security numbers in
+/// plain ASCII. Redaction reasons about column names; a page of bytes has no column names, so there
+/// was nothing for it to catch.
+///
+/// These functions need superuser (or an explicit grant), and the start-up gate refuses a superuser
+/// role for a network listener. Over stdio it does not — that is the ordinary Claude Desktop setup,
+/// and the README says outright that a superuser connection leaves you relying on this validator
+/// alone. This is that validator doing its job.
+const RAW_STORAGE_FUNCS: &[&str] = &[
+    "get_raw_page",
+    "heap_page_items",
+    "heap_page_item_attrs",
+    "tuple_data_split",
+    "page_header",
+    "bt_page_items",
+    "brin_page_items",
+    "gin_leafpage_items",
+    "hash_page_items",
+    "fsm_page_contents",
+    "gist_page_items",
+    "gist_page_items_bytea",
+];
+
+/// Extension functions that change the database while living outside the catalog namespace.
+///
+/// TimescaleDB and PostGIS install into `public`, so nothing about their names says "administrative"
+/// — `drop_chunks(...)` deletes data and reads like an ordinary call. They are listed by name for
+/// the same reason `setval` is: the name IS the operation.
+const EXTENSION_WRITE_FUNCS: &[&str] = &[
+    // TimescaleDB — DDL and data removal behind ordinary-looking calls
+    "create_hypertable",
+    "drop_chunks",
+    "compress_chunk",
+    "decompress_chunk",
+    "add_retention_policy",
+    "remove_retention_policy",
+    "add_compression_policy",
+    "remove_compression_policy",
+    "add_continuous_aggregate_policy",
+    "refresh_continuous_aggregate",
+    "add_dimension",
+    "attach_tablespace",
+    "detach_tablespace",
+    "move_chunk",
+    "reorder_chunk",
+    // PostGIS — thin wrappers over ALTER TABLE
+    "addgeometrycolumn",
+    "dropgeometrycolumn",
+    "dropgeometrytable",
+    "updategeometrysrid",
+    "populate_geometry_columns",
+];
 
 /// Extension schemas whose functions are administrative by nature.
 ///
@@ -681,8 +742,13 @@ pub enum FnVerdict {
 /// ordinary table and stays allowed; taking that away would be a control that costs its user
 /// something and buys nothing.
 const DENY_SCHEMAS: &[&str] = &[
-    "cron",   // pg_cron — schedules SQL to run later, outside any transaction we control
-    "repack", // pg_repack — rewrites tables in place
+    "cron",      // pg_cron — schedules SQL to run later, outside any transaction we control
+    "repack",    // pg_repack — rewrites tables in place
+    "partman",   // pg_partman — creates and drops partitions
+    "pglogical", // replication: subscriptions, nodes, replication sets
+    "squeeze",   // pg_squeeze — rewrites tables in place
+    "_timescaledb_internal",
+    "_timescaledb_functions", // Timescale's private schemas; the public API is listed by name
 ];
 
 /// The denied schema a qualified name sits in, if any. Compares every part except the last, so
@@ -723,7 +789,11 @@ pub fn classify_function(name: &str) -> FnVerdict {
     if SAFE_DESPITE_FAMILY.contains(&name) || operator_allowed(name) {
         return FnVerdict::Allowed;
     }
+    if RAW_STORAGE_FUNCS.contains(&name) {
+        return FnVerdict::RawStorage;
+    }
     if SIDE_EFFECT_FUNCS.contains(&name)
+        || EXTENSION_WRITE_FUNCS.contains(&name)
         || DENY_FAMILIES.iter().any(|p| name.starts_with(p))
         || (name.starts_with("pg_stat_") && name.contains("reset"))
     {
@@ -741,6 +811,11 @@ fn function_rejection(name: &str) -> Option<String> {
     match classify_function(name) {
         FnVerdict::Allowed => None,
         FnVerdict::SideEffect => Some(format!("side-effect function: {}", name)),
+        FnVerdict::RawStorage => Some(format!(
+            "raw-storage function: {} — it returns pages or tuples as bytes, which column controls \
+             (redaction, projection) cannot inspect",
+            name
+        )),
         FnVerdict::UnknownCatalog => Some(format!(
             "catalog function not known to be read-only: {} (allow it with MCP_ALLOW_FUNCTIONS if it is)",
             name
@@ -1894,6 +1969,54 @@ mod extension_schema_tests {
             "SELECT * FROM cron.job_run_details ORDER BY start_time DESC LIMIT 10",
         ] {
             v(sql).unwrap_or_else(|e| panic!("{sql} should be a read, got: {e}"));
+        }
+    }
+
+    /// The redaction bypass, and the reason `RawStorage` is a separate verdict rather than another
+    /// entry in the write list. Nothing here writes. `get_raw_page` reads the table the way the disk
+    /// sees it, and every value on that page comes back — including the redacted column, which was
+    /// demonstrated end to end on 2026-08-17: `SELECT ssn FROM people` refused, the raw page
+    /// returned with both social security numbers in plain ASCII inside 8192 bytes.
+    #[test]
+    fn raw_storage_functions_cannot_be_used_to_read_around_redaction() {
+        for sql in [
+            "SELECT get_raw_page('people', 0)",
+            "SELECT * FROM heap_page_items(get_raw_page('people', 0))",
+            "SELECT page_header(get_raw_page('people', 0))",
+            "SELECT tuple_data_split('people'::regclass, t_data, t_infomask, t_infomask2, t_bits) \
+             FROM heap_page_items(get_raw_page('people', 0))",
+        ] {
+            let e = v(sql).expect_err(sql);
+            assert!(e.contains("raw-storage function"), "{sql} -> {e}");
+        }
+    }
+
+    /// TimescaleDB and PostGIS install into `public`, so their names carry no hint that they are
+    /// administrative. `drop_chunks` deletes data and reads like an ordinary function call.
+    #[test]
+    fn extension_writes_in_the_public_schema_are_still_writes() {
+        for sql in [
+            "SELECT drop_chunks('t', older_than => now())",
+            "SELECT create_hypertable('t', 'time')",
+            "SELECT add_retention_policy('t', INTERVAL '7 days')",
+            "SELECT AddGeometryColumn('t', 'geom', 4326, 'POINT', 2)",
+            "SELECT DropGeometryColumn('t', 'geom')",
+        ] {
+            let e = v(sql).expect_err(sql);
+            assert!(e.contains("side-effect function"), "{sql} -> {e}");
+        }
+    }
+
+    /// The read-only halves of the same extensions must survive, or the rule costs its user
+    /// something real. `timescaledb_information` is views; `ST_AsText` is a pure function.
+    #[test]
+    fn the_read_only_halves_of_those_extensions_survive() {
+        for sql in [
+            "SELECT * FROM timescaledb_information.hypertables",
+            "SELECT ST_AsText(geom) FROM places",
+            "SELECT * FROM cron.job",
+        ] {
+            v(sql).unwrap_or_else(|e| panic!("{sql} should pass, got: {e}"));
         }
     }
 

