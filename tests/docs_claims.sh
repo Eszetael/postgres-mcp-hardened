@@ -385,6 +385,33 @@ print("PASS Control J: the bundle runs the file the release actually puts in it,
       % len(platforms))
 PYEOF
 
+# Control K: the banner at the top of the README states which version is out. That line is edited by
+# hand at release time, there is no checklist saying so, and nothing was watching it — the same shape
+# as every other stale claim found on 2026-08-17. It is compared against what npm actually serves,
+# not against Cargo.toml: `Cargo.toml` is what we are building next, npm is what people can install
+# now, and the banner is a statement about the second. So this stays green while 0.1.7 is unreleased
+# and turns red the moment a release lands without the banner following it.
+if ! curl -sf -m 15 -o "$tmpdir/npmver.json" \
+        "https://registry.npmjs.org/postgres-mcp-hardened/latest"; then
+    echo "WARN Control K: npm unreachable — the version banner went unchecked this run"
+else
+    python3 - "$tmpdir" <<'PYEOF' || fail=1
+import io, json, os, re, sys
+d = sys.argv[1]
+published = json.load(io.open(os.path.join(d, "npmver.json"), encoding="utf-8"))["version"]
+readme = io.open("README.md", encoding="utf-8").read()
+m = re.search(r"Version (\d+\.\d+\.\d+)", readme)
+if not m:
+    print("FAIL Control K: the README banner no longer states a version")
+    sys.exit(1)
+if m.group(1) != published:
+    print("FAIL Control K: the README banner says %s, npm serves %s — release the banner or "
+          "correct it" % (m.group(1), published))
+    sys.exit(1)
+print("PASS Control K: the README banner and the published npm version agree (%s)" % published)
+PYEOF
+fi
+
 if [ "$fail" -eq 0 ]; then
     echo "PASS Control A: every 'verified' claim names a test that exists"
     echo "PASS Control B: the documented settings and the source agree"
