@@ -255,6 +255,26 @@ PYEOF
   fi
 done
 
+# The README's second paragraph names which MCP revision is current. It said `2025-11-25` and
+# described `2026-07-28` as sitting behind a switch, for ten days after that switch was retired and
+# the newer revision became the default — and the claim had already been copied into a published
+# article. A sentence in the most-read paragraph of the project drifted because nothing checked it.
+current_rev=$(printf '%s\n' \
+  '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2026-07-28","capabilities":{},"clientInfo":{"name":"acceptance","version":"0"}}}' \
+  | env DATABASE_URL="$URL" timeout 25 "$BIN" --stdio 2>/dev/null \
+  | python3 -c 'import sys,json
+for l in sys.stdin:
+    try: d=json.loads(l)
+    except Exception: continue
+    if d.get("id")==1: print((d.get("result") or {}).get("protocolVersion","")); break')
+if [ -z "$current_rev" ]; then
+  no "could not read the negotiated revision" ""
+elif grep -q "negotiates the MCP revision: \`$current_rev\` (current" README.md; then
+  ok "the README names the revision the server actually speaks ($current_rev)"
+else
+  no "README names a different current revision than the server negotiates" "server: $current_rev"
+fi
+
 # The other half of that fix must not have loosened the check it came from: a misspelling of a
 # protection is still fatal, because starting with redaction off is the failure this guards.
 env MCP_REDACT_COLUMN=ssn DATABASE_URL="$DEADDB" timeout 10 "$BIN" --stdio </dev/null >/dev/null 2>&1
