@@ -683,6 +683,7 @@ defeated in review and are therefore described as depth rather than as boundarie
   the log when you archive or move it; deleting it only loses the truncation check, never an entry.
   The offline verifier is unchanged and still needs an external anchor:
   `--verify-audit <file> --expect-last <hash>`.
+  *verified* (acceptance: "a shortened log is noticed at startup, without any external anchor")
 - **A wrong setting is fatal, not merely wrong:** an unparsable listen address, an audit file that
   cannot be written, `sslmode=disable` to a database on another machine, a metrics token that is also
   the database credential, a boolean spelt `yes` — each used to be accepted and quietly do something
@@ -728,7 +729,7 @@ left resident memory flat and file descriptors unchanged.
 | `JWT_PUBKEY_PEM`, `JWT_AUD`, `JWT_ISS` | enable OAuth 2.1 token validation (omit to disable auth); the key may be the PEM text or a path to a PEM file |
 | `MCP_AUDIT_LOG` | path to the append-only audit log (hash-chained); verify with `--verify-audit <file> [--expect-last <hash>]`. The server also writes `<log>.hwm` beside it — the last sequence number and hash, used at startup to notice a shortened log |
 | `MCP_AUDIT_HMAC_KEY` / `MCP_AUDIT_HMAC_KEY_FILE` | key that turns the audit chain into HMAC-SHA256 — keep it off the host so the log cannot be rewritten (a trailing newline in the file is ignored) |
-| `MCP_AUDIT_HMAC_KEYS_OLD` | comma-separated previous keys, so a log that survived a key rotation still verifies |
+| `MCP_AUDIT_HMAC_KEYS_OLD` | comma-separated previous keys, so a log that survived a key rotation still verifies. *verified* (acceptance: "a chain spanning a key rotation verifies with both keys") |
 | `MCP_REDACT_COLUMNS` | columns to keep out of results, e.g. `password, ssn, card_number` — masked at any depth and refused if referenced. Defence in depth, not a boundary: pair it with `REVOKE SELECT (col)` |
 | `MCP_BEARER_TOKEN` | shared token required on every request, for deployments without an identity provider. Ignored when OAuth is configured — accepting it as an alternative would give its holder full scope and leave the audit with no identity |
 | `MCP_STATEMENT_TIMEOUT` | query time limit (PostgreSQL interval, default `30s`) |

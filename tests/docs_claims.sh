@@ -140,7 +140,7 @@ except OSError:
     print("FAIL Control E: %s is missing" % doc)
     raise SystemExit(1)
 
-bad, drift, rows = [], [], 0
+bad, drift, flaky, rows = [], [], [], 0
 for line in text.splitlines():
     if not line.startswith("|"):
         continue
@@ -162,21 +162,48 @@ for line in text.splitlines():
             req = urllib.request.Request(url, headers=h)
             with urllib.request.urlopen(req, timeout=20) as r:
                 total += (json.load(r).get("reactions") or {}).get("+1", 0)
+        except urllib.error.HTTPError as e:
+            # 404/410 mean the claim is wrong: we cite an issue that is not there. Anything else
+            # means GitHub hiccuped, which is not a defect in this repository — and a build turned
+            # red by somebody else's 503 teaches people to ignore red builds. One retry, then skip.
+            if e.code in (404, 410):
+                bad.append("%s/%s#%s (%s)" % (owner, repo, num, e.code))
+                missing = True
+            else:
+                time.sleep(2)
+                try:
+                    with urllib.request.urlopen(urllib.request.Request(url, headers=h), timeout=20) as r:
+                        total += (json.load(r).get("reactions") or {}).get("+1", 0)
+                except Exception:
+                    flaky.append("%s/%s#%s (HTTP %s)" % (owner, repo, num, e.code))
+                    missing = True
         except Exception as e:
-            bad.append("%s/%s#%s (%s)" % (owner, repo, num, str(e)[:40]))
-            missing = True
+            time.sleep(2)
+            try:
+                with urllib.request.urlopen(urllib.request.Request(url, headers=h), timeout=20) as r:
+                    total += (json.load(r).get("reactions") or {}).get("+1", 0)
+            except Exception:
+                flaky.append("%s/%s#%s (%s)" % (owner, repo, num, str(e)[:30]))
+                missing = True
         time.sleep(0.1)
     if not missing and total != claimed:
         drift.append("%s: says %d, actually %d" %
                      (", ".join("#" + i[2] for i in ids), claimed, total))
 
 for b in bad:
-    print("FAIL Control E: cited issue cannot be reached: %s" % b)
+    print("FAIL Control E: cited issue does not exist: %s" % b)
+for f in flaky:
+    print("WARN Control E: could not reach %s — GitHub, not us; count unchecked this run" % f)
 for d in drift:
     print("WARN Control E: reaction count drifted — %s" % d)
 if not bad:
-    print("PASS Control E: all %d cited external issues exist%s"
-          % (rows, " (%d counts drifted, see above)" % len(drift) if drift else ""))
+    notes = []
+    if drift:
+        notes.append("%d counts drifted" % len(drift))
+    if flaky:
+        notes.append("%d unreachable this run" % len(flaky))
+    print("PASS Control E: no cited issue is missing%s"
+          % (" (%s, see above)" % "; ".join(notes) if notes else ""))
 raise SystemExit(1 if bad else 0)
 PYEOF
 fi

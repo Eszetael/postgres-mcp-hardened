@@ -1232,6 +1232,44 @@ head -n -1 "$AL" > "$AL.cut"
 "$BIN" --verify-audit "$AL.cut" --expect-last "$ANCHOR" >/dev/null 2>&1 && no "TRUNCATION MISSED WITH AN ANCHOR" "" || ok "with the anchor, truncation is caught"
 rm -f "$AL" "$AL.cut"
 
+# Key rotation and the .hwm sidecar are both documented promises that nothing exercised until
+# 2026-08-17. They are the two strongest claims the audit makes: one says an operator can change the
+# signing key without orphaning the history, the other says the log notices being SHORTENED — which a
+# hash chain alone cannot, because a truncated chain recomputes perfectly.
+RL=/tmp/acc_rot_$$.log; rm -f "$RL" "$RL.hwm"
+start DATABASE_URL="$URL" MCP_AUDIT_LOG="$RL" MCP_AUDIT_HMAC_KEY=rot_old
+tool query '{"sql":"SELECT 1"}' >/dev/null
+stop
+start DATABASE_URL="$URL" MCP_AUDIT_LOG="$RL" MCP_AUDIT_HMAC_KEY=rot_new MCP_AUDIT_HMAC_KEYS_OLD=rot_old
+tool query '{"sql":"SELECT 2"}' >/dev/null
+stop
+out=$(env MCP_AUDIT_HMAC_KEY=rot_new MCP_AUDIT_HMAC_KEYS_OLD=rot_old "$BIN" --verify-audit "$RL" 2>&1)
+case "$out" in
+  OK*) ok "a chain spanning a key rotation verifies with both keys" ;;
+  *)   no "key rotation orphaned the history" "$out" ;;
+esac
+# Without the retired key the old entries must NOT silently pass: they are unverifiable, and the
+# message has to say which key is missing rather than "tampered".
+out=$(env MCP_AUDIT_HMAC_KEY=rot_new "$BIN" --verify-audit "$RL" 2>&1)
+case "$out" in
+  *"was not provided"*) ok "dropping the retired key is reported as a missing key, not as tampering" ;;
+  OK*) no "ENTRIES SIGNED WITH AN UNAVAILABLE KEY VERIFIED" "$out" ;;
+  *)   no "missing key reported as something else" "$out" ;;
+esac
+
+# The sidecar: cut the tail, restart, and the server must say entries are gone. This is the check
+# that does not need an off-host anchor, so it is the one an ordinary operator actually gets.
+head -n -1 "$RL" > "$RL.short" && mv "$RL.short" "$RL"
+err=$(printf '%s\n' \
+  '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"acceptance","version":"0"}}}' \
+  | env DATABASE_URL="$URL" MCP_AUDIT_LOG="$RL" MCP_AUDIT_HMAC_KEY=rot_new MCP_AUDIT_HMAC_KEYS_OLD=rot_old \
+    timeout 30 "$BIN" --stdio 2>&1 >/dev/null)
+case "$err" in
+  *"MISSING FROM THE END"*) ok "a shortened log is noticed at startup, without any external anchor" ;;
+  *) no "the sidecar did not notice a shortened log" "$(printf '%s' "$err" | grep -v '^AUDIT' | head -c 150)" ;;
+esac
+rm -f "$RL" "$RL.hwm"
+
 section "Deployment shapes"
 start MCP_DATABASE_URLS="a=$URL;b=$URL"
 r=$(tool query '{"sql":"SELECT 1 AS x","database":"b"}' | body); echo "$r" | grep -q '"x":1' && ok "several databases from one server" || no "multi-database" "$r"
