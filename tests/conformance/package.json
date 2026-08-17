@@ -3,5 +3,7 @@
   "private": true,
   "type": "module",
   "description": "Drives the server with the official MCP SDK, so protocol conformance is asserted by an implementation we did not write.",
-  "dependencies": { "@modelcontextprotocol/sdk": "^1.29.0" }
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.30.0"
+  }
 }
