@@ -695,6 +695,25 @@ pub(crate) fn execute_readonly(final_sql: &str, db: Option<&str>) -> Result<Valu
         // which with an 8 MB cap bounds a request at roughly +55 MB. The instrument was checked
         // against a case that MUST grow (the 7 MB row) before the flat readings were believed.
         //
+        // ⚠️ 2026-08-17: "the omitted path does not grow with the cell" IS NOT TRUE, and the reason
+        // is not in this function. Re-measured on the release build, PostgreSQL 18, `VmHWM` of this
+        // process, one request, cell built by `repeat('x', N)`:
+        //
+        //      1 MB cell ->  16 MB peak
+        //     10 MB cell ->  48 MB peak
+        //     50 MB cell -> 205 MB peak
+        //    100 MB cell -> 400 MB peak      <- linear, roughly 4x the cell
+        //
+        // The row IS omitted and the RESPONSE is bounded (300 bytes) — this wrapper works. The
+        // memory goes to the COST GUARD, one layer up in `tools.rs`, which asks
+        // `EXPLAIN (FORMAT JSON, VERBOSE)`. PostgreSQL constant-folds `repeat('x', 100000000)`
+        // during planning and VERBOSE prints the folded literal in the plan's `Output` field, so the
+        // plan itself is 200 MB. Measured directly: the same statement with VERBOSE returns
+        // 200,000,643 bytes and without VERBOSE returns 579, at every cell size.
+        //
+        // It is written here rather than only there because this is where somebody looks when they
+        // ask "is a huge cell bounded?", and the honest answer has two halves.
+        //
         // The note previously here recorded 2026-08-08 numbers — 4 MB cell 42 MB · 30 MB 128 MB ·
         // 60 MB 245 MB — claiming growth on the OMITTED path. They do not reproduce. Two candidate
         // explanations were tested and both failed: `VmPeak` is ~1.4 GB regardless of payload

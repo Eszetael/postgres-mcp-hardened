@@ -100,6 +100,30 @@ server checks each one rather than assuming it.
 
 ## Residual risks, unfixed and named
 
+- **The cost guard is the most expensive part of a request, and a caller sets the price.** Found and
+  measured 2026-08-17; not closed. PostgreSQL constant-folds expressions while planning, and
+  `EXPLAIN (… VERBOSE)` prints the folded value in the plan's `Output`. So `SELECT repeat('x',
+  100000000)` produces a **200 MB plan** — the same statement without `VERBOSE` produces 579 bytes,
+  at any size — and this process peaks near **400 MB** parsing it. Peak memory is linear in a
+  constant the caller writes: 1 MB → 16 MB, 10 MB → 48 MB, 50 MB → 205 MB, 100 MB → 400 MB.
+
+  The *result* is bounded and always was: the row is omitted server-side and 300 bytes come back.
+  It is the guard, not the answer, that grows.
+
+  Three repairs were tried and each cost more than it saved, which is why this is written down
+  instead of quietly patched:
+
+  | attempt | what breaks |
+  |---|---|
+  | drop `VERBOSE` | `Schema` is VERBOSE-only, and the surface allowlist needs it to tell `public.t` from `other.t` |
+  | plan `SELECT 1 FROM (sql) _x` so unused columns prune | the plan does fall to 1 KB — and the planner prunes the *work* too: `SELECT count(*) FROM bigt` reports cost 0.02 instead of 4167 and lists **no relation at all**, blinding both the cost guard and the surface check |
+  | predict the size from the cheap plan first | `Plan Width` is 32 for `repeat('x', 10)` and 32 for `repeat('x', 1000000000)` — the planner's default guess for text, not the folded size |
+
+  **What bounds it today is the memory limit on the process**, and if you run this where an untrusted
+  caller can reach it, set one: `--memory` on the container, `MemoryMax=` under systemd. The server
+  is refused a listener without authentication anyway, so the caller is someone you gave a token to
+  — but a token is not a promise of good arithmetic.
+
 - **A parse failure is not a control, and we relied on one without knowing.** Upgrading `sqlparser`
   from 0.49 to 0.62 showed that several writes were being refused because the old library could not
   parse them, not because any rule here rejected them. The rules have since been fixed, but the

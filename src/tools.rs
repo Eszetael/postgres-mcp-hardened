@@ -496,6 +496,29 @@ pub(crate) fn cost_guard(sql: &str, max_cost: f64, db: Option<&str>) -> Result<(
         .map_err(|e| CostErr::QueryError(e.to_string()))?;
     // VERBOSE so the plan labels each scan with its schema and relation. One EXPLAIN answers both
     // questions — how expensive, and what it reaches — instead of paying for the round trip twice.
+    //
+    // ⚠️ KNOWN LIMIT, measured 2026-08-17 and not closed. PostgreSQL constant-folds expressions
+    // while planning, and VERBOSE prints the folded value in the plan's `Output`. So
+    // `SELECT repeat('x', 100000000)` produces a 200 MB PLAN — 579 bytes without VERBOSE, at any
+    // size — and this process peaks near 400 MB parsing it, linear in the constant the caller wrote.
+    // The result itself is bounded: the row is omitted and 300 bytes come back. The cost guard is
+    // the expensive part, which is an uncomfortable thing for a cost guard to be.
+    //
+    // Three obvious repairs were tried and each broke something worth more, so none was taken:
+    //
+    //   * Drop VERBOSE. `Schema` is VERBOSE-only (`Relation Name` is not), and the surface check
+    //     needs it to tell `public.t` from `other.t`. Verified by reading both plans.
+    //   * Ask about `SELECT 1 FROM (sql) _x`, so unused columns are pruned. The plan does collapse
+    //     to 1,094 bytes — and the planner, seeing the output unused, prunes the work as well:
+    //     `SELECT count(*) FROM bigt` reports a cost of 0.02 instead of 4167, and its plan lists NO
+    //     relation at all. That trades a memory bound for a hole in two controls.
+    //   * Predict the size from the cheap plan first. `Plan Width` is 32 for `repeat('x', 10)` and
+    //     32 for `repeat('x', 1000000000)` — the planner's default guess for text, not the folded
+    //     size. It cannot see this coming either.
+    //
+    // What actually bounds it today is the memory limit on the process: a container `--memory` cap,
+    // or a systemd `MemoryMax`. THREAT_MODEL.md says so under its own heading rather than leaving it
+    // in a comment only the next maintainer would find.
     let row = client
         .query_one(&format!("EXPLAIN (FORMAT JSON, VERBOSE) {}", sql), &[])
         .map_err(|e| CostErr::QueryError(friendly_pg_error_for(&e, Some(sql))))?;
