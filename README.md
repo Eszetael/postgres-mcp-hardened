@@ -705,8 +705,23 @@ defeated in review and are therefore described as depth rather than as boundarie
   with the social security numbers in plain ASCII. `pageinspect` and its relatives are now refused
   as a category of their own, because "this returns storage rather than columns" is a different
   problem from "this writes", and telling an operator which one they hit is worth a separate
-  message. It also shows the shape of the limit better than any sentence here can: a column filter
-  protects columns, and anything that reads underneath columns is outside what it can promise.
+  message.
+
+  The same round found the quieter version of it. PostgreSQL's planner keeps a sample of each
+  column's real values, and `pg_stats` publishes them: with 3,000 rows, `SELECT * FROM pg_stats
+  WHERE tablename='people'` returned `{123-45-6789,555-00-1111,987-65-4321}` while `SELECT ssn FROM
+  people` was refused. That query never names the redacted column, so a name-based rule has nothing
+  to act on. The value-bearing statistics columns — `most_common_vals`, `histogram_bounds`,
+  `most_common_elems`, `stavalues1`…`stavalues5` — now join whatever you configure, whenever you
+  configure anything. The rest of the view is untouched: `n_distinct`, `null_frac` and `correlation`
+  are what the index advice below is built from and they carry no values, so removing the whole
+  relation would have broken ten columns to fix four.
+
+  Both findings say the same thing, and it is a better description of this feature's limit than any
+  list of patches: **a column filter protects columns, so anything that reads underneath columns is
+  outside what it can promise.** Raw pages and planner samples are two doors into that space; the
+  honest assumption is that there are more, which is why the role and the transaction are the real
+  boundary and this remains defence in depth.
 
   So the server stops asserting and **asks the database**: at startup it reports every table where
   the connected role can still read a redacted column, with the exact statements that fix it, and

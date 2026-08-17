@@ -102,6 +102,23 @@ for network listeners; over stdio it does not, that being the ordinary desktop s
 already said that a superuser connection leaves you relying on the validator alone. This is the
 validator doing that job.
 
+**The quieter version of the same bypass was one query away.** PostgreSQL's planner keeps a sample
+of each column's real values, and `pg_stats` publishes it. `SELECT * FROM pg_stats WHERE
+tablename='people'` returned `{123-45-6789,555-00-1111,987-65-4321}` from a 3,000-row table while
+`SELECT ssn FROM people` was refused — and that query does not name the redacted column anywhere, so
+a name-based rule had nothing to act on. `pg_statistic.stavalues1` is the same thing one layer down.
+
+The fix is deliberately narrow. Denying `pg_stats` outright would have been one line and would have
+broken the index advice this project documents, which is built from `n_distinct`, `null_frac` and
+`correlation` — ten columns that carry no values, to fix four that do. So the value-bearing columns
+join the operator's redaction list, and only when the operator configured one: switching redaction
+on is the statement that values matter here.
+
+Taken together the two findings describe the feature's limit better than any list of patches could:
+a column filter protects columns, so anything reading underneath columns is outside what it can
+promise. Raw pages and planner samples are two doors into that space and the honest assumption is
+that there are more — which is why the role and the transaction, not this, are the boundary.
+
 The same sweep found the schema hole was wider than `pg_cron`. TimescaleDB and PostGIS install into
 `public`, so `drop_chunks(...)` — which deletes data — reads like any other call and matched nothing;
 `AddGeometryColumn` and `DropGeometryColumn` are thin wrappers over `ALTER TABLE`. `pg_partman`,

@@ -516,6 +516,10 @@ pub(crate) fn redact_patterns() -> &'static [String] {
                     .map(|s| s.rsplit('.').next().unwrap_or(&s).to_string())
                     .collect()
             })
+            // The planner's statistics carry real values sampled from the data, so a redacted
+            // column leaks through `SELECT * FROM pg_stats` without ever being named. See
+            // `validate::STATISTIC_VALUE_COLUMNS`.
+            .map(crate::validate::expand_with_statistic_columns)
             .unwrap_or_default()
     });
     &P

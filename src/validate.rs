@@ -1033,6 +1033,48 @@ pub(crate) fn redaction_configured() -> bool {
     !redacted_names().is_empty()
 }
 
+/// Statistics columns that carry sampled values from the data itself.
+///
+/// `pg_stats` is a view over the planner's statistics, and `most_common_vals` is exactly what it
+/// says: real values taken from the column. Demonstrated on 2026-08-17 — with 3000 rows and
+/// `MCP_REDACT_COLUMNS=ssn`, `SELECT attname, most_common_vals FROM pg_stats WHERE
+/// tablename='people'` returned `{123-45-6789,555-00-1111,987-65-4321}`. The query never names the
+/// redacted column, so name-based refusal had nothing to refuse. Neither did `SELECT *`.
+///
+/// Only the value-bearing columns are added, not the whole view. `n_distinct`, `null_frac`,
+/// `correlation` and `avg_width` are what index advice is built from and they leak nothing — taking
+/// the entire relation away would break a documented feature to fix a leak in four of its columns.
+///
+/// These are appended to whatever the operator configured, and only when they configured something:
+/// switching redaction on is the statement that values matter here, and this is part of honouring it.
+pub(crate) const STATISTIC_VALUE_COLUMNS: &[&str] = &[
+    "most_common_vals",
+    "most_common_elems",
+    "histogram_bounds",
+    "elem_count_histogram",
+    "range_length_histogram",
+    "range_bounds_histogram",
+    "stavalues1",
+    "stavalues2",
+    "stavalues3",
+    "stavalues4",
+    "stavalues5",
+];
+
+/// The operator's list plus the statistics columns, or empty when redaction is off.
+pub(crate) fn expand_with_statistic_columns(mut v: Vec<String>) -> Vec<String> {
+    if v.is_empty() {
+        return v;
+    }
+    for c in STATISTIC_VALUE_COLUMNS {
+        let c = (*c).to_string();
+        if !v.contains(&c) {
+            v.push(c);
+        }
+    }
+    v
+}
+
 fn redacted_names() -> &'static [String] {
     static R: Lazy<Vec<String>> = Lazy::new(|| {
         std::env::var("MCP_REDACT_COLUMNS")
@@ -1043,6 +1085,7 @@ fn redacted_names() -> &'static [String] {
                     .map(|s| s.rsplit('.').next().unwrap_or(&s).to_string())
                     .collect()
             })
+            .map(expand_with_statistic_columns)
             .unwrap_or_default()
     });
     &R
@@ -2004,6 +2047,41 @@ mod extension_schema_tests {
         ] {
             let e = v(sql).expect_err(sql);
             assert!(e.contains("side-effect function"), "{sql} -> {e}");
+        }
+    }
+
+    /// The planner keeps real values. `pg_stats.most_common_vals` is a sample of the column, and a
+    /// query can reach it without naming the column at all — `SELECT * FROM pg_stats WHERE
+    /// tablename='people'`. Demonstrated with 3000 rows: the view returned
+    /// `{123-45-6789,555-00-1111,987-65-4321}` while `SELECT ssn FROM people` was refused.
+    #[test]
+    fn planner_statistics_cannot_be_read_around_redaction() {
+        // The list is only extended when the operator has configured redaction at all.
+        assert!(expand_with_statistic_columns(vec![]).is_empty());
+        let with = expand_with_statistic_columns(vec!["ssn".to_string()]);
+        for c in STATISTIC_VALUE_COLUMNS {
+            assert!(with.contains(&(*c).to_string()), "missing {c}");
+        }
+        assert!(
+            with.contains(&"ssn".to_string()),
+            "the operator's own list must survive"
+        );
+    }
+
+    /// And the columns index advice is built from must not be swept up with them, or fixing a leak
+    /// in four columns breaks a documented feature that uses the other ten.
+    #[test]
+    fn the_harmless_statistics_columns_are_left_alone() {
+        let with = expand_with_statistic_columns(vec!["ssn".to_string()]);
+        for c in [
+            "n_distinct",
+            "null_frac",
+            "correlation",
+            "avg_width",
+            "attname",
+            "tablename",
+        ] {
+            assert!(!with.contains(&c.to_string()), "{c} should stay readable");
         }
     }
 

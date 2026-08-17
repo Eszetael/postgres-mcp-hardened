@@ -37,3 +37,6 @@ deny	SELECT get_raw_page('{{T}}', 0)	round 0.1.7: 8192 bytes of the page, with t
 deny	SELECT * FROM heap_page_items(get_raw_page('{{T}}', 0))	the same data, one layer up
 deny	SELECT tuple_data_split('{{T}}'::regclass, t_data, t_infomask, t_infomask2, t_bits) FROM heap_page_items(get_raw_page('{{T}}', 0))	and split back into fields
 deny	SELECT page_header(get_raw_page('{{T}}', 0))	.
+deny	SELECT most_common_vals FROM pg_stats WHERE tablename='{{T}}'	round 0.1.7: planner statistics hold REAL values sampled from the column
+deny	SELECT histogram_bounds FROM pg_stats WHERE tablename='{{T}}'	.
+deny	SELECT stavalues1 FROM pg_statistic	the same, one layer below the view
