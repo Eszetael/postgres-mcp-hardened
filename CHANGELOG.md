@@ -111,8 +111,29 @@ the README says they print — verified from a clean `node:22-slim` container ov
 from this repository present. Control H now checks those four on every run, and was itself checked by
 making one of them lie.
 
+Three more surfaced once the remaining prose was walked the same way:
+
+- **The README was wrong by one revision about the specification itself.** It said HTTP+SSE was
+  replaced by Streamable HTTP in `2025-06-18`; the specification's own changelog records that in
+  `2025-03-26`. The sentence appears in a paragraph criticising other servers for shipping a
+  deprecated transport, in a project whose pitch is protocol correctness. The rest of that section
+  was checked against the source and holds: `2026-07-28` really is the newest revision, it really is
+  the largest break MCP has had (sessions, the `initialize` handshake and `ping` are all removed by
+  its changelog), and the missing-header fallback really is `2025-03-26` in both revisions that
+  define one, which this server deviates from on purpose and says so.
+- **Conformance was being checked against a client one minor version behind the ecosystem.** The
+  entire value of that job is that somebody else's code talks to us; a stale lockfile quietly
+  undermines it. On SDK 1.30.0, all fifteen checks pass over stdio and Streamable HTTP.
+- **"A twelve-minute soak left resident memory flat"** was true of everything after the first few
+  seconds and not true of the number. Measured: 51,499 requests, file descriptors 15 at the start
+  and 15 at the end, memory 8.1 MB to 11.2 MB — of which 8.1 to 10.7 happened inside the first 400
+  requests and the remaining 51,000 added 0.5 MB along a flattening curve. An allocator settling, not
+  a leak. The paragraph now gives the numbers, and `tests/soak.sh` exists so the invitation to
+  reproduce it points at something real. Descriptors are its assertion; memory is reported but not
+  thresholded, because a threshold there would fire on allocator behaviour and end up switched off.
+
 The pattern is worth naming, because it is the opposite of the one above it: the code was right every
-time it was pushed, and seven separate statements about the code were wrong. Rigour applied to a
+time it was pushed, and ten separate statements about the code were wrong. Rigour applied to a
 program and withheld from the sentences describing it is not rigour.
 
 ## 0.1.6 — 2026-08-15
