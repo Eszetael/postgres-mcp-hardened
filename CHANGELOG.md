@@ -76,9 +76,34 @@ that would have held.
   `DISCARD ALL`. The denial list carries the pre-15 spellings `pg_start_backup`/`pg_stop_backup`, but
   the `pg_backup_` prefix covers the modern names — verified through `--validate`, not by reading.
 
+Then the remaining figures were measured rather than repeated, and three more gave way:
+
+- **Idle memory was 7.7 MB, not the 5.2 MB claimed.** Five separate starts under identical conditions
+  landed within 0.1 MB of each other, so the old number is not noise — it is a different measurement
+  whose method was never written down, which makes it neither defensible nor repeatable. Every figure
+  in that table now carries how it was obtained. The first reading taken today said 3.8 MB and was
+  false: `pgrep` had matched a different process. Hence five runs, not one.
+- **The overhead is 5.5 to 7.3 ms per query, not "about 4 ms".** The driver floor moved with it —
+  0.28 ms then against 0.43 ms now for the same lookup — so this was the machine talking. Before
+  changing the number the obvious suspect was checked, this release's own build settings: the 0.1.6
+  binary, built before `lto` was switched on, measures within 0.4 ms of the new one on this machine
+  within the same hour. The release profile halved the binary and cost nothing. The structural claim
+  — that the overhead is nearly constant and does not grow with query cost — was re-confirmed and
+  stands, because that, not the magnitude, is the argument.
+- **The Testing section said the acceptance suite checks 43 behaviours. It checks 290.** Nobody
+  updates prose when adding a test. The suite now verifies that sentence against its own final count
+  before printing it, because only the suite knows the true number — counting from outside would be
+  guesswork when cases are generated in loops.
+
+Two claims were re-tested and held: the fuzz harness really does run 200k mutants (three seeds of
+them, in fact, on every change), and the four `--validate` examples in the README print exactly what
+the README says they print — verified from a clean `node:22-slim` container over `npx`, with nothing
+from this repository present. Control H now checks those four on every run, and was itself checked by
+making one of them lie.
+
 The pattern is worth naming, because it is the opposite of the one above it: the code was right every
-time it was pushed, and the prose about the code was wrong four times. Rigour applied to a program
-and withheld from the sentences describing it is not rigour.
+time it was pushed, and seven separate statements about the code were wrong. Rigour applied to a
+program and withheld from the sentences describing it is not rigour.
 
 ## 0.1.6 — 2026-08-15
 
