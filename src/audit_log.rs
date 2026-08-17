@@ -216,13 +216,31 @@ fn write_hwm(seq: u64, hash: &str) {
     }
 }
 
+/// Lowercase hex of a digest.
+///
+/// This used to be `format!("{:x}", digest)`. `sha2` 0.11 returns `Array` instead of
+/// `GenericArray`, and `Array` does not implement `LowerHex`, so six call sites stopped compiling.
+/// Writing the encoding out is the better answer anyway: every hash in this file ends up in an
+/// audit record or a chain link, and the byte-for-byte shape of those strings is a compatibility
+/// promise to logs already written. A promise that rests on a formatting trait in someone else's
+/// crate is a promise held by somebody else.
+fn hex(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        // `unwrap` is unreachable: writing to a String cannot fail.
+        let _ = write!(out, "{:02x}", b);
+    }
+    out
+}
+
 // --- SQL fingerprint (first 16 hex characters of SHA-256) ---
 pub(crate) fn sql_fingerprint(sql: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(sql.as_bytes());
     let result = hasher.finalize();
     // Manual hex formatting; we keep the first 16 characters (8 bytes)
-    format!("{:x}", result).chars().take(16).collect()
+    hex(&result).chars().take(16).collect()
 }
 
 // --- Main audit function ---
@@ -291,7 +309,7 @@ pub(crate) fn audit_extra(
         None => {
             let mut hasher = Sha256::new();
             hasher.update(payload.as_bytes());
-            format!("{:x}", hasher.finalize())
+            hex(&hasher.finalize())
         }
     };
 
@@ -418,7 +436,7 @@ pub(crate) fn verify_audit_file(
             None => {
                 let mut h = Sha256::new();
                 h.update(payload.as_bytes());
-                format!("{:x}", h.finalize())
+                hex(&h.finalize())
             }
         };
         if got_hash != expect {
@@ -498,7 +516,7 @@ pub(crate) fn audit_key() -> Option<(Vec<u8>, String)> {
 pub(crate) fn key_fingerprint(k: &[u8]) -> String {
     let mut h = Sha256::new();
     h.update(k);
-    format!("{:x}", h.finalize()).chars().take(8).collect()
+    hex(&h.finalize()).chars().take(8).collect()
 }
 
 /// HMAC-SHA256 per RFC 2104 — the standard construction, written out to keep the crate set minimal.
@@ -521,7 +539,7 @@ pub(crate) fn hmac_sha256_hex(key: Vec<u8>, msg: &[u8]) -> String {
     let mut outer = Sha256::new();
     outer.update(&opad);
     outer.update(inner);
-    format!("{:x}", outer.finalize())
+    hex(&outer.finalize())
 }
 
 // --- caller identity, available to the audit without threading a parameter through six signatures ---
@@ -568,7 +586,7 @@ mod tests {
                 None => {
                     let mut h = Sha256::new();
                     h.update(payload.as_bytes());
-                    format!("{:x}", h.finalize())
+                    hex(&h.finalize())
                 }
             };
             let mut full = entry.as_object().unwrap().clone();
@@ -777,5 +795,34 @@ mod tests {
             );
         }
         assert_ne!(fp, sql_fingerprint("SELECT 1"));
+    }
+}
+
+#[cfg(test)]
+mod hex_tests {
+    use super::*;
+
+    /// Pinned to the FIPS 180-2 vector for SHA-256("abc"). The point is not that SHA-256 works —
+    /// it is that the *string* this file produces did not change when `sha2` went from 0.10 to 0.11
+    /// and the hand-written `hex` replaced `format!("{:x}", …)`. Every audit record already on disk
+    /// carries hashes in this exact shape, and `--verify-audit` compares them as text. A silent
+    /// change of case or padding here would not fail to compile; it would quietly declare every
+    /// existing log tampered with.
+    #[test]
+    fn hex_encoding_is_byte_for_byte_what_it_always_was() {
+        let mut h = Sha256::new();
+        h.update(b"abc");
+        assert_eq!(
+            hex(&h.finalize()),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
+
+    /// A leading zero byte is where a naive encoder loses a character and every hash after it
+    /// shifts. SHA-256 of this input starts with 0x04.
+    #[test]
+    fn a_leading_zero_nibble_is_not_dropped() {
+        assert_eq!(hex(&[0x00, 0x0f, 0xa0, 0xff]), "000fa0ff");
+        assert_eq!(hex(&[]), "");
     }
 }
