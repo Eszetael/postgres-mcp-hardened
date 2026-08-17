@@ -717,11 +717,20 @@ defeated in review and are therefore described as depth rather than as boundarie
   are what the index advice below is built from and they carry no values, so removing the whole
   relation would have broken ten columns to fix four.
 
-  Both findings say the same thing, and it is a better description of this feature's limit than any
-  list of patches: **a column filter protects columns, so anything that reads underneath columns is
-  outside what it can promise.** Raw pages and planner samples are two doors into that space; the
-  honest assumption is that there are more, which is why the role and the transaction are the real
-  boundary and this remains defence in depth.
+  Two more doors turned out to open on the same room. A value too long for its row is stored in a
+  TOAST table, and that table is readable by name: `SELECT chunk_data FROM pg_toast.pg_toast_16384`
+  returned the redacted text in the clear. `pg_largeobject` is the same thing for large objects — the
+  bytes underneath `lo_get`. Both are refused now, as *relations* rather than functions, with a
+  message that says why: they hold physical storage rather than columns. The catalogue that merely
+  describes the database is untouched — `pg_tables`, `pg_stat_activity`, `pg_largeobject_metadata`,
+  and the statistics columns index advice needs.
+
+  All four say the same thing, and it describes this feature's limit better than any list of patches:
+  **a column filter protects columns, so anything that reads underneath columns is outside what it
+  can promise.** Raw pages, planner samples, TOAST chunks and large-object bytes are four doors into
+  that space, all four found in a single afternoon by looking for the shape rather than the names.
+  The honest assumption is that there are more, which is why the database role and the read-only
+  transaction are the real boundary and this stays what it says it is: defence in depth.
 
   So the server stops asserting and **asks the database**: at startup it reports every table where
   the connected role can still read a redacted column, with the exact statements that fix it, and

@@ -40,3 +40,7 @@ deny	SELECT page_header(get_raw_page('{{T}}', 0))	.
 deny	SELECT most_common_vals FROM pg_stats WHERE tablename='{{T}}'	round 0.1.7: planner statistics hold REAL values sampled from the column
 deny	SELECT histogram_bounds FROM pg_stats WHERE tablename='{{T}}'	.
 deny	SELECT stavalues1 FROM pg_statistic	the same, one layer below the view
+deny	SELECT chunk_data FROM pg_toast.pg_toast_16384	round 0.1.7: a value too long for its row lives in TOAST, where columns no longer exist
+deny	SELECT * FROM pg_toast.pg_toast_16384	.
+deny	SELECT data FROM pg_largeobject	the bytes underneath lo_get
+deny	SELECT stxdmcv FROM pg_statistic_ext_data	extended statistics keep their own sample of real values

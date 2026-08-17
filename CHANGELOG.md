@@ -114,10 +114,24 @@ broken the index advice this project documents, which is built from `n_distinct`
 join the operator's redaction list, and only when the operator configured one: switching redaction
 on is the statement that values matter here.
 
-Taken together the two findings describe the feature's limit better than any list of patches could:
+**Two more doors opened on the same room.** A value too long for its row is stored in a TOAST table
+that is readable by name — `SELECT chunk_data FROM pg_toast.pg_toast_16384` returned the redacted
+text in the clear, and a TOAST chunk carries no column name because at that level columns no longer
+exist. `pg_largeobject` is the same idea for large objects: the bytes underneath `lo_get`. These are
+relations rather than functions, so they needed a rule of their own, with a message that says what
+they are. They are refused whether or not redaction is configured, because reading physical storage
+is not something a question about data ever needs; by the time it is needed, somebody is doing
+database forensics rather than talking to an agent. What merely *describes* the database is
+untouched: `pg_tables`, `pg_stat_activity`, `pg_largeobject_metadata`, and the statistics columns the
+index advice is built from — each pinned by a test, because a control that quietly takes away
+legitimate reads gets switched off, and then it protects no one.
+
+Taken together the four findings describe the feature's limit better than any list of patches could:
 a column filter protects columns, so anything reading underneath columns is outside what it can
-promise. Raw pages and planner samples are two doors into that space and the honest assumption is
-that there are more — which is why the role and the transaction, not this, are the boundary.
+promise. Raw pages, planner samples, TOAST chunks and large-object bytes are four doors into that
+space, all four found in one afternoon once the search stopped being about names and started being
+about the shape. The honest assumption is that there are more — which is why the role and the
+transaction, not this, are the boundary.
 
 The same sweep found the schema hole was wider than `pg_cron`. TimescaleDB and PostGIS install into
 `public`, so `drop_chunks(...)` — which deletes data — reads like any other call and matched nothing;

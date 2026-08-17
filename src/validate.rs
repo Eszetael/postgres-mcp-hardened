@@ -536,6 +536,14 @@ impl Visitor for SecurityScanner {
             self.hit = Some("a relation name built from a function call — refused unread".into());
             return ControlFlow::Break(());
         }
+        if let Some(r) = is_raw_storage_relation(name) {
+            self.hit = Some(format!(
+                "raw-storage relation: {} — it holds physical storage rather than columns, so \
+                 column controls (redaction, projection) cannot inspect it",
+                r
+            ));
+            return ControlFlow::Break(());
+        }
         if let Some(n) = last_part_name(name) {
             if matches!(classify_function(&n), FnVerdict::SideEffect) {
                 self.hit = Some(format!("side-effect function: {}", n));
@@ -663,6 +671,45 @@ pub enum FnVerdict {
     UnknownCatalog,
     /// Reads real data, but in a shape column-level controls cannot see: raw pages, raw tuples.
     RawStorage,
+}
+
+/// Relations that ARE the storage, rather than a view of it.
+///
+/// The same door as `pageinspect`, opened from the other side. A value too long for its row lives in
+/// a TOAST table, and that table is readable by name: with `MCP_REDACT_COLUMNS=ssn` and a long
+/// value, `SELECT chunk_data FROM pg_toast.pg_toast_16384` returned the redacted text in the clear
+/// (verified 2026-08-17). The chunk carries no column name for redaction to match — it never did,
+/// because at that level columns no longer exist.
+///
+/// `pg_largeobject` is the same idea for large objects: `lo_get` is the API, and this is the bytes
+/// underneath it. Denied whether or not redaction is configured, because reading physical storage is
+/// not something a question about data ever needs, and the moment it is needed the operator is doing
+/// database forensics, not asking an agent.
+const RAW_STORAGE_RELATIONS: &[&str] = &["pg_largeobject", "pg_statistic", "pg_statistic_ext_data"];
+
+/// Schemas that hold physical storage rather than user data.
+const RAW_STORAGE_SCHEMAS: &[&str] = &["pg_toast", "pg_toast_temp_1"];
+
+/// True when a relation names raw storage: `pg_toast.anything`, or one of the storage catalogs.
+fn is_raw_storage_relation(name: &ObjectName) -> Option<String> {
+    let parts: Vec<String> = name
+        .0
+        .iter()
+        .filter_map(|p| Some(p.as_ident()?.value.to_lowercase()))
+        .collect();
+    if parts.is_empty() {
+        return None;
+    }
+    if parts.len() >= 2 {
+        let sch = &parts[parts.len() - 2];
+        if RAW_STORAGE_SCHEMAS.contains(&sch.as_str()) || sch.starts_with("pg_toast") {
+            return Some(parts.join("."));
+        }
+    }
+    let last = parts.last()?;
+    RAW_STORAGE_RELATIONS
+        .contains(&last.as_str())
+        .then(|| last.clone())
 }
 
 /// Functions that hand back storage instead of columns.
@@ -1059,6 +1106,8 @@ pub(crate) const STATISTIC_VALUE_COLUMNS: &[&str] = &[
     "stavalues3",
     "stavalues4",
     "stavalues5",
+    "stxdmcv",
+    "stxdhistogram",
 ];
 
 /// The operator's list plus the statistics columns, or empty when redaction is off.
@@ -2066,6 +2115,40 @@ mod extension_schema_tests {
             with.contains(&"ssn".to_string()),
             "the operator's own list must survive"
         );
+    }
+
+    /// TOAST is the same door from the other side: a value too long for its row is stored in
+    /// `pg_toast.pg_toast_<oid>`, readable by name, and the chunk carries no column name because at
+    /// that level columns no longer exist. Verified with a long value and `MCP_REDACT_COLUMNS=ssn`.
+    #[test]
+    fn raw_storage_relations_cannot_be_read_around_redaction() {
+        for sql in [
+            "SELECT chunk_data FROM pg_toast.pg_toast_16384",
+            "SELECT * FROM pg_toast.pg_toast_16384",
+            "SELECT data FROM pg_largeobject",
+            "SELECT * FROM pg_statistic",
+            "SELECT stxdmcv FROM pg_statistic_ext_data",
+        ] {
+            let e = v(sql).expect_err(sql);
+            assert!(
+                e.contains("raw-storage relation") || e.contains("redacted"),
+                "{sql} -> {e}"
+            );
+        }
+    }
+
+    /// Catalogue reads that describe the database rather than expose its bytes must survive.
+    /// `pg_largeobject_metadata` is ownership and permissions, with no `data` column at all.
+    #[test]
+    fn the_descriptive_catalogue_is_still_readable() {
+        for sql in [
+            "SELECT * FROM pg_tables",
+            "SELECT * FROM pg_largeobject_metadata",
+            "SELECT attname, n_distinct FROM pg_stats WHERE tablename='people'",
+            "SELECT * FROM pg_stat_activity",
+        ] {
+            v(sql).unwrap_or_else(|e| panic!("{sql} should pass, got: {e}"));
+        }
     }
 
     /// And the columns index advice is built from must not be swept up with them, or fixing a leak
