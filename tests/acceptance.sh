@@ -1316,6 +1316,19 @@ r=$(tool query '{"sql":"SELECT 1 AS x","database":"b"}' | body); echo "$r" | gre
 r=$(tool query '{"sql":"SELECT 1"}' | body); case "$r" in *"pass \"database\""*) ok "ambiguous request names the choices";; *) no "ambiguity message" "$r";; esac
 stop
 
+# The README tells the reader how many behaviours this suite checks. That sentence said 43 while the
+# suite ran 290 — nobody updates prose when adding a test, and no gate was watching. Only this script
+# knows the true number, so this script is where the claim is checked. Counting statically from
+# outside would be guesswork: cases are generated in loops.
+readme_n=$(grep -oE "suite that starts its own PostgreSQL and checks [0-9]+" "$(dirname "$0")/../README.md" 2>/dev/null | grep -oE '[0-9]+$')
+total=$((PASS + FAIL + SKIP))
+if [ -z "$readme_n" ]; then
+    printf 'WARN: the README no longer states how many behaviours this suite checks\n'
+elif [ "$readme_n" != "$total" ]; then
+    printf 'FAIL: the README says this suite checks %s behaviours; it ran %s\n' "$readme_n" "$total"
+    FAIL=$((FAIL + 1))
+fi
+
 printf '\n== %d passed, %d failed, %d skipped ==\n' "$PASS" "$FAIL" "$SKIP"
 [ "${KEEP:-0}" = 1 ] || docker rm -f acc_pg >/dev/null 2>&1
 exit $([ "$FAIL" -eq 0 ] && echo 0 || echo 1)

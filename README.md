@@ -284,7 +284,7 @@ Beyond unit tests, the repository carries two harnesses that run in CI on every 
 - `--fuzz` — a deterministic fuzzer that mutates a corpus of known writes with transformations
   that do not change SQL meaning (comments, case, dollar-quoting, invisible Unicode, parentheses)
   and asserts that none of them ever becomes an allowed statement.
-- `tests/acceptance.sh` — an end-to-end suite that starts its own PostgreSQL and checks 43
+- `tests/acceptance.sh` — an end-to-end suite that starts its own PostgreSQL and checks 290
   behaviours: every write-bypass reported against the deprecated server (including the
   `COMMIT`/`END` injection), truthful results, schema introspection, protocol conformance,
   configuration mistakes failing loudly, audit tamper detection, fair use under load, and
@@ -506,16 +506,24 @@ contract it never agreed to.
 ## What the safety costs
 
 Measured, not asserted: `tests/bench/`, against the `pg` driver running the same query on the same
-machine (PostgreSQL 18 in Docker, 50k-row table, 300 sequential requests, rate limit off).
+machine (PostgreSQL 18.6 in Docker, 50k-row table, 300 sequential requests, rate limit off).
+Re-measured 2026-08-17 on a shared VPS at load average 2.6 — median of two runs:
 
 | query | driver | this server | difference |
 |---|---|---|---|
-| point lookup | 0.28 ms | 3.88 ms | +3.6 ms |
-| small scan | 0.64 ms | 5.82 ms | +5.2 ms |
-| aggregate | 3.96 ms | 7.67 ms | +3.7 ms |
+| point lookup | 0.43 ms | 5.9 ms | +5.5 ms |
+| small scan | 1.0 ms | 8.3 ms | +7.3 ms |
+| aggregate | 4.7 ms | 11.3 ms | +6.6 ms |
 
-About **4 ms per query**, and the shape of that number matters more than the size: it is nearly
-constant. If the AST validation were the cost, it would grow with the query. It does not. The time
+An earlier table here said +3.6/+5.2/+3.7 and "about 4 ms". Those came from a quieter machine, and
+the driver floor moved with them — 0.28 ms against today's 0.43 for the same lookup — so it was the
+hardware talking, not the code. Two things were checked before changing the number, because the
+obvious suspect was our own build: the 0.1.6 binary, built before `lto` was switched on, measures
++5.4/+7.8/+5.9 on this machine within the same hour. Identical. The release profile halved the
+binary and cost nothing here.
+
+Expect **5 to 8 ms per query**, and treat any single figure on this page as a reading from one
+machine on one day. The shape matters more than the size: the overhead is nearly constant. If the AST validation were the cost, it would grow with the query. It does not. The time
 goes on round trips — the session is reset, the timeouts and read-only flag are set, a read-only
 transaction is opened, the cost guard plans the statement, then the query runs and the transaction
 is rolled back. Five or six exchanges where the driver has one.
