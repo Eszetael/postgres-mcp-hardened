@@ -470,9 +470,7 @@ pub(crate) fn preflight_config() {
             if !url.contains("sslmode=disable") {
                 continue;
             }
-            let remote = !(url.contains("@localhost")
-                || url.contains("@127.0.0.1")
-                || url.contains("@[::1]"));
+            let remote = !db_is_local(url);
             if remote
                 && !std::env::var("MCP_ALLOW_PLAINTEXT_DB").is_ok_and(|v| v == "i-accept-the-risk")
             {

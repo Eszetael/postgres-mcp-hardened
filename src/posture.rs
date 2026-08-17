@@ -11,8 +11,8 @@ use once_cell::sync::Lazy;
 use serde_json::Value;
 use std::sync::RwLock;
 
-use crate::query_catalog;
 use crate::validate;
+use crate::{db_is_local, query_catalog, url_for};
 use serde_json::json;
 
 /// What the connected role can do, as the database reports it.
@@ -511,6 +511,14 @@ pub(crate) fn report(db: Option<&str>) -> Value {
             fact: "the connection to PostgreSQL is encrypted (measured, not assumed)".into(),
             fix: None,
         }),
+        Some(false) if url_for(db).as_deref().is_some_and(db_is_local) => findings.push(Finding {
+            id: "tls.local",
+            severity: Severity::Ok,
+            fact: "the connection to PostgreSQL is not encrypted, and does not need to be: the \
+                   database is on this machine, so there is no wire for anyone to listen on"
+                .into(),
+            fix: None,
+        }),
         Some(false) => findings.push(Finding {
             id: "tls.off",
             severity: if exposed {
@@ -751,5 +759,43 @@ mod tests {
             ..Default::default()
         };
         assert!(f.excessive().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod locality_tests {
+    use crate::db_is_local;
+
+    /// The predicate that decides whether an unencrypted connection is a finding at all.
+    ///
+    /// It exists because two parts of the server were answering the same question with different
+    /// code: startup refused plaintext only to a database elsewhere, while the posture grader
+    /// reported plaintext to localhost as a gap — which capped a correctly configured local setup
+    /// at B forever and offered `sslmode=verify-full` as the fix, advice that breaks a local
+    /// PostgreSQL with no certificate. Now there is one predicate, and this is the test that keeps
+    /// its edges where both callers expect them.
+    #[test]
+    fn a_database_on_this_machine_is_local() {
+        for u in [
+            "postgres://u:p@localhost:5432/db",
+            "postgres://u:p@127.0.0.1:5432/db",
+            "postgres://u:p@[::1]:5432/db",
+            "postgres://u:p@127.0.0.1/db?sslmode=disable",
+        ] {
+            assert!(db_is_local(u), "should be local: {}", u);
+        }
+    }
+
+    #[test]
+    fn a_database_anywhere_else_is_not() {
+        for u in [
+            "postgres://u:p@db.example.com:5432/db",
+            "postgres://u:p@10.0.0.5:5432/db",
+            "postgres://u:p@my-rds.eu-central-1.rds.amazonaws.com/db",
+            // The host is what matters, not a database or user that happens to be named localhost.
+            "postgres://localhost:p@db.example.com/localhost",
+        ] {
+            assert!(!db_is_local(u), "should not be local: {}", u);
+        }
     }
 }

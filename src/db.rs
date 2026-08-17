@@ -316,7 +316,7 @@ fn reachability_hint(url: &str) -> Option<&'static str> {
 /// Reading `DATABASE_URL` alone made every TLS diagnosis dead code under `MCP_DATABASE_URLS` — the
 /// multi-database mode this server exists for. Worse, the fallback message told the operator to set
 /// `DATABASE_URL` on a server that was configured correctly.
-fn url_for(name: Option<&str>) -> Option<String> {
+pub(crate) fn url_for(name: Option<&str>) -> Option<String> {
     if let Ok(spec) = std::env::var("MCP_DATABASE_URLS") {
         let entries: Vec<(String, String)> = spec
             .split(';')
@@ -334,6 +334,18 @@ fn url_for(name: Option<&str>) -> Option<String> {
         };
     }
     database_url()
+}
+
+/// Whether the database lives on this machine.
+///
+/// One predicate, two callers, because they were drifting apart. Startup refuses an unencrypted
+/// connection only to a database that is NOT here — the threat is somebody on the wire, and on a
+/// loopback socket there is no wire. The posture grader did not know that rule and reported
+/// plaintext to localhost as a finding, which capped a correctly configured local setup at B
+/// forever and offered `sslmode=verify-full` as the fix — advice that breaks a local PostgreSQL
+/// with no certificate. Two places judging the same fact must judge it with the same code.
+pub(crate) fn db_is_local(url: &str) -> bool {
+    url.contains("@localhost") || url.contains("@127.0.0.1") || url.contains("@[::1]")
 }
 
 /// The opening of every `pool_error_detail` message that means "the database never answered", as
