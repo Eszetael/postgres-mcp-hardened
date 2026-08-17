@@ -658,7 +658,8 @@ pub(crate) fn execute_readonly(final_sql: &str, db: Option<&str>) -> Result<Valu
     // anything that slipped past the validator stays in the database PERMANENTLY. Comparing with the
     // deprecated `@modelcontextprotocol/server-postgres` was sobering — it wraps each query in
     // `BEGIN TRANSACTION READ ONLY` and ends with `ROLLBACK`, so `pg_import_system_collations()`
-    // (which writes DESPITE read-only) is undone there, while here it persisted 874 rows.
+    // (which writes DESPITE read-only) is undone there, while here it persisted every row it wrote
+    // — 874 on the database we tested, which is however many collations happened to be missing.
     // A third layer of defence, in the one place where we were weaker than what we replace.
     client
         .batch_execute("BEGIN TRANSACTION READ ONLY")

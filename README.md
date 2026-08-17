@@ -84,11 +84,26 @@ and one this server now adopts as well.
 The problem is that it is the *only* defence, and it is not complete:
 
 - **A read-only transaction does not block every write.** PostgreSQL executes
-  `pg_import_system_collations()` inside `SET TRANSACTION READ ONLY` without raising `SQLSTATE 25006`
-  — it inserted 874 rows into `pg_collation` in our tests. `gin_clean_pending_list()` rewrites index
-  structures; `pg_backup_start()` puts the server into backup mode and survives `DISCARD ALL`. The
-  rollback saves you from the first case, not from the side effects that live outside transaction
-  semantics.
+  `pg_import_system_collations()` inside `SET TRANSACTION READ ONLY` without raising `SQLSTATE 25006`,
+  and the rows it writes are committed. `gin_clean_pending_list()` rewrites index structures;
+  `pg_backup_start()` puts the server into backup mode and survives `DISCARD ALL`. The rollback saves
+  you from the first case, not from the side effects that live outside transaction semantics.
+
+  Check it yourself rather than believing us — but note the precondition, because without it you will
+  see a zero and conclude we made this up. The function imports the collations that are *missing*, so
+  on an untouched database it writes nothing and still raises no error. Remove some first:
+
+  ```sql
+  DELETE FROM pg_collation WHERE collname IN (SELECT collname FROM pg_collation ORDER BY oid DESC LIMIT 200);
+  BEGIN READ ONLY;
+    DELETE FROM pg_collation WHERE collname LIKE 'zu%';  -- ERROR: cannot execute DELETE in a read-only transaction
+    SELECT pg_import_system_collations('pg_catalog');    -- 200, no error
+  COMMIT;                                                -- and the 200 rows are there
+  ```
+
+  Both statements are writes and both are inside the same read-only transaction. One is refused and
+  one is not. That asymmetry — not any particular row count — is the reason this server does not
+  treat the transaction as its only defence.
 - **No statement timeout, no cost guard, no row limit** — one query can run until the server gives up.
 - **No authentication, no audit trail, no handling of prompt injection** through returned row data.
 - One source file of 143 lines, unmaintained since December 2024, no test suite.
