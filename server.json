@@ -3,7 +3,7 @@
   "name": "io.github.Eszetael/postgres-mcp-hardened",
   "title": "PostgreSQL (hardened, read-only)",
   "description": "Read-only PostgreSQL over MCP. Writes refused at the parsed SQL, plus a READ ONLY transaction.",
-  "version": "0.1.6",
+  "version": "0.1.7",
   "websiteUrl": "https://github.com/Eszetael/postgres-mcp-hardened",
   "repository": {
     "url": "https://github.com/Eszetael/postgres-mcp-hardened",
@@ -13,7 +13,7 @@
     {
       "registryType": "npm",
       "identifier": "postgres-mcp-hardened",
-      "version": "0.1.6",
+      "version": "0.1.7",
       "transport": {
         "type": "stdio"
       },
@@ -51,7 +51,7 @@
     },
     {
       "registryType": "oci",
-      "identifier": "ghcr.io/eszetael/postgres-mcp-hardened:0.1.6",
+      "identifier": "ghcr.io/eszetael/postgres-mcp-hardened:0.1.7",
       "transport": {
         "type": "streamable-http",
         "url": "http://localhost:8080/mcp"

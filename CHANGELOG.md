@@ -1,5 +1,49 @@
 # Changelog
 
+## 0.1.7 — 2026-08-17
+
+Two days of walking every path this project documents, as a stranger would, from an empty directory.
+Seven defects, and not one of them in the security core: that survived eight redaction bypasses, five
+TLS scenarios, every startup gate and the whole audit chain without a scratch. Every defect was on
+the surface — in a path somebody described and never walked to the end.
+
+- **One-click install never worked.** The `.mcpb` manifest had existed since July and nobody had ever
+  packed it, so nobody discovered that it fails the official schema validation: `repository` was a
+  string where an object is required. The release workflow now validates the manifest and packs a
+  bundle per platform from the binary it has just built, and `docs_claims.sh` validates it on every
+  commit. The README leads with it, because "open this file" is a lower bar than "edit this JSON".
+- **A correctly configured local server could not reach grade A, whatever the operator did.** Startup
+  accepts an unencrypted connection to a database on this machine — the threat is somebody on the
+  wire, and a loopback socket has no wire — but the posture grader did not know that rule and
+  reported it as a finding, suggesting `sslmode=verify-full`, which breaks a local PostgreSQL that
+  has no certificate. One predicate, `db_is_local`, now answers that question for both.
+- **A password containing `@` sent the operator to check their firewall.** The message about
+  percent-encoding hung off a parse failure, and a password with `@` does not fail to parse: the
+  driver takes the last `@` as the separator and fails at connect time instead. Named outright now,
+  with `MCP_PASSWORD_FILE` offered as the way to avoid the question.
+- **TLS demanded from a local database blamed a missing CA.** A local PostgreSQL ships with
+  `ssl = off` — the official Docker image and the distribution packages all do — and our own VS Code
+  example demanded `sslmode=verify-full` from `localhost`, so it did not work as written.
+- **Two example configurations were unusable as written.** `claude_desktop_config.json` named
+  `/usr/local/bin/postgres-mcp-hardened`, which nothing in the documentation puts there, producing the
+  `ENOENT` this project criticises in the server it replaces. The compose file's own header omitted
+  the bearer token that the same file configures.
+- **Every tool parameter now carries a description.** An external review of the tool surface scored
+  the four tools with undescribed parameters lowest of the ten, every time for the same reason: a
+  bare `{"type": "string"}` tells an agent nothing about where the value comes from. Each parameter
+  now says, and each tool names a sibling and when to prefer it — `query` says outright not to
+  hand-write catalog queries, because `list_tables` and `describe_table` already return that.
+- **The README named the wrong current protocol revision** for ten days after `2026-07-28` became the
+  default, and the stale sentence had already been copied into a published article.
+
+Everything above is now pinned by a test. The suite grew from 280 acceptance cases to 288 and gained
+two controls: one that verifies claims about *other people's* repositories (every cited issue must
+exist; a drifted reaction count warns rather than failing, because that is the world moving and not
+a defect here), and one that validates the `.mcpb` manifest against the official schema.
+
+Key rotation and the audit sidecar — the two strongest promises the project makes — had no test at
+all until now. Both do.
+
 ## 0.1.6 — 2026-08-15
 
 The first outside environment to run this server found two defects in an afternoon, and both had
