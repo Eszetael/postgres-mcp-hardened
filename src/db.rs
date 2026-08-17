@@ -336,6 +336,27 @@ pub(crate) fn url_for(name: Option<&str>) -> Option<String> {
     database_url()
 }
 
+/// Whether the authority part of the URL carries more than one `@`, which almost always means the
+/// password contains one and the driver split the string in the wrong place.
+///
+/// The helpful message about percent-encoding already existed, but it only fired when the string
+/// FAILED TO PARSE. A password with `@` parses fine — the driver takes the last `@` as the
+/// separator and treats the rest as a hostname — so it got all the way to a connection attempt and
+/// came back as "error connecting to server", which sends the operator to check their firewall.
+/// Found on 2026-08-17 by walking the first-run path with a password the tool itself suggests.
+pub(crate) fn authority_has_extra_at(url: &str) -> bool {
+    let after_scheme = match url.split_once("://") {
+        Some((_, rest)) => rest,
+        None => return false,
+    };
+    // The authority ends at the first `/` (the database) or `?` (parameters).
+    let authority = after_scheme
+        .split(['/', '?'])
+        .next()
+        .unwrap_or(after_scheme);
+    authority.matches('@').count() > 1
+}
+
 /// Whether the database lives on this machine.
 ///
 /// One predicate, two callers, because they were drifting apart. Startup refuses an unencrypted
@@ -443,14 +464,26 @@ pub(crate) fn pool_error_detail(db: Option<&str>) -> String {
                 } else if d.contains("expired") {
                     "cannot connect to PostgreSQL: the server certificate has expired".to_string()
                 } else {
-                    format!(
-                        "cannot connect to PostgreSQL: {} — check host, port and sslmode; \
-                         for a private CA (e.g. an RDS bundle) point MCP_SSLROOTCERT at the PEM file{}",
-                        e,
-                        reachability_hint(&url)
-                            .map(|h| format!(". {}", h))
-                            .unwrap_or_default()
-                    )
+                    // Say the likely cause before the generic advice: an operator told to check
+                    // host, port and sslmode will check host, port and sslmode, and the password
+                    // is none of those.
+                    if authority_has_extra_at(&url) {
+                        "cannot connect to PostgreSQL: the connection string has a second `@` before \
+                         the database name, so the password almost certainly contains one and the \
+                         driver split the string at the wrong place. Percent-encode it: @ becomes \
+                         %40, : becomes %3A, / becomes %2F, # becomes %23. `MCP_PASSWORD_FILE` \
+                         avoids the problem entirely by keeping the password out of the URL."
+                            .to_string()
+                    } else {
+                        format!(
+                            "cannot connect to PostgreSQL: {} — check host, port and sslmode; \
+                             for a private CA (e.g. an RDS bundle) point MCP_SSLROOTCERT at the PEM file{}",
+                            e,
+                            reachability_hint(&url)
+                                .map(|h| format!(". {}", h))
+                                .unwrap_or_default()
+                        )
+                    }
                 }
             }
         }
@@ -1111,5 +1144,42 @@ mod hypo_tests {
         assert!(uses_hypothetical_index(&nested));
         let seq = json!([{ "Plan": { "Node Type": "Seq Scan", "Relation Name": "big" } }]);
         assert!(!uses_hypothetical_index(&seq));
+    }
+}
+
+#[cfg(test)]
+mod authority_tests {
+    use super::authority_has_extra_at;
+
+    /// A password with `@` in it does not fail to parse — it parses into the wrong thing.
+    ///
+    /// That is why the existing "percent-encode it" message never reached anyone: it hung off the
+    /// parse error, and there is no parse error. The connection attempt fails instead, and the
+    /// generic transport message sends the operator to check their firewall for a problem that is
+    /// in their password. This predicate is the difference between those two answers.
+    #[test]
+    fn a_password_with_an_at_sign_is_detected() {
+        for u in [
+            "postgres://user:pa@ss@localhost:5432/db",
+            "postgresql://user:a@b@db.example.com/x",
+            "postgres://user:@@127.0.0.1/db",
+        ] {
+            assert!(authority_has_extra_at(u), "should be flagged: {}", u);
+        }
+    }
+
+    #[test]
+    fn an_ordinary_url_is_not_flagged() {
+        for u in [
+            "postgres://user:plain@localhost:5432/db",
+            "postgres://user@localhost/db",
+            "postgres://localhost/db",
+            // An `@` AFTER the authority belongs to the database name or a parameter, not the
+            // password: the split must stop at the first `/` or `?`.
+            "postgres://user:plain@localhost:5432/db@name",
+            "postgres://user:plain@localhost/db?options=-csearch_path%3Da@b",
+        ] {
+            assert!(!authority_has_extra_at(u), "should not be flagged: {}", u);
+        }
     }
 }

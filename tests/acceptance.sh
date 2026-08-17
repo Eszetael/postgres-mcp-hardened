@@ -189,6 +189,22 @@ print('OK')")
   && ok "a host can inspect the server with no database and mcp-proxy in front" \
   || no "inspection without a database" "$verdict"
 
+# A password containing `@` does not fail to parse, it parses into the wrong thing — so the helpful
+# "percent-encode it" message, which hung off the parse error, never reached anybody. The operator
+# got "check host, port and sslmode" and went to look at their firewall. Found 2026-08-17 by walking
+# the first-run path.
+out=$(env DATABASE_URL="postgres://u:pa@ss@127.0.0.1:1/db" timeout 20 "$BIN" --validate "SELECT 1" 2>&1)
+probe=$(printf '%s\n%s\n' \
+  '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"acceptance","version":"0"}}}' \
+  '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"query","arguments":{"sql":"SELECT 1"}}}' \
+  | env DATABASE_URL="postgres://u:pa@ss@127.0.0.1:1/db" timeout 40 "$BIN" --stdio 2>/dev/null)
+case "$probe" in
+  *"password almost certainly contains one"*)
+    ok "a password with @ is named as the cause" ;;
+  *)
+    no "password with @ still reported as a host problem" "$(printf '%s' "$probe" | tail -c 160)" ;;
+esac
+
 # The other half of that fix must not have loosened the check it came from: a misspelling of a
 # protection is still fatal, because starting with redaction off is the failure this guards.
 env MCP_REDACT_COLUMN=ssn DATABASE_URL="$DEADDB" timeout 10 "$BIN" --stdio </dev/null >/dev/null 2>&1
