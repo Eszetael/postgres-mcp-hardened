@@ -76,6 +76,16 @@ that would have held.
   `DISCARD ALL`. The denial list carries the pre-15 spellings `pg_start_backup`/`pg_stop_backup`, but
   the `pg_backup_` prefix covers the modern names — verified through `--validate`, not by reading.
 
+One more path was walked to its end before it could ship, and it was broken: **the one-click bundle
+would not have started on Windows.** The release copies `postgres-mcp-hardened.exe` into the bundle
+on that platform, while the manifest named `bin/postgres-mcp-hardened` for all three, with no
+platform override — so the client would have been told to run a file that is not in the archive.
+`.mcpb` bundling is new in this release, so nobody has hit it, and now nobody will. Control F could
+not have caught it: the official schema validator passes the broken manifest, because a manifest
+naming a file that is not there is still valid JSON. Control J compares what the manifest runs
+against what the release actually puts in the bundle, per declared platform, and was verified by
+removing the fix and watching the schema validator say "passes" while the control said no.
+
 Then the remaining figures were measured rather than repeated, and three more gave way:
 
 - **Idle memory was 7.7 MB, not the 5.2 MB claimed.** Five separate starts under identical conditions

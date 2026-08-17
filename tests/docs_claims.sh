@@ -347,6 +347,44 @@ print("PASS Control I: all %d pinned actions carry the version they actually run
 PYEOF
 fi
 
+# Control J: the .mcpb bundle declares which platforms it supports, and the release workflow copies a
+# differently-named file on Windows (`…​.exe`). The manifest hard-coded one command for all three
+# platforms, so the Windows bundle would have shipped with `bin/postgres-mcp-hardened.exe` inside and
+# a manifest telling the client to run `bin/postgres-mcp-hardened`. One-click install is the FIRST
+# option the README offers; it would have failed on Windows for everyone, and the schema validator in
+# Control F cannot see it, because a manifest naming a file that is not there is still valid JSON.
+python3 - <<'PYEOF' || fail=1
+import json, re, sys
+m = json.load(open("mcpb/manifest.json"))
+cfg = m["server"]["mcp_config"]
+platforms = set(m.get("compatibility", {}).get("platforms", []))
+over = cfg.get("platform_overrides", {})
+wf = open(".github/workflows/release.yml").read()
+bad = []
+
+# What does the workflow actually place in the bundle for Windows?
+win_named_exe = re.search(r'cp "\$\{DIR\}/\$\{BIN\}\.exe" mcpb/bin/\$\{BIN\}\.exe', wf) is not None
+if "win32" in platforms and win_named_exe:
+    cmd = (over.get("win32") or {}).get("command", cfg["command"])
+    if not cmd.endswith(".exe"):
+        bad.append("win32 is a declared platform and the release copies a .exe, "
+                   "but the manifest runs %r" % cmd)
+if "win32" in platforms and not win_named_exe:
+    bad.append("win32 is declared but the release workflow no longer copies a .exe; "
+               "this check is now looking at the wrong thing")
+for p in platforms - {"win32"}:
+    cmd = (over.get(p) or {}).get("command", cfg["command"])
+    if cmd.endswith(".exe"):
+        bad.append("%s would run %r" % (p, cmd))
+
+for b in bad:
+    print("FAIL Control J: " + b)
+if bad:
+    sys.exit(1)
+print("PASS Control J: the bundle runs the file the release actually puts in it, on all %d platforms"
+      % len(platforms))
+PYEOF
+
 if [ "$fail" -eq 0 ]; then
     echo "PASS Control A: every 'verified' claim names a test that exists"
     echo "PASS Control B: the documented settings and the source agree"

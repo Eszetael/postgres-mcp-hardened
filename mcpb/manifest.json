@@ -34,6 +34,11 @@
         "MCP_MAX_COST": "${user_config.max_cost}",
         "MCP_CLIENT_ID": "${user_config.client_id}",
         "MCP_REDACT_COLUMNS": "${user_config.redact_columns}"
+      },
+      "platform_overrides": {
+        "win32": {
+          "command": "bin/postgres-mcp-hardened.exe"
+        }
       }
     }
   },
