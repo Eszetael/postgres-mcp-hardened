@@ -37,3 +37,15 @@ webpki-roots = "1"
 [dev-dependencies]
 rsa = { version = "0.9", features = ["pem"] }
 rand = "0.8"
+
+# The release profile was never set, so the shipped binary carried debug symbols it has no use for:
+# 18.9 MB, of which 5.3 MB was symbol table. Stripping is not cosmetic here — this is a security tool
+# people are asked to download and check by hand, and every megabyte is one more thing to justify.
+#
+# `panic` is deliberately left at unwind. Aborting would shrink it further, but the audit log's
+# integrity depends on Drop running when a request handler panics, and a smaller binary is not worth
+# a hash chain that stops one entry short of the truth.
+[profile.release]
+strip = true
+lto = true
+codegen-units = 1

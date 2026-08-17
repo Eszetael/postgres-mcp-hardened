@@ -44,6 +44,42 @@ a defect here), and one that validates the `.mcpb` manifest against the official
 Key rotation and the audit sidecar — the two strongest promises the project makes — had no test at
 all until now. Both do.
 
+### Then the same walk was taken through what this project *says*, and it went worse
+
+The security core had held under every attack. The claims about it had not. Four figures that a
+reader is invited to verify were wrong, and the invitation is what makes that serious — a number
+nobody can check is merely unsupported, while a number that fails when checked discredits the ones
+that would have held.
+
+- **The opening sentence of the README overstated the archived server's downloads by 39,000** —
+  "~476k a month" against npm's 437,210. Nobody had lied; the figure was measured once and quietly
+  aged. That sentence is the project's whole justification and directories copy it verbatim.
+  `docs_claims.sh` now has Control G, which fetches the real figure on every run and fails on drift
+  beyond 8%. Tolerance, because npm moves a few percent by itself and a check that has to be muted
+  costs more than it saves.
+- **The binary was 18.9 MB, not the 11 MB claimed, and it is not static.** The number had never been
+  measured on a release build, because this crate had no `[profile.release]` at all — so five
+  megabytes of debug symbols went out to every user who downloaded it. Setting `strip`, `lto` and
+  `codegen-units = 1` brings it to 9.2 MB. `panic` stays at `unwind` deliberately: aborting would
+  shrink it further, but the audit chain's integrity depends on `Drop` running when a request handler
+  panics, and no megabyte is worth a hash chain that stops one entry short of the truth. "Static" was
+  never true of any of the five published targets, none of which is a `musl` build.
+- **The headline demonstration could be disproved in thirty seconds.** The claim that
+  `pg_import_system_collations()` "inserted 874 rows" inside a read-only transaction is true, but the
+  function imports the collations that are *missing* — so on an untouched database it inserts nothing
+  and still raises no error. Anyone taking up the invitation to check would have seen a zero. The
+  README now states the precondition and gives the exact SQL: with 200 collations removed, `DELETE`
+  inside `BEGIN READ ONLY` is refused with `SQLSTATE 25006` while the import writes 200 rows that
+  survive `COMMIT`. That asymmetry is the argument; the row count never was.
+- `gin_clean_pending_list()` and `pg_backup_start()` were re-tested rather than trusted, and both
+  hold: 10 index pages cleaned inside a read-only transaction, and backup mode surviving
+  `DISCARD ALL`. The denial list carries the pre-15 spellings `pg_start_backup`/`pg_stop_backup`, but
+  the `pg_backup_` prefix covers the modern names — verified through `--validate`, not by reading.
+
+The pattern is worth naming, because it is the opposite of the one above it: the code was right every
+time it was pushed, and the prose about the code was wrong four times. Rigour applied to a program
+and withheld from the sentences describing it is not rigour.
+
 ## 0.1.6 — 2026-08-15
 
 The first outside environment to run this server found two defects in an afternoon, and both had

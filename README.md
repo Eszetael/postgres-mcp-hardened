@@ -728,8 +728,16 @@ Rust" claim rather than take it:
 | Resident memory, after a benchmark run | 9.2 MB |
 | Median request latency | ~8 ms — including the `curl` process the measurement spawns, so the server's own share is lower |
 | Start to first validated statement | 7 ms |
-| Binary | 11 MB, static, no runtime to install |
+| Binary | 9.2 MB (linux x86_64, 0.1.7 onward). Nothing to install alongside it — no Node, no Python, no shared library we ship. It is *not* statically linked: like any `-gnu` target it uses the system `libc`, `libm` and `libgcc_s`. |
 | Container image | 14.8 MB compressed, 41 MB unpacked (linux/amd64, 0.1.6), distroless, non-root |
+
+The binary line was wrong until 0.1.7 — it said "11 MB, static", and the file people actually
+downloaded was 18.9 MB and dynamically linked. The size was never measured on a release build,
+because this crate had no `[profile.release]` at all, so more than five megabytes of debug symbols
+shipped to every user. Setting `strip`, `lto` and `codegen-units = 1` took it to 9.2 MB. The word
+"static" was simply not true of any of the five targets we publish, none of which is a `musl` build.
+The 0.1.6 numbers above the fold are left as measured; a footprint table that quietly improves its
+own history is not evidence of anything.
 
 A twelve-minute soak of mixed traffic (reads, refusals, errors, aborted requests, session churn)
 left resident memory flat and file descriptors unchanged.
