@@ -1099,6 +1099,46 @@ grep -q "REFUSING TO START" /tmp/acc_plain_$$.log \
   || ok "and a plain reader is still allowed to serve"
 { kill -9 %1; } 2>/dev/null; rm -f "$CUSTOM_LOG" /tmp/acc_plain_$$.log
 
+# The built-in privileged roles, which is how an operator actually grants file access — far more
+# common than a hand-rolled role with CREATEROLE. A member of pg_read_server_files can read anything
+# the postgres process can, and pg_execute_server_program can run commands on the host; neither
+# writes to a table, so "read-only" says nothing useful about them.
+sqlout=$(docker exec -i acc_pg psql -U postgres -q -v ON_ERROR_STOP=1 2>&1 <<SQL
+DROP ROLE IF EXISTS acc_filereader; CREATE ROLE acc_filereader LOGIN PASSWORD 'f';
+GRANT pg_read_server_files TO acc_filereader;
+GRANT CONNECT ON DATABASE postgres TO acc_filereader;
+GRANT USAGE ON SCHEMA public TO acc_filereader;
+DROP ROLE IF EXISTS acc_progrunner; CREATE ROLE acc_progrunner LOGIN PASSWORD 'p';
+GRANT pg_execute_server_program TO acc_progrunner;
+GRANT CONNECT ON DATABASE postgres TO acc_progrunner;
+GRANT USAGE ON SCHEMA public TO acc_progrunner;
+SQL
+)
+sqlrc=$?
+if [ $sqlrc -ne 0 ]; then
+  no "could not create the privileged roles for this check" "$(printf '%s' "$sqlout" | head -c 160)"
+else
+  i=0
+  for pair in "acc_filereader:f:pg_read_server_files" "acc_progrunner:p:pg_execute_server_program"; do
+    role=${pair%%:*}; rest=${pair#*:}; pw=${rest%%:*}; grp=${rest##*:}
+    i=$((i+1))
+    L=/tmp/acc_priv_${i}_$$.log
+    # `timeout` is not decoration: if the guard ever stops refusing, the server serves forever and
+    # this case would hang the suite instead of failing it. A test that hangs reports nothing.
+    env DATABASE_URL="postgres://$role:$pw@127.0.0.1:$PGPORT_ACC/postgres" \
+        MCP_ADDR=0.0.0.0:$(( PORT + 60 + i )) MCP_BEARER_TOKEN=t timeout 20 "$BIN" > "$L" 2>&1
+    rc=$?
+    if [ $rc -eq 3 ] && grep -q "$grp" "$L"; then
+      ok "a member of $grp is refused a network listener, and the group is named"
+    else
+      # Show what actually happened, not a grep that assumes the failure we expected.
+      no "$grp was not treated as more than a reader" \
+         "rc=$rc | $(grep -vE '^AUDIT|^TLS' "$L" | head -2 | tr '\n' ' ' | cut -c1-140)"
+    fi
+    rm -f "$L"
+  done
+fi
+
 PAUD=/tmp/acc_posture_$$.log; rm -f "$PAUD"
 start DATABASE_URL="$URL" MCP_AUDIT_LOG="$PAUD"
 r=$(tool security_posture '{}' | body)
