@@ -12,12 +12,15 @@
     "postgres": {
       "type": "stdio",
       "command": "postgres-mcp-hardened",
-      "args": ["--stdio"],
+      "args": [
+        "--stdio"
+      ],
       "env": {
-        "DATABASE_URL": "postgres://reader:${input:pgpass}@localhost:5432/mydb?sslmode=verify-full",
+        "DATABASE_URL": "postgres://reader:${input:pgpass}@localhost:5432/mydb",
         "MCP_ALLOW_SCHEMAS": "public",
         "MCP_AUDIT_LOG": "${workspaceFolder}/.postgres-mcp-audit.log"
       }
     }
-  }
+  },
+  "//sslmode": "No sslmode here on purpose. A local PostgreSQL ships with ssl=off — the official Docker image and the distribution packages all do — so `sslmode=verify-full` against localhost fails at the handshake. This example carried it until 2026-08-17 and therefore did not work as written. For a hosted database (RDS, Supabase, Neon) add `?sslmode=verify-full` and point MCP_SSLROOTCERT at the provider CA bundle."
 }

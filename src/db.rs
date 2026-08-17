@@ -467,7 +467,20 @@ pub(crate) fn pool_error_detail(db: Option<&str>) -> String {
                     // Say the likely cause before the generic advice: an operator told to check
                     // host, port and sslmode will check host, port and sslmode, and the password
                     // is none of those.
-                    if authority_has_extra_at(&url) {
+                    // A local PostgreSQL almost always ships with `ssl = off` — the official
+                    // Docker image does, and so do the apt and brew packages. Demanding TLS from it
+                    // then fails at the handshake, where the message used to talk about private CAs
+                    // and send the operator hunting for a certificate bundle that is not the
+                    // problem. Our own VS Code example carried `sslmode=verify-full` against
+                    // localhost and therefore did not work as written (found 2026-08-17).
+                    if d.contains("handshake") && db_is_local(&url) {
+                        "cannot connect to PostgreSQL: TLS was required but the handshake failed, and \
+                         the database is on this machine — a local PostgreSQL usually ships with \
+                         `ssl = off` (the official Docker image and the distribution packages all do). \
+                         Check `SHOW ssl;`. For a database on this machine you do not need TLS at all: \
+                         drop the `sslmode` parameter, or set `sslmode=disable`."
+                            .to_string()
+                    } else if authority_has_extra_at(&url) {
                         "cannot connect to PostgreSQL: the connection string has a second `@` before \
                          the database name, so the password almost certainly contains one and the \
                          driver split the string at the wrong place. Percent-encode it: @ becomes \

@@ -1,12 +1,17 @@
 {
   "mcpServers": {
     "postgres": {
-      "command": "/usr/local/bin/postgres-mcp-hardened",
-      "args": ["--stdio"],
+      "command": "npx",
+      "args": [
+        "-y",
+        "postgres-mcp-hardened",
+        "--stdio"
+      ],
       "env": {
         "DATABASE_URL": "postgres://reader:YOUR_PASSWORD@localhost:5432/mydb",
         "MCP_REDACT_COLUMNS": "ssn, card_number, password"
       }
     }
-  }
+  },
+  "//": "`npx` matches the install path the README leads with, and needs nothing on PATH: the package fetches the native binary for your platform and verifies its checksum. This file used to name /usr/local/bin/postgres-mcp-hardened, which nothing in the documentation puts there — so copying it produced ENOENT, the same failure this project criticises in the deprecated server. Using an installed binary instead? Replace command with its absolute path and drop the -y argument."
 }

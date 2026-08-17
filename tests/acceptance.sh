@@ -205,6 +205,56 @@ case "$probe" in
     no "password with @ still reported as a host problem" "$(printf '%s' "$probe" | tail -c 160)" ;;
 esac
 
+# TLS demanded from a local PostgreSQL fails at the handshake, and a local PostgreSQL ships with
+# ssl=off — the official Docker image and the distribution packages all do. The message used to talk
+# about private CAs and send the operator looking for a certificate bundle. Our own VS Code example
+# carried `sslmode=verify-full` against localhost and therefore did not work as written.
+probe=$(printf '%s\n%s\n' \
+  '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"acceptance","version":"0"}}}' \
+  '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"query","arguments":{"sql":"SELECT 1"}}}' \
+  | env DATABASE_URL="${URL}?sslmode=verify-full" timeout 40 "$BIN" --stdio 2>/dev/null)
+case "$probe" in
+  *"ssl = off"*) ok "TLS refused by a local database names ssl=off, not a missing CA" ;;
+  *) no "local TLS failure still blamed on a certificate" "$(printf '%s' "$probe" | tail -c 150)" ;;
+esac
+
+# Every example configuration must be usable as written. Three of them were not: the compose header
+# omitted the bearer token it configures, the Claude Desktop file named a binary nothing installs,
+# and the VS Code file demanded TLS from a database that does not offer it.
+for f in examples/*.json; do
+  python3 -m json.tool "$f" >/dev/null 2>&1 || { no "example is not valid JSON: $f" ""; continue; }
+  # The VALUES, not the file text: an earlier version of this check grepped raw bytes and matched
+  # the comments explaining the very mistake it was looking for.
+  verdict=$(python3 - "$f" <<'PYEOF'
+import json, sys
+d = json.load(open(sys.argv[1]))
+bad = []
+def walk(node):
+    if isinstance(node, dict):
+        for k, v in node.items():
+            if k.startswith("//"):
+                continue                      # explanatory keys are prose, not configuration
+            if k == "command" and isinstance(v, str) and v.startswith("/usr/local/bin/"):
+                bad.append("names a binary nothing installs: " + v)
+            if k == "DATABASE_URL" and isinstance(v, str):
+                local = "@localhost" in v or "@127.0.0.1" in v
+                if local and "sslmode=verify-full" in v:
+                    bad.append("demands TLS from a local database")
+            walk(v)
+    elif isinstance(node, list):
+        for v in node:
+            walk(v)
+walk(d)
+print("; ".join(bad) if bad else "OK")
+PYEOF
+)
+  if [ "$verdict" = OK ]; then
+    ok "example is usable as written: $(basename "$f")"
+  else
+    no "example cannot be used as written: $(basename "$f")" "$verdict"
+  fi
+done
+
 # The other half of that fix must not have loosened the check it came from: a misspelling of a
 # protection is still fatal, because starting with redaction off is the failure this guards.
 env MCP_REDACT_COLUMN=ssn DATABASE_URL="$DEADDB" timeout 10 "$BIN" --stdio </dev/null >/dev/null 2>&1
