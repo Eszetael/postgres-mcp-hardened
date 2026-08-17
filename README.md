@@ -332,8 +332,10 @@ The ones we deliberately built against:
 - **Credentials in the client configuration.** `MCP_PASSWORD_FILE` keeps the password out of it.
 - **Tables in a non-default schema silently not found.** `MCP_SEARCH_PATH` fixes the lookup, and
   the tools take an explicit `schema` anyway.
-- **Deprecated transport.** SSE was replaced by Streamable HTTP in the 2025-06-18 specification;
-  we speak the current one.
+- **Deprecated transport.** HTTP+SSE was replaced by Streamable HTTP in **2025-03-26**, three
+  revisions ago (this page said 2025-06-18 until 0.1.7, which was wrong by one revision; the
+  specification's own changelog for 2025-03-26 records the replacement). We speak the current
+  transport.
 
 ## Troubleshooting
 
