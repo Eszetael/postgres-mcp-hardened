@@ -1,9 +1,15 @@
 # A working setup in one command: a PostgreSQL with sample data and the MCP server in front of it.
 #
 #   docker compose -f examples/docker-compose.yml up -d
-#   curl -s -H content-type:application/json http://127.0.0.1:8080/mcp \
+#   curl -s -H content-type:application/json -H 'authorization: Bearer change-me-before-running' \
+#     http://127.0.0.1:8080/mcp \
 #     -d '{"jsonrpc":"2.0","id":1,"method":"tools/call",
 #          "params":{"name":"query","arguments":{"sql":"SELECT * FROM people"}}}'
+#
+# The Authorization header is not optional and this file is why: it binds 0.0.0.0, so the server
+# refuses to serve without a token. The first version of this comment left the header out, and
+# anyone who pasted both lines got "invalid or missing bearer token" from an example that was
+# supposed to work in one command. Change the token below before running this anywhere real.
 #
 # The server connects as `reader`, a role with SELECT and nothing else — the deployment this
 # project recommends, not a superuser shortcut that only works in a demo.
@@ -20,8 +26,10 @@ services:
       retries: 20
 
   mcp:
-    build: ..
-    # Published image: ghcr.io/eszetael/postgres-mcp-hardened:latest
+    # The published image, so this file plus seed.sql is all you need — no clone, no build.
+    image: ghcr.io/eszetael/postgres-mcp-hardened:latest
+    # Working on the server itself? Swap the line above for this one to build from the checkout:
+    # build: ..
 
     depends_on:
       db:

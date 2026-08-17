@@ -699,7 +699,7 @@ defeated in review and are therefore described as depth rather than as boundarie
 - **Audit:** every tool decision is logged as a tamper-evident, hash-chained JSON line (no raw SQL).
 - **Supply chain:** dependency licences, sources and advisories enforced in CI (`cargo deny`,
   `cargo audit`); a CycloneDX SBOM is attached to every release.
-- **Runtime:** ships as a distroless, non-root container (~34 MB, built and smoke-tested in CI).
+- **Runtime:** ships as a distroless, non-root container — **14.8 MB to download**, 41 MB on disk for `linux/amd64` at 0.1.6, built and smoke-tested in CI. Both numbers, because a single one is always the flattering one: `docker images` shows the second, your bandwidth pays the first.
 
 ## Footprint
 
@@ -713,7 +713,7 @@ Rust" claim rather than take it:
 | Median request latency | ~8 ms — including the `curl` process the measurement spawns, so the server's own share is lower |
 | Start to first validated statement | 7 ms |
 | Binary | 11 MB, static, no runtime to install |
-| Container image | ~34 MB distroless, non-root |
+| Container image | 14.8 MB compressed, 41 MB unpacked (linux/amd64, 0.1.6), distroless, non-root |
 
 A twelve-minute soak of mixed traffic (reads, refusals, errors, aborted requests, session churn)
 left resident memory flat and file descriptors unchanged.
