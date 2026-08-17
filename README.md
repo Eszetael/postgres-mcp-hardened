@@ -167,12 +167,20 @@ on x86-64 and arm64, each with a checksum and a signature; verifying them is the
 user, and the same signatures cover it as cover the binaries.
 
 ```bash
-docker run --rm -p 127.0.0.1:8080:8080 \
+docker run --rm -p 127.0.0.1:8080:8080 --memory=512m \
   -e DATABASE_URL="postgres://readonly_user:PASSWORD@db-host:5432/mydb" \
   -e MCP_ADDR=0.0.0.0:8080 \
   -e MCP_BEARER_TOKEN="$(openssl rand -hex 32)" \
   ghcr.io/eszetael/postgres-mcp-hardened:latest
 ```
+
+`--memory` is not decoration. The server idles at 7.7 MB and a normal request costs single-digit
+megabytes, but a caller can write `SELECT repeat('x', 100000000)` and drive peak memory to 400 MB —
+not through the result, which stays bounded at 300 bytes, but through the cost guard's own
+`EXPLAIN`, which PostgreSQL fills with the constant it folded while planning. That is a named
+residual risk in [`THREAT_MODEL.md`](THREAT_MODEL.md), with the three repairs that were tried and
+what each one broke. Until it is closed, the memory limit is the thing that holds, so set one:
+`--memory` here, `MemoryMax=` under systemd.
 
 `MCP_ADDR` must bind `0.0.0.0` and not `127.0.0.1`, or the server listens on an interface that only
 exists inside the container and the published port answers nothing. The other easy one: `localhost`
