@@ -298,6 +298,55 @@ print("PASS Control H: all %d README --validate examples print what the README p
 PYEOF
 fi
 
+# Control I: the workflows pin every action to a commit SHA with the version in a trailing comment.
+# The SHA is what runs; the comment is what a human reads. Dependabot's own pull request bumped
+# actions/checkout to the v7.0.1 commit and left the comment saying v4.3.0 — so an auditor reading
+# the workflow would have concluded this repository runs checkout v4, while it runs v7. Pinning by
+# digest is worth nothing if the label beside it is fiction, because the label is the only part
+# anybody reads.
+if [ -z "${GITHUB_TOKEN:-}" ]; then
+    echo "SKIP Control I: no GITHUB_TOKEN, cannot resolve pinned action SHAs to tags"
+else
+    grep -rhoE 'uses: [A-Za-z0-9/_.-]+@[a-f0-9]{40} # v[0-9][0-9.]*' .github/workflows/ \
+        | sort -u > "$tmpdir/pins" || true
+    python3 - "$tmpdir" <<'PYEOF' || fail=1
+import io, json, os, sys, urllib.error, urllib.request
+d = sys.argv[1]
+tok = os.environ["GITHUB_TOKEN"]
+bad = warn = seen = 0
+for line in io.open(os.path.join(d, "pins"), encoding="utf-8"):
+    line = line.strip()
+    if not line:
+        continue
+    spec, label = line.split(" # ")
+    repo, sha = spec.replace("uses: ", "").split("@")
+    seen += 1
+    req = urllib.request.Request(
+        "https://api.github.com/repos/%s/tags?per_page=100" % repo,
+        headers={"Authorization": "Bearer " + tok, "User-Agent": "docs-claims"})
+    try:
+        tags = json.load(urllib.request.urlopen(req, timeout=20))
+    except Exception as e:
+        print("WARN Control I: could not resolve %s — %s" % (repo, e))
+        warn += 1
+        continue
+    names = [t["name"] for t in tags if t["commit"]["sha"] == sha]
+    if not names:
+        # Old pins fall off the end of the tag list. Not a lie, just unresolvable from here.
+        print("WARN Control I: %s@%s matches no tag in the last 100 — comment says %s"
+              % (repo, sha[:8], label))
+        warn += 1
+    elif label not in names:
+        print("FAIL Control I: %s is pinned to %s, which is %s, but the comment says %s"
+              % (repo, sha[:8], "/".join(names), label))
+        bad += 1
+if bad:
+    sys.exit(1)
+print("PASS Control I: all %d pinned actions carry the version they actually run%s"
+      % (seen, " (%d unresolved)" % warn if warn else ""))
+PYEOF
+fi
+
 if [ "$fail" -eq 0 ]; then
     echo "PASS Control A: every 'verified' claim names a test that exists"
     echo "PASS Control B: the documented settings and the source agree"

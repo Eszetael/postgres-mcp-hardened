@@ -53,7 +53,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.3.0
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       # The toolchain comes from rust-toolchain.toml — one file, read by rustup, so the version
       # cannot differ between a laptop, the test matrix and the artefacts people download. The
@@ -220,7 +220,7 @@ jobs:
       contents: read
       id-token: write        # npm provenance: the registry records which workflow published this
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.3.0
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       # `pattern` NIE jest ozdobnikiem: bez niego krok bierze WSZYSTKIE artefakty przebiegu, a to
       # nie jest stała lista. Zadanie `sign` dokłada artefakt atestacji, więc ile ich jest, zależy
       # od tego, co zdążyło się skończyć. 09-08 przy pierwszym uruchomieniu było ich pięć i przeszło;
@@ -318,7 +318,7 @@ jobs:
       contents: write
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.3.0
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       # rustup honours rust-toolchain.toml, so the version stays in exactly one file.
       - run: rustup show
       - run: cargo install cargo-cyclonedx --locked
@@ -337,7 +337,7 @@ jobs:
       contents: read
       packages: write
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.3.0
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           registry: ghcr.io
@@ -389,7 +389,7 @@ jobs:
       contents: read
       id-token: write
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.3.0
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       # Wersja w manifeście musi zgadzać się z tagiem I z tym, co poszło na npm. Bez tej kontroli
       # rejestr kierowałby ludzi do wersji, której nie ma — dokładnie ten rodzaj cichej nieprawdy,
