@@ -26,3 +26,9 @@ deny	ROLLBACK	.
 deny	ABORT	.
 allow	SELECT 1 AS x FROM {{T2}} LIMIT 1	reading still works
 allow	WITH x AS (SELECT 1 AS x FROM {{T2}} LIMIT 1) SELECT * FROM x	so does a read-only CTE
+deny	SELECT cron.schedule('nightly', '0 0 * * *', 'DROP TABLE users')	round 0.1.7: pg_cron lives in its own schema, so its names matched no pg_* family and this was ALLOWED
+deny	SELECT cron.schedule_in_database('j', '0 0 * * *', 'DELETE FROM t', 'postgres')	the same, aimed at another database
+deny	SELECT cron.unschedule('nightly')	removing somebody else's job is a write too
+deny	SELECT cron.alter_job(1, schedule := '0 0 * * *')	.
+deny	SELECT CRON.SCHEDULE('a', 'b', 'c')	the schema match must not care about case
+deny	SELECT * FROM repack.repack_table('t')	pg_repack rewrites the table in place

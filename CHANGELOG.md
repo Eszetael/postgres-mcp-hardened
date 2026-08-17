@@ -76,6 +76,40 @@ that would have held.
   `DISCARD ALL`. The denial list carries the pre-15 spellings `pg_start_backup`/`pg_stop_backup`, but
   the `pg_backup_` prefix covers the modern names — verified through `--validate`, not by reading.
 
+### And then, finally, one in the guard itself
+
+Every defect above is on the surface. This one is not, and it is the reason the fresh adversarial
+round was worth running after a day of everything coming back clean:
+
+**`SELECT cron.schedule('nightly', '0 0 * * *', 'DROP TABLE users')` was allowed.** `pg_cron`
+schedules arbitrary SQL to run later, outside any transaction this server opens, as whoever owns the
+job — and it is offered by RDS, Cloud SQL, Azure, Supabase and Neon, so this is not an exotic setup.
+`repack.repack_table`, which rewrites a table in place, went through the same hole.
+
+The cause is worth stating precisely, because it says something about how the deny list was
+conceived. Every rule in `validate.rs` reasons about the *catalog namespace* — `pg_*`, `lo_*`,
+`dblink*`. Extensions do not live there. `pg_cron` installs into a schema of its own, so its
+functions are called `schedule` and `alter_job`, names that match nothing at all. The list was
+guarding a room the intruder had no reason to enter.
+
+The read-only transaction does stop these, and that was verified rather than assumed: a PL/pgSQL
+function that INSERTs raises `cannot execute INSERT in a read-only transaction` even when called
+from inside a `SELECT`. That is precisely why this was worth fixing instead of shrugging at. The
+whole argument of this project against the server it replaces is that one layer is not enough.
+
+The fix denies by *schema*, not by name, and judges function calls only. `SELECT * FROM cron.job` is
+an ordinary read of an ordinary table and stays allowed; a control that takes a legitimate read away
+and buys nothing gets switched off, and then it is protecting no one. Six cases went into the
+adversarial corpus (82 to 88) and three unit tests, one of which exists to make sure a schema that
+merely resembles a denied one — `cronjobs`, `crony` — is not caught.
+
+Running that corpus turned up one more thing, in the invitation to run it: the README's example
+omitted `ADV_TABLE2`, which then kept its default of `film`, a table from the Pagila sample
+database. Following the documentation exactly produced three "mismatches" that were a missing
+relation and nothing else. The harness now checks all three relations up front and names the wrong
+one, because a security corpus that reports a typo as a failed control teaches its reader to ignore
+the failures that matter.
+
 One more path was walked to its end before it could ship, and it was broken: **the one-click bundle
 would not have started on Windows.** The release copies `postgres-mcp-hardened.exe` into the bundle
 on that platform, while the manifest named `bin/postgres-mcp-hardened` for all three, with no

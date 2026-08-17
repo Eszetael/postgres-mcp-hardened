@@ -519,8 +519,8 @@ impl Visitor for SecurityScanner {
                 );
                 return ControlFlow::Break(());
             }
-            if let Some(name) = last_part_name(&f.name) {
-                if let Some(msg) = function_rejection(&name) {
+            if let Some(msg) = qualified_function_rejection(&f.name) {
+                {
                     self.hit = Some(msg);
                     return ControlFlow::Break(());
                 }
@@ -573,11 +573,9 @@ impl Visitor for SecurityScanner {
                     Some("a table function named by a function call — refused unread".into());
                 return ControlFlow::Break(());
             }
-            if let Some(n) = last_part_name(name) {
-                if let Some(msg) = function_rejection(&n) {
-                    self.hit = Some(msg);
-                    return ControlFlow::Break(());
-                }
+            if let Some(msg) = qualified_function_rejection(name) {
+                self.hit = Some(msg);
+                return ControlFlow::Break(());
             }
         }
         ControlFlow::Continue(())
@@ -663,6 +661,53 @@ pub enum FnVerdict {
     SideEffect,
     /// A function from the PostgreSQL catalog namespace that we do NOT know to be read-only.
     UnknownCatalog,
+}
+
+/// Extension schemas whose functions are administrative by nature.
+///
+/// The deny list below reasons about `pg_*`, `lo_*` and `dblink*` because those are the catalog
+/// namespace. Extensions do not live there: `pg_cron` installs into a schema called `cron`, so its
+/// functions are `cron.schedule`, `cron.unschedule`, `cron.alter_job` — names that match nothing
+/// here, and `cron.schedule('nightly', '0 0 * * *', 'DROP TABLE users')` was ALLOWED until 0.1.7.
+/// It writes a row scheduling arbitrary SQL to run later, outside our transaction, as the job owner.
+/// `pg_cron` is offered by RDS, Cloud SQL, Azure, Supabase and Neon, so this is not an exotic setup.
+///
+/// The read-only transaction does stop it — verified: a PL/pgSQL function that INSERTs raises
+/// `cannot execute INSERT in a read-only transaction` even when called from a `SELECT`. That is
+/// exactly why this is worth fixing rather than shrugging at: the deny list exists because the
+/// transaction is not the only thing we are willing to depend on.
+///
+/// Only FUNCTION calls are judged by schema. `SELECT * FROM cron.job` is an ordinary read of an
+/// ordinary table and stays allowed; taking that away would be a control that costs its user
+/// something and buys nothing.
+const DENY_SCHEMAS: &[&str] = &[
+    "cron",   // pg_cron — schedules SQL to run later, outside any transaction we control
+    "repack", // pg_repack — rewrites tables in place
+];
+
+/// The denied schema a qualified name sits in, if any. Compares every part except the last, so
+/// `cron.schedule` and `public.cron.schedule` are both caught.
+fn denied_schema(name: &ObjectName) -> Option<String> {
+    let n = name.0.len();
+    if n < 2 {
+        return None;
+    }
+    name.0[..n - 1].iter().find_map(|p| {
+        let v = p.as_ident()?.value.to_lowercase();
+        DENY_SCHEMAS.contains(&v.as_str()).then_some(v)
+    })
+}
+
+/// Rejection for a function named with its schema. Schema first, then the name.
+fn qualified_function_rejection(name: &ObjectName) -> Option<String> {
+    if let Some(sch) = denied_schema(name) {
+        let f = last_part_name(name).unwrap_or_else(|| "?".into());
+        return Some(format!(
+            "side-effect function: {}.{} (the {} schema is administrative)",
+            sch, f, sch
+        ));
+    }
+    function_rejection(&last_part_name(name)?)
 }
 
 /// Verdict for a function name.
@@ -1805,6 +1850,63 @@ mod adversarial {
             let res = validate_readonly(sql);
             // Logged, not asserted — useful when migrating to a new sqlparser version.
             println!("MAYBE_ALLOW: {:?} -> {:?}", sql, res);
+        }
+    }
+}
+
+#[cfg(test)]
+mod extension_schema_tests {
+    use super::*;
+
+    fn v(sql: &str) -> Result<(), String> {
+        validate_readonly(sql)
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+
+    /// `pg_cron` is offered by RDS, Cloud SQL, Azure, Supabase and Neon, and it installs into a
+    /// schema of its own. Every rule in this file was written about `pg_*`, `lo_*` and `dblink*`,
+    /// so `cron.schedule` matched nothing and was ALLOWED until 0.1.7. What it schedules runs later,
+    /// outside any transaction this server opens, as whoever owns the job.
+    #[test]
+    fn pg_cron_cannot_schedule_a_write_for_later() {
+        for sql in [
+            "SELECT cron.schedule('nightly', '0 0 * * *', 'DROP TABLE users')",
+            "SELECT cron.schedule_in_database('j', '0 0 * * *', 'DELETE FROM t', 'postgres')",
+            "SELECT cron.unschedule('nightly')",
+            "SELECT cron.alter_job(1, schedule := '0 0 * * *')",
+            "SELECT CRON.SCHEDULE('a', 'b', 'c')",
+            "SELECT * FROM repack.repack_table('t')",
+        ] {
+            let e = v(sql).expect_err(sql);
+            assert!(e.contains("side-effect function"), "{sql} -> {e}");
+        }
+    }
+
+    /// The schema rule judges FUNCTION CALLS. `cron.job` is a table, reading it is a read, and a
+    /// control that takes away a legitimate read to stop nothing is worse than no control: the
+    /// operator switches the whole thing off.
+    #[test]
+    fn reading_the_cron_tables_is_still_a_read() {
+        for sql in [
+            "SELECT * FROM cron.job",
+            "SELECT jobid, schedule FROM cron.job WHERE active",
+            "SELECT * FROM cron.job_run_details ORDER BY start_time DESC LIMIT 10",
+        ] {
+            v(sql).unwrap_or_else(|e| panic!("{sql} should be a read, got: {e}"));
+        }
+    }
+
+    /// A schema that merely resembles a denied one must not be caught, or the next person to name
+    /// a table `cronjobs` finds their reads refused with no idea why.
+    #[test]
+    fn a_similar_name_is_not_a_denied_schema() {
+        for sql in [
+            "SELECT crony.schedule('a')",
+            "SELECT * FROM cronjobs",
+            "SELECT repacked.f(1)",
+        ] {
+            v(sql).unwrap_or_else(|e| panic!("{sql} should pass, got: {e}"));
         }
     }
 }

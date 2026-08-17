@@ -15,6 +15,35 @@ ADV_TABLE2="${ADV_TABLE2:-film}"           # any readable table
 ADV_REDACT_COL="${ADV_REDACT_COL:-password}"
 
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+
+# Say plainly what is missing, instead of letting it surface as mismatching cases.
+#
+# The README invites you to point this corpus at your own database, and its example passes ADV_TABLE
+# and ADV_REDACT_COL — but not ADV_TABLE2, which then keeps its default of `film`, a table from the
+# Pagila sample database that your database almost certainly does not have. Following the
+# documentation exactly produced three "mismatches" that were nothing of the kind: `allow` cases
+# failing because the relation did not exist. A harness that reports a missing table as a failed
+# security check teaches its reader to distrust the failures that matter.
+if command -v psql >/dev/null 2>&1; then
+  for pair in "ADV_TABLE:$ADV_TABLE" "ADV_TABLE2:$ADV_TABLE2"; do
+    var=${pair%%:*}; rel=${pair#*:}
+    if ! psql "$ADV_URL" -tAc "SELECT to_regclass('$rel') IS NOT NULL" 2>/dev/null | grep -q '^t$'; then
+      echo "ERROR: $var is '$rel' and that relation is not visible in this database." >&2
+      echo "       Set it to one that is: $var=<your table> $0" >&2
+      exit 2
+    fi
+  done
+  if ! psql "$ADV_URL" -tAc \
+      "SELECT count(*) FROM information_schema.columns WHERE table_name = '$ADV_TABLE' AND column_name = '$ADV_REDACT_COL'" \
+      2>/dev/null | grep -qv '^0$'; then
+    echo "ERROR: ADV_REDACT_COL is '$ADV_REDACT_COL' and $ADV_TABLE has no such column." >&2
+    echo "       The redaction cases need a column to redact." >&2
+    exit 2
+  fi
+else
+  echo "NOTE: psql not found, skipping the check that $ADV_TABLE/$ADV_TABLE2 exist." >&2
+fi
+
 BIN="$PROJECT_DIR/target/release/postgres-mcp-hardened"
 if [ ! -x "$BIN" ]; then
   echo "ERROR: binary not found at $BIN" >&2

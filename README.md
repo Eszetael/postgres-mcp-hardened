@@ -663,8 +663,17 @@ which it stopped working. It runs on every build, and — because the cases are 
 placeholders rather than our fixture — you can point it at your own database:
 
 ```bash
-ADV_URL='postgres://…' ADV_TABLE=people ADV_REDACT_COL=ssn ./tests/adversarial/run.sh
+ADV_URL='postgres://…' \
+  ADV_TABLE=people ADV_TABLE2=orders ADV_REDACT_COL=ssn \
+  ./tests/adversarial/run.sh
 ```
+
+`ADV_TABLE` needs the sensitive column, `ADV_TABLE2` is any other readable table, `ADV_REDACT_COL`
+is the column to redact. All three matter: this example omitted `ADV_TABLE2` until 0.1.7, so it kept
+its default of `film` — a table from the Pagila sample database — and following the instruction
+exactly produced three "mismatches" that were only a missing relation. The harness now checks the
+three up front and says which one is wrong, because a security corpus that reports a typo as a
+failed control teaches you to ignore the failures that matter.
 
 A security claim you can only check by reading our source is a claim you have to take on trust, and
 this project's own history is the argument against that.
