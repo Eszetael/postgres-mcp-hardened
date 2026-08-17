@@ -130,7 +130,7 @@ the original never had.
 
 ## Install
 
-Three ways in, in the order most people want them.
+Five ways in, in the order most people want them.
 
 **One click**, for a client that accepts `.mcpb` bundles: download
 `postgres-mcp-hardened-<your-platform>.mcpb` from the
@@ -157,9 +157,30 @@ platform and verifies its checksum before running it.
 The connection string goes in `env`, not in `args`, on purpose: arguments show up in `ps` output and
 in shell history on a shared machine, and a database password does not belong there.
 
-**A binary from the releases page** — one static file, nothing to keep up to date, and the option to
-take if your machine has no Node at all. Every release carries builds for Linux, macOS and Windows
+**A binary from the releases page** — one file, nothing to keep up to date, and the option to take if
+your machine has no Node at all. (Not a *static* binary, as this page claimed until 0.1.7: the
+`-gnu` and macOS targets link the system C library like any other native program. There is simply
+nothing to install alongside it.) Every release carries builds for Linux, macOS and Windows
 on x86-64 and arm64, each with a checksum and a signature; verifying them is the next section.
+
+**As a container**, if that is how you run things. The image is distroless and runs as a non-root
+user, and the same signatures cover it as cover the binaries.
+
+```bash
+docker run --rm -p 127.0.0.1:8080:8080 \
+  -e DATABASE_URL="postgres://readonly_user:PASSWORD@db-host:5432/mydb" \
+  -e MCP_ADDR=0.0.0.0:8080 \
+  -e MCP_BEARER_TOKEN="$(openssl rand -hex 32)" \
+  ghcr.io/eszetael/postgres-mcp-hardened:latest
+```
+
+`MCP_ADDR` must bind `0.0.0.0` and not `127.0.0.1`, or the server listens on an interface that only
+exists inside the container and the published port answers nothing. The other easy one: `localhost`
+in `DATABASE_URL` means *the container*, not your machine, so a PostgreSQL running on the host needs
+`host.docker.internal` (Docker Desktop) or the host's address on the bridge (`172.17.0.1` by default
+on Linux). Both of these were walked end to end against the published image before being written
+here, including that a read returns rows and `DROP TABLE` comes back as
+`-32602 non-read-only statement: Drop`.
 
 **From source** — `cargo build --release` in a clone. Not `cargo install`: this crate is not on
 crates.io, and an instruction that fails is worse than one that is missing.
@@ -268,7 +289,7 @@ reproduced against this server; here is how each behaves:
 | One database per instance, because the connection string is a command-line argument | `MCP_DATABASE_URLS="prod=…;dev=…"` serves several databases from one server; every tool takes an optional `database`, and resources span all of them |
 | `no pg_hba.conf entry … SSL off` | The error says the server requires TLS and names the fix (`?sslmode=require`) |
 | Read-only bypassed by injecting `COMMIT` / `END` | Rejected — the multi-statement gate works on tokens, before the parser, and `COMMIT` alone is refused as a write |
-| `spawn npx ENOENT`, Node version problems | A single static binary; no Node, no npx, no `node_modules` |
+| `spawn npx ENOENT`, Node version problems | A single native binary; no Node, no npx, no `node_modules` |
 | Hangs indefinitely against RDS with no output or error | Bounded: an unreachable host answers in ~8 s with the reason, never silently |
 | `self-signed certificate in certificate chain` | Point `MCP_SSLROOTCERT` at the CA bundle; the error names that variable |
 | Connection string only as a command-line argument | `DATABASE_URL` **or** the positional argument — the original invocation keeps working |
@@ -319,7 +340,7 @@ The ones we deliberately built against:
 Answers to the questions people actually asked about the deprecated server, so nobody has to open
 an issue to find them.
 
-**`spawn npx ENOENT` / "which Node version do I need?"** — none. This is a single static binary.
+**`spawn npx ENOENT` / "which Node version do I need?"** — none. This is a single native binary, with no runtime to install beside it.
 Download it from the releases page and point your client
 at the file. There is no `node_modules`, no `npx`, nothing to keep up to date.
 
