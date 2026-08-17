@@ -223,6 +223,38 @@ else
     fi
 fi
 
+# Control G: numbers we quote about OTHER people's npm packages. The README's opening sentence —
+# the one directories copy verbatim — said "~476k downloads a month" while npm said 437,210. Nobody
+# had lied; the figure was measured once and then quietly aged, which is how every stale claim
+# starts. A number about the outside world is only true on the day it is checked, so it gets
+# checked. Drift beyond the tolerance is a FAIL, not a warning: the sentence is our lead argument.
+#
+# Tolerance is 8%. npm download counts move a few percent week to week on their own, and a check
+# that fires on ordinary noise gets muted, which costs more than it saves.
+grep -oE '[0-9]+k downloads a month' README.md | head -1 > "$tmpdir/claimed" || true
+if ! curl -sf -m 15 -o "$tmpdir/npm.json" \
+        "https://api.npmjs.org/downloads/point/last-month/@modelcontextprotocol/server-postgres"; then
+    echo "WARN Control G: npm unreachable — the download figure went unchecked this run"
+else
+    python3 - "$tmpdir" <<'PYEOF' || fail=1
+import io, json, os, re, sys
+d = sys.argv[1]
+claimed_raw = io.open(os.path.join(d, "claimed"), encoding="utf-8").read().strip()
+if not claimed_raw:
+    print("FAIL Control G: README no longer states a download figure in the expected form")
+    sys.exit(1)
+claimed = int(re.match(r"(\d+)k", claimed_raw).group(1)) * 1000
+actual = json.load(io.open(os.path.join(d, "npm.json"), encoding="utf-8"))["downloads"]
+drift = abs(claimed - actual) / actual
+if drift > 0.08:
+    print("FAIL Control G: README claims %s for the archived server, npm reports %s (%.0f%% off)"
+          % (claimed_raw, format(actual, ","), drift * 100))
+    sys.exit(1)
+print("PASS Control G: the download figure matches npm today (%s claimed, %s reported)"
+      % (claimed_raw, format(actual, ",")))
+PYEOF
+fi
+
 if [ "$fail" -eq 0 ]; then
     echo "PASS Control A: every 'verified' claim names a test that exists"
     echo "PASS Control B: the documented settings and the source agree"
