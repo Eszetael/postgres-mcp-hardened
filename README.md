@@ -1,12 +1,31 @@
 # postgres-mcp-hardened
 
-> ### 🚧 Version 0.1.6 — on every channel, not yet used by anyone but us
+> ### 🚧 Version 0.1.7 — the release where the guard itself turned out to have holes
 >
 > Published: binaries for five platforms with checksums, Sigstore signatures and build provenance;
-> an image on `ghcr.io` for amd64 and arm64; a package on npm; and an entry in the official MCP
-> registry. Five of those versions went out in a single day, because three of them were spent
-> learning the registry's ownership rules one refusal at a time — that story is in
-> [`CHANGELOG.md`](CHANGELOG.md).
+> `.mcpb` bundles for one-click install (new here, and the Windows one would not have started before
+> this release); an image on `ghcr.io` for amd64 and arm64; a package on npm; and an entry in the
+> official MCP registry.
+>
+> **0.1.7 closes six ways past the read-only and redaction controls, all of them demonstrated against
+> a running server rather than argued.** Four went around column names instead of dressing them up:
+> `get_raw_page` returned 8,192 bytes of a table with the redacted values in plain ASCII;
+> `SELECT * FROM pg_stats` returned real column values without naming the column at all; TOAST and
+> `pg_largeobject` are the same door from the storage side. The other two were writes through
+> extensions the deny list could not see, because it reasons about the `pg_*` catalog namespace and
+> `pg_cron` lives in a schema of its own — `cron.schedule('nightly','0 0 * * *','DROP TABLE users')`
+> was allowed. The pattern underneath all four redaction findings is now written down where the
+> feature is described: a column filter protects columns, so anything reading *underneath* columns is
+> outside what it can promise.
+>
+> One limit was found and **not** closed, and is named in [`THREAT_MODEL.md`](THREAT_MODEL.md) with
+> the three repairs that were tried and what each one broke: the cost guard is the most expensive part
+> of a request, because `EXPLAIN VERBOSE` prints constants the planner folded.
+>
+> Twelve claims this page used to make about itself were measured and found wrong — the download
+> figure, the binary size, the memory, the per-query overhead, the test count, and one that was off by
+> a whole MCP revision. Each is corrected below with its method, and five new gates check the classes
+> they belonged to on every commit.
 >
 > **What is actually proven**, in the sense that something other than an opinion checks it: the
 > read-only rules (a fuzz harness over 200k mutations, an adversarial corpus of every bypass found
