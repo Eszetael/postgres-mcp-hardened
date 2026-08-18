@@ -326,6 +326,44 @@ code=$(curl -s -o /dev/null -w '%{http_code}' -m 10 -H content-type:application/
 [ "$code" = 401 ] && ok "request without a token is refused" || no "token not enforced" "got $code"
 code=$(curl -s -o /dev/null -w '%{http_code}' -m 10 -H content-type:application/json -H 'authorization: Bearer t0ken' "http://127.0.0.1:$PORT/mcp" -d '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}')
 [ "$code" = 200 ] && ok "request with the token is served" || no "valid token rejected" "got $code"
+# RFC 7235 §2.1 makes the auth-scheme case-insensitive, and RFC 6750 spells it as a quoted string,
+# which ABNF reads the same way. Until 0.1.7 this server answered 200 to `Bearer` and 401 to
+# `bearer` — never a way in, but a way to be told "authentication failed" while holding a valid
+# token, which is a bug somebody diagnoses for twenty minutes before going elsewhere.
+for spelling in bearer BEARER BeArEr; do
+  code=$(curl -s -o /dev/null -w '%{http_code}' -m 10 -H content-type:application/json \
+    -H "authorization: $spelling t0ken" "http://127.0.0.1:$PORT/mcp" \
+    -d '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}')
+  [ "$code" = 200 ] && ok "the scheme spelled '$spelling' is accepted, as the RFC requires" \
+    || no "scheme '$spelling' rejected" "got $code"
+done
+# `1*SP` in the grammar: one space is required, more are allowed.
+code=$(curl -s -o /dev/null -w '%{http_code}' -m 10 -H content-type:application/json \
+  -H "authorization: Bearer    t0ken" "http://127.0.0.1:$PORT/mcp" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}')
+[ "$code" = 200 ] && ok "more than one space before the token is accepted" || no "1*SP not honoured" "got $code"
+# And the things that must still fail.
+for bad in "Bearer wrong" "Bearer t0ke" "Bearer t0kenX" "Basic dDBrZW4=" "Bearer"; do
+  code=$(curl -s -o /dev/null -w '%{http_code}' -m 10 -H content-type:application/json \
+    -H "authorization: $bad" "http://127.0.0.1:$PORT/mcp" \
+    -d '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}')
+  [ "$code" = 401 ] && ok "'$bad' is still refused" || no "'$bad' was accepted" "got $code"
+done
+# JSON-RPC 2.0 §4: an id, when present, MUST be a string, a number or null. Objects, arrays and
+# booleans were accepted and echoed back until 0.1.7 — harmless, but inconsistent with refusing
+# `jsonrpc: "1.0"` and a missing `method` in the same function.
+for badid in '{"a":1}' '[1,2]' 'true'; do
+  r=$(curl -s -m 10 -H content-type:application/json -H 'authorization: Bearer t0ken' \
+    "http://127.0.0.1:$PORT/mcp" -d "{\"jsonrpc\":\"2.0\",\"id\":$badid,\"method\":\"tools/list\"}")
+  case "$r" in *'-32600'*) ok "an id of $badid is an Invalid Request" ;;
+               *) no "id $badid accepted" "$(printf '%s' "$r" | head -c 90)" ;; esac
+done
+for goodid in '"abc"' '7' 'null'; do
+  r=$(curl -s -m 10 -H content-type:application/json -H 'authorization: Bearer t0ken' \
+    "http://127.0.0.1:$PORT/mcp" -d "{\"jsonrpc\":\"2.0\",\"id\":$goodid,\"method\":\"tools/list\"}")
+  case "$r" in *'-32600'*) no "a legal id $goodid was refused" "$(printf '%s' "$r" | head -c 90)" ;;
+               *) ok "an id of $goodid is accepted" ;; esac
+done
 stop
 
 section "Connection pooling"

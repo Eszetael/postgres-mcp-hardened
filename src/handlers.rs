@@ -16,6 +16,21 @@ pub(crate) fn handle_request(req: &Value) -> Value {
         return json!({ "error": { "code": -32600, "message": "Invalid Request: jsonrpc must be 2.0" } });
     }
 
+    // JSON-RPC 2.0 §4: an `id`, when present, "MUST contain a String, Number, or NULL value".
+    // Objects, arrays and booleans are not identifiers. This server accepted all three and echoed
+    // them back until 0.1.7 — harmless in itself, since the id is only mirrored, but inconsistent
+    // with rejecting `jsonrpc: "1.0"` and a missing `method` two lines above. A protocol server that
+    // is strict about the parts it happened to think of and lenient elsewhere is not strict, it is
+    // arbitrary, and the client cannot tell which rule it is meeting.
+    //
+    // An ABSENT id is a notification and stays legal — that is a different thing from an invalid one.
+    if let Some(id) = req.get("id") {
+        if !(id.is_string() || id.is_number() || id.is_null()) {
+            return json!({ "error": { "code": -32600,
+                "message": "Invalid Request: id must be a string, a number or null (JSON-RPC 2.0 §4)" } });
+        }
+    }
+
     let method = match req.get("method").and_then(|v| v.as_str()) {
         Some(m) => m,
         None => {
@@ -1165,5 +1180,45 @@ mod tool_surface_tests {
             "these tools never name another tool, so an agent cannot tell when to use something else: {:?}",
             lonely
         );
+    }
+}
+
+#[cfg(test)]
+mod jsonrpc_id_tests {
+    use super::*;
+
+    fn code(req: Value) -> Option<i64> {
+        handle_request(&req)
+            .get("error")
+            .and_then(|e| e.get("code"))
+            .and_then(|c| c.as_i64())
+    }
+
+    /// JSON-RPC 2.0 §4. Accepted and echoed back until 0.1.7.
+    #[test]
+    fn an_id_that_is_not_a_string_number_or_null_is_an_invalid_request() {
+        for id in [json!({"a": 1}), json!([1, 2]), json!(true), json!(false)] {
+            let req = json!({"jsonrpc": "2.0", "id": id, "method": "tools/list"});
+            assert_eq!(code(req), Some(-32600), "id {id} should be refused");
+        }
+    }
+
+    /// The legal shapes stay legal, and an absent id is a notification rather than a bad one.
+    #[test]
+    fn strings_numbers_null_and_absence_are_all_fine() {
+        for req in [
+            json!({"jsonrpc": "2.0", "id": "abc", "method": "tools/list"}),
+            json!({"jsonrpc": "2.0", "id": 7, "method": "tools/list"}),
+            json!({"jsonrpc": "2.0", "id": -1, "method": "tools/list"}),
+            json!({"jsonrpc": "2.0", "id": 1.5, "method": "tools/list"}),
+            json!({"jsonrpc": "2.0", "id": null, "method": "tools/list"}),
+            json!({"jsonrpc": "2.0", "method": "tools/list"}),
+        ] {
+            assert_ne!(
+                code(req.clone()),
+                Some(-32600),
+                "{req} should not be refused for its id"
+            );
+        }
     }
 }
