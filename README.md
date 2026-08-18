@@ -1,6 +1,6 @@
 # postgres-mcp-hardened
 
-> ### 🚧 Version 0.1.8 — a security release, and how it was found
+> ### 🚧 Version 0.1.9 — a security release, and how it was found
 >
 > Published: binaries for five platforms with checksums, Sigstore signatures and build provenance;
 > `.mcpb` bundles for one-click install; an image on `ghcr.io` for amd64 and arm64; a package on npm;
@@ -27,6 +27,12 @@
 > bytes of SQL make PostgreSQL fold a constant into 5.9 GB of backend memory during planning, and a
 > five second `statement_timeout` does not stop it. 0.1.8 refuses the obvious shapes; the general
 > problem is upstream of anything this server can do.
+>
+> **0.1.9 exists because the 0.1.8 fix had a one-word bypass**: `chr(120)` instead of `'x'` produced
+> the same gigabyte plan, because the size estimate could not read a function call and gave up, and
+> giving up meant allowing. It was caught within the hour by running the *published* build through
+> `npx` from a clean container rather than trusting the local one. The rule now is the one PostgreSQL
+> uses to decide whether to fold at all: is the expression constant.
 >
 > Everything here is 0.1.x because nobody outside this project has run it against their own data.
 
