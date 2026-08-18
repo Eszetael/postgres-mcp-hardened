@@ -516,6 +516,13 @@ pub(crate) fn cost_guard(sql: &str, max_cost: f64, db: Option<&str>) -> Result<(
     //     32 for `repeat('x', 1000000000)` — the planner's default guess for text, not the folded
     //     size. It cannot see this coming either.
     //
+    // ⚠️ 2026-08-18: measured again, and the earlier note put the cost in the wrong process.
+    // PostgreSQL folds the constant in `eval_const_expressions` while PLANNING, so the backend pays
+    // ~200 MB (`VmHWM`, one session, `repeat('x',100000000)`) even with no VERBOSE at all — 31.8 MB
+    // baseline, 210 MB without VERBOSE, 374 MB with. Dropping the flag would not have fixed the
+    // resource problem, only our share of it. Nothing on this side reaches memory the database
+    // spends before the guard has decided anything.
+    //
     // What actually bounds it today is the memory limit on the process: a container `--memory` cap,
     // or a systemd `MemoryMax`. THREAT_MODEL.md says so under its own heading rather than leaving it
     // in a comment only the next maintainer would find.

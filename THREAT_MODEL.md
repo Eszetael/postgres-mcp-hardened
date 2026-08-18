@@ -110,6 +110,30 @@ server checks each one rather than assuming it.
   The *result* is bounded and always was: the row is omitted server-side and 300 bytes come back.
   It is the guard, not the answer, that grows.
 
+  **Correction, 2026-08-18: most of that cost is not ours, and dropping `VERBOSE` would not remove
+  it.** PostgreSQL folds the constant in `eval_const_expressions` while planning, before any plan
+  text exists. Measured as `VmHWM` of the PostgreSQL backend, one session, `repeat('x', 100000000)`:
+
+  | statement | backend peak |
+  |---|---|
+  | `EXPLAIN SELECT repeat('x', 10)` (baseline) | 31.8 MB |
+  | `EXPLAIN SELECT repeat('x', 100000000)` — no VERBOSE | **210 MB** |
+  | `EXPLAIN (VERBOSE) SELECT repeat('x', 100000000)` | 374 MB |
+
+  So the earlier framing was wrong about where the money goes. `VERBOSE` roughly doubles it and adds
+  the plan text we then parse, but a caller can spend 200 MB of the database's memory through a
+  guard that has not yet decided anything, and no client-side repair reaches that. The only fix that
+  would is refusing the statement before it is planned at all.
+
+  That makes a fourth attempt worth stating, since it is the one a reader will suggest first:
+  **reject an integer literal above a threshold in the expansion functions** (`repeat`, `lpad`,
+  `rpad`, `generate_series`) at the AST, before `EXPLAIN`. It is the only option that also protects
+  the backend. It was not taken because it is a name-based filter over a function list, which is the
+  exact shape of control this project criticises three sections above, and it is trivially routed
+  around by arithmetic (`repeat('x', 10000 * 10000)`) or by a value the planner folds from somewhere
+  else. Cheap, partial, and honest about being partial: it may still be worth doing, and it is not
+  done yet.
+
   Three repairs were tried and each cost more than it saved, which is why this is written down
   instead of quietly patched:
 
