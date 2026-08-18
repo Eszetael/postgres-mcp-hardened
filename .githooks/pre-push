@@ -27,6 +27,14 @@ run "cargo fmt --check"        cargo fmt --check
 run "cargo clippy -D warnings" cargo clippy --release --all-targets -- -D warnings
 run "cargo test"               cargo test --release
 [ -x tests/docs_claims.sh ] && run "documentation claims" ./tests/docs_claims.sh
+# The version lives in five places: Cargo.toml, Cargo.lock, mcpb/manifest.json, and TWICE in
+# server.json (the field, and the image tag the MCP registry pulls). Bumping four of them and
+# tagging cost a failed 0.1.8 release: `checks / audit` caught it, but only after the tag existed.
+# These three scripts are seconds, they already existed, and they were only wired into CI.
+for s in scripts/check_registry_identity.py scripts/check_prerelease_guards.py \
+         scripts/check_release_permissions.py; do
+  [ -f "$s" ] && run "$(basename "$s" .py)" python3 "$s"
+done
 
 if [ "$fail" -ne 0 ]; then
   echo
