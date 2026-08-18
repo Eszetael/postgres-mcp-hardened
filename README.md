@@ -102,27 +102,42 @@ and one this server now adopts as well.
 
 The problem is that it is the *only* defence, and it is not complete:
 
-- **A read-only transaction does not block every write.** PostgreSQL executes
-  `pg_import_system_collations()` inside `SET TRANSACTION READ ONLY` without raising `SQLSTATE 25006`,
-  and the rows it writes are committed. `gin_clean_pending_list()` rewrites index structures;
-  `pg_backup_start()` puts the server into backup mode and survives `DISCARD ALL`. The rollback saves
-  you from the first case, not from the side effects that live outside transaction semantics.
+- **A read-only transaction does not block every write, and a rollback does not undo everything it
+  lets through.** Two separate facts, and the second is the one that matters.
 
-  Check it yourself rather than believing us — but note the precondition, because without it you will
-  see a zero and conclude we made this up. The function imports the collations that are *missing*, so
-  on an untouched database it writes nothing and still raises no error. Remove some first:
+  `gin_clean_pending_list()` runs inside `SET TRANSACTION READ ONLY` and its work **survives the
+  rollback**: an index with 25 pending pages has 0 after the transaction is rolled back.
+  `pg_backup_start()` puts the session into backup state, survives `DISCARD ALL`, and with the
+  default `fast => false` waits for a spread checkpoint while forcing `full_page_writes` on, which
+  is a real cost on a busy server. `pg_import_system_collations()` also executes without raising
+  `SQLSTATE 25006`, but be careful how much weight you put on it: **that one IS undone by a
+  rollback**, so against a server that always rolls back it is a curiosity rather than a bypass.
+
+  Reproduce it, but read the two preconditions first, because without them you will see a zero or an
+  error and conclude we made this up. All three need superuser or ownership of the object. And the
+  import only restores collations that are *missing*, so something has to be removed first:
 
   ```sql
-  DELETE FROM pg_collation WHERE collname IN (SELECT collname FROM pg_collation ORDER BY oid DESC LIMIT 200);
+  -- as superuser, and note these are three separate transactions: a statement that errors
+  -- inside a block aborts the whole block, so they cannot be run as one.
+  DELETE FROM pg_collation WHERE oid IN (SELECT oid FROM pg_collation ORDER BY oid DESC LIMIT 200);
+
   BEGIN READ ONLY;
-    DELETE FROM pg_collation WHERE collname LIKE 'zu%';  -- ERROR: cannot execute DELETE in a read-only transaction
+    DELETE FROM pg_collation WHERE collname LIKE 'zu%';  -- ERROR: cannot execute DELETE ...
+  ROLLBACK;
+
+  BEGIN READ ONLY;
     SELECT pg_import_system_collations('pg_catalog');    -- 200, no error
-  COMMIT;                                                -- and the 200 rows are there
+  COMMIT;                                                -- and now the rows are there
   ```
 
-  Both statements are writes and both are inside the same read-only transaction. One is refused and
-  one is not. That asymmetry — not any particular row count — is the reason this server does not
-  treat the transaction as its only defence.
+  Both are writes, both are inside a read-only transaction, and one is refused while the other is
+  not. That asymmetry is why this server does not treat the transaction as its only defence. It is
+  also why the *role* matters more than any of this: every example above needs privileges a
+  least-privilege reader does not have, and this server refuses to start as a network listener when
+  the role it was given can write. What it cannot control is which connection string somebody pastes
+  into a client config, and the usual answer is whichever one they already had.
+
 - **No statement timeout, no cost guard, no row limit** — one query can run until the server gives up.
 - **No authentication, no audit trail, no handling of prompt injection** through returned row data.
 - One source file of 143 lines, unmaintained since December 2024, no test suite.
