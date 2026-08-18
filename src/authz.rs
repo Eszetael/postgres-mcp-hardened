@@ -39,6 +39,33 @@ pub(crate) static AUTH_CONFIG: Lazy<Option<AuthConfig>> = Lazy::new(|| {
     })
 });
 
+/// The token out of an `Authorization: Bearer …` header, per RFC 7235 and RFC 6750.
+///
+/// Written out because `strip_prefix("Bearer ")` is not what those documents say, and the difference
+/// is visible from outside. RFC 7235 §2.1: "The scheme is case-insensitive." RFC 6750's grammar is
+/// `credentials = "Bearer" 1*SP b64token`, and a quoted string in ABNF is case-insensitive too, so
+/// `bearer`, `BEARER` and `BeArEr` are all correct spellings, as is more than one space before the
+/// token. Verified 2026-08-18: this server answered 200 to `Bearer` and 401 to `bearer`.
+///
+/// It fails closed, so it was never a way in — it is a way to be told "authentication failed" while
+/// holding a valid token and a correctly formed request, which is the kind of thing somebody
+/// diagnoses for twenty minutes and then goes to use something else.
+///
+/// The token itself is returned with leading spaces removed and nothing else touched. Trailing
+/// whitespace is not this function's business: RFC 7230 §3.2.4 has the HTTP layer strip the optional
+/// whitespace around a field value before anyone sees it, so `Bearer tok ` and `Bearer tok` arrive
+/// here identical. Verified over the wire, because the alternative was to assert it in a comment.
+pub(crate) fn bearer_token(value: &str) -> Option<&str> {
+    let rest = value.strip_prefix(|c: char| c.eq_ignore_ascii_case(&'b'))?;
+    let (scheme_tail, after) = rest.split_at(rest.len().min(5));
+    if !scheme_tail.eq_ignore_ascii_case("earer") {
+        return None;
+    }
+    // `1*SP`: at least one space, and more are allowed.
+    let trimmed = after.strip_prefix(' ')?;
+    Some(trimmed.trim_start_matches(' '))
+}
+
 /// Compares two secrets without revealing the length of the expected one.
 ///
 /// The previous version short-circuited on `len() != len()`, which answers "how long is the token"
@@ -124,7 +151,7 @@ pub(crate) fn enforce_auth(
             let given = headers
                 .get("authorization")
                 .and_then(|v| v.to_str().ok())
-                .and_then(|s| s.strip_prefix("Bearer "))
+                .and_then(bearer_token)
                 .unwrap_or("");
             if !secret_eq(given, &expected) {
                 return Err((401, "invalid or missing bearer token".into(), None));
@@ -165,7 +192,7 @@ pub(crate) fn enforce_auth(
     let token = headers
         .get("authorization")
         .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.strip_prefix("Bearer "));
+        .and_then(bearer_token);
 
     let token = match token {
         Some(t) => t,
@@ -203,4 +230,61 @@ pub(crate) fn enforce_auth(
     }
 
     Ok(Some(ctx.tenant))
+}
+
+#[cfg(test)]
+mod bearer_tests {
+    use super::bearer_token;
+
+    /// RFC 7235 §2.1 makes the scheme case-insensitive and RFC 6750 spells it with a quoted string,
+    /// which ABNF also reads case-insensitively. Before 0.1.7 this server answered 200 to `Bearer`
+    /// and 401 to `bearer` — fail-closed, so never a way in, but a way to be told "authentication
+    /// failed" while holding a valid token and a correctly formed request.
+    #[test]
+    fn the_scheme_is_case_insensitive() {
+        for h in [
+            "Bearer tok",
+            "bearer tok",
+            "BEARER tok",
+            "BeArEr tok",
+            "beaRER tok",
+        ] {
+            assert_eq!(bearer_token(h), Some("tok"), "{h}");
+        }
+    }
+
+    /// `credentials = "Bearer" 1*SP b64token` — one space is required and more are allowed.
+    #[test]
+    fn one_space_is_required_and_more_are_allowed() {
+        assert_eq!(bearer_token("Bearer tok"), Some("tok"));
+        assert_eq!(bearer_token("Bearer    tok"), Some("tok"));
+        assert_eq!(
+            bearer_token("Bearer"),
+            None,
+            "no space at all is not a credential"
+        );
+        assert_eq!(
+            bearer_token("Bearer "),
+            Some(""),
+            "a space and nothing after it is an empty token, which never matches"
+        );
+    }
+
+    /// Anything that is not this scheme stays unrecognised. A near-miss must not fall through to
+    /// "no token" in a way that could be read as "no authentication required" — the caller of this
+    /// function treats `None` as unauthenticated, which is the safe direction.
+    #[test]
+    fn other_schemes_and_near_misses_are_not_bearer() {
+        for h in [
+            "Basic dG9r",
+            "Bear tok",
+            "Bearerr tok",
+            "Bearertok",
+            "XBearer tok",
+            "",
+            "tok",
+        ] {
+            assert_eq!(bearer_token(h), None, "{h}");
+        }
+    }
 }

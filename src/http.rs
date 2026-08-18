@@ -193,7 +193,7 @@ pub(crate) async fn metrics_handler(headers: HeaderMap) -> impl IntoResponse {
             let given = headers
                 .get("authorization")
                 .and_then(|v| v.to_str().ok())
-                .and_then(|s| s.strip_prefix("Bearer "))
+                .and_then(crate::authz::bearer_token)
                 .unwrap_or("");
             if !crate::secret_eq(given, &expected) {
                 return deny("unauthorized");
