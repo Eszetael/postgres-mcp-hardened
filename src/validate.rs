@@ -778,7 +778,7 @@ const EXTENSION_WRITE_FUNCS: &[&str] = &[
 /// functions are `cron.schedule`, `cron.unschedule`, `cron.alter_job` — names that match nothing
 /// here, and `cron.schedule('nightly', '0 0 * * *', 'DROP TABLE users')` was ALLOWED until 0.1.7.
 /// It writes a row scheduling arbitrary SQL to run later, outside our transaction, as the job owner.
-/// `pg_cron` is offered by RDS, Cloud SQL, Azure, Supabase and Neon, so this is not an exotic setup.
+/// `pg_cron` is offered by RDS, Supabase and Neon (checked against their own documentation on 2026-08-18), so this is not an exotic setup.
 ///
 /// The read-only transaction does stop it — verified: a PL/pgSQL function that INSERTs raises
 /// `cannot execute INSERT in a read-only transaction` even when called from a `SELECT`. That is
@@ -2031,7 +2031,7 @@ mod extension_schema_tests {
             .map_err(|e| e.to_string())
     }
 
-    /// `pg_cron` is offered by RDS, Cloud SQL, Azure, Supabase and Neon, and it installs into a
+    /// `pg_cron` is offered by RDS, Supabase and Neon among others, and it installs into a
     /// schema of its own. Every rule in this file was written about `pg_*`, `lo_*` and `dblink*`,
     /// so `cron.schedule` matched nothing and was ALLOWED until 0.1.7. What it schedules runs later,
     /// outside any transaction this server opens, as whoever owns the job.

@@ -83,7 +83,7 @@ round was worth running after a day of everything coming back clean:
 
 **`SELECT cron.schedule('nightly', '0 0 * * *', 'DROP TABLE users')` was allowed.** `pg_cron`
 schedules arbitrary SQL to run later, outside any transaction this server opens, as whoever owns the
-job — and it is offered by RDS, Cloud SQL, Azure, Supabase and Neon, so this is not an exotic setup.
+job — and it is offered by RDS, Supabase and Neon (checked against their own documentation on 2026-08-18), so this is not an exotic setup.
 `repack.repack_table`, which rewrites a table in place, went through the same hole.
 
 **And the same round, pushed further, found a redaction bypass — the more serious of the two.**
