@@ -100,12 +100,36 @@ server checks each one rather than assuming it.
 
 ## Residual risks, unfixed and named
 
-- **The cost guard is the most expensive part of a request, and a caller sets the price.** Found and
-  measured 2026-08-17; not closed. PostgreSQL constant-folds expressions while planning, and
-  `EXPLAIN (… VERBOSE)` prints the folded value in the plan's `Output`. So `SELECT repeat('x',
-  100000000)` produces a **200 MB plan** — the same statement without `VERBOSE` produces 579 bytes,
-  at any size — and this process peaks near **400 MB** parsing it. Peak memory is linear in a
-  constant the caller writes: 1 MB → 16 MB, 10 MB → 48 MB, 50 MB → 205 MB, 100 MB → 400 MB.
+- **The cost guard is the most expensive part of a request, and a caller sets the price.** Found
+  2026-08-17, re-measured properly 2026-08-18 after an outside review, and the first two measurements
+  were both wrong in the same direction: too small, and in the wrong process.
+
+  **Growth is not linear in the constant. It is multiplicative in the nesting depth**, and thirteen
+  more characters buy a thousand times the memory:
+
+  | statement | plan size |
+  |---|---|
+  | `SELECT repeat('x',1000)` | 1.3 kB |
+  | `SELECT repeat(repeat('x',1000),1000)` | 1 MB |
+  | `SELECT repeat(repeat(repeat('x',1000),1000),1000)` | **1 GB** |
+
+  That last one is **49 bytes of SQL**, and it costs the PostgreSQL backend **5.9 GB** of resident
+  memory (measured) and about fourteen seconds of CPU. `MAX_SQL_LEN` is 100,000 characters, which is
+  three orders of magnitude more room than the attack needs.
+
+  **`statement_timeout` does not reliably stop it.** The cost guard sets 5 s; the statement above ran
+  for 13.7 s and completed. A single large `repeat` *is* cancelled, so the interrupt check exists, but
+  it is not reached during the allocation that matters.
+
+  **The damage is to the database, not to this server.** Driven through a live server the request came
+  back as a timeout error and this process peaked at 9.9 MB. The backend still paid the 5.9 GB. Every
+  control this server has is downstream of a cost the database has already paid, which is an
+  uncomfortable shape for a component whose purpose is to protect that database.
+
+  It is also not one function. `repeat`, `lpad`, `rpad`, `||`, `format`, `array_fill`, `translate`,
+  `replace`, `encode(decode(...))` and `::text` all fold to their full size, so this is the class
+  "any IMMUTABLE function with a large result", not a list of names. Arithmetic defeats a literal
+  threshold on its own: `repeat('x', 10000 * 10000)` is folded before anyone looks at the number.
 
   The *result* is bounded and always was: the row is omitted server-side and 300 bytes come back.
   It is the guard, not the answer, that grows.

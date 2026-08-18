@@ -366,7 +366,33 @@ pub(crate) fn authority_has_extra_at(url: &str) -> bool {
 /// forever and offered `sslmode=verify-full` as the fix — advice that breaks a local PostgreSQL
 /// with no certificate. Two places judging the same fact must judge it with the same code.
 pub(crate) fn db_is_local(url: &str) -> bool {
-    url.contains("@localhost") || url.contains("@127.0.0.1") || url.contains("@[::1]")
+    // Parse the host out. The previous version matched `@localhost` anywhere in the string, which
+    // meant `postgres://u:p@real.example.com/db?application_name=@localhost` was treated as a
+    // loopback connection — and this predicate is what excuses a database connection from being
+    // encrypted. A substring search over a URL is not a host check; it is a host check that an
+    // attacker gets to write.
+    //
+    // The authority is what sits between `://` and the first `/` or `?`; the host is what follows
+    // the LAST `@` in it, because a password may contain one. A `:port` and IPv6 brackets are
+    // stripped before comparing.
+    let after_scheme = match url.split_once("://") {
+        Some((_, rest)) => rest,
+        None => url,
+    };
+    let authority = after_scheme
+        .split(['/', '?'])
+        .next()
+        .unwrap_or(after_scheme);
+    let host_port = match authority.rsplit_once('@') {
+        Some((_, h)) => h,
+        None => authority,
+    };
+    let host = if let Some(end) = host_port.strip_prefix('[').and_then(|r| r.split_once(']')) {
+        end.0
+    } else {
+        host_port.split(':').next().unwrap_or(host_port)
+    };
+    matches!(host, "localhost" | "127.0.0.1" | "::1")
 }
 
 /// The opening of every `pool_error_detail` message that means "the database never answered", as
@@ -1217,6 +1243,45 @@ mod authority_tests {
             "postgres://user:plain@localhost/db?options=-csearch_path%3Da@b",
         ] {
             assert!(!authority_has_extra_at(u), "should not be flagged: {}", u);
+        }
+    }
+}
+
+#[cfg(test)]
+mod local_host_tests {
+    use super::db_is_local;
+
+    /// The bug this replaced: `db_is_local` matched `@localhost` anywhere in the string, and this
+    /// predicate is what lets a connection skip TLS. A caller who controls any part of the URL,
+    /// including a parameter nobody thinks of as security-relevant, could dress a remote database
+    /// up as loopback.
+    #[test]
+    fn a_remote_host_cannot_be_disguised_as_loopback() {
+        for url in [
+            "postgres://u:p@real.example.com/db?application_name=@localhost",
+            "postgres://u:p@real.example.com/db?options=-c%20search_path=@127.0.0.1",
+            "postgres://u:p@evil.test/@localhost",
+            "postgres://@localhost:p@real.example.com/db",
+            "postgres://u:p@localhost.evil.com/db",
+            "postgres://u:p@notlocalhost/db",
+        ] {
+            assert!(!db_is_local(url), "{url} is NOT local");
+        }
+    }
+
+    /// And the connections that really are on this machine still are, including a password with an
+    /// `@` in it, an explicit port, and IPv6 in brackets.
+    #[test]
+    fn genuine_loopback_is_still_recognised() {
+        for url in [
+            "postgres://u:p@localhost/db",
+            "postgres://u:p@localhost:5432/db",
+            "postgres://u:p@127.0.0.1:5432/db?sslmode=disable",
+            "postgres://u:p@[::1]:5432/db",
+            "postgres://user:pa@ss@localhost/db",
+            "postgresql://u@127.0.0.1/db",
+        ] {
+            assert!(db_is_local(url), "{url} IS local");
         }
     }
 }

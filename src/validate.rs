@@ -2,8 +2,9 @@
 //! We trust the AST (sqlparser), not regexes: comments and obfuscation disappear when the tree is built.
 use once_cell::sync::Lazy;
 use sqlparser::ast::{
-    Expr, FunctionArg, FunctionArgExpr, FunctionArguments, LimitClause, ObjectName, Query,
-    SelectItem, SetExpr, Statement, TableAlias, TableFactor, Value, Visit, Visitor,
+    BinaryOperator, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, JoinConstraint,
+    JoinOperator, LimitClause, ObjectName, Query, SelectItem, SetExpr, Statement, TableAlias,
+    TableFactor, Value, Visit, Visitor,
 };
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
@@ -50,11 +51,16 @@ pub enum ValidationError {
     Redacted(String),
     /// A construct that would carry a redacted column past the name-based checks.
     RedactionEvasion(String),
+    /// A constant the planner would materialise into something this server could never return.
+    /// Separate from `NotReadOnly` because it is not about writing: telling an operator that
+    /// `repeat('x', 100000000)` is "a non-read-only statement" sends them looking for the write.
+    OversizedConstant(String),
 }
 
 impl fmt::Display for ValidationError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::OversizedConstant(m) => write!(f, "{}", m),
             Self::NotParseable(e) => write!(f, "SQL parse error: {}", e),
             Self::MultiStatement => write!(f, "multiple statements are forbidden"),
             Self::NotReadOnly(s) => write!(f, "non-read-only statement: {}", s),
@@ -146,8 +152,12 @@ pub fn validate_readonly(sql: &str) -> Result<(), ValidationError> {
         redaction_on: !row_refs.is_empty() || redaction_configured(),
         row_refs,
         evasion: None,
+        oversized: None,
     };
     let _ = ast[0].visit(&mut scanner);
+    if let Some(m) = scanner.oversized {
+        return Err(ValidationError::OversizedConstant(m));
+    }
     if let Some(c) = scanner.redacted {
         return Err(ValidationError::Redacted(c));
     }
@@ -368,6 +378,7 @@ struct SecurityScanner {
     redacted: Option<String>,
     /// Table names and aliases in this statement, lower-cased. Only collected when redaction is on.
     row_refs: std::collections::HashSet<String>,
+    oversized: Option<String>,
     evasion: Option<String>,
     redaction_on: bool,
 }
@@ -380,6 +391,75 @@ struct SecurityScanner {
 fn alias_renames_columns(alias: Option<&TableAlias>) -> bool {
     alias.is_some_and(|a| !a.columns.is_empty())
 }
+impl SecurityScanner {
+    /// A join can name a redacted column without ever writing it as an expression.
+    ///
+    /// `SELECT count(*) FROM people JOIN (SELECT '123-45-6789' AS ssn) g USING (ssn)` was ALLOWED
+    /// until 0.1.8, and it is a working equality oracle: the count says whether that value is in the
+    /// table. Unlike the reads that go *underneath* columns (raw pages, planner statistics, TOAST),
+    /// this one needs no privileges at all — an ordinary least-privilege reader can run it.
+    ///
+    /// The column list of `USING` is a `Vec<Ident>` inside `JoinConstraint`, not an `Expr`, so
+    /// `pre_visit_expr` never saw it. `NATURAL JOIN` is worse: it names nothing, and which columns
+    /// it joins on depends on the schema, which this validator does not have. Both are refused while
+    /// redaction is configured. A natural join is a poor idea in a generated query anyway, because
+    /// adding a column to a table silently changes what it means.
+    fn join_constraint_evasion(&mut self, q: &Query) -> ControlFlow<()> {
+        if !self.redaction_on {
+            return ControlFlow::Continue(());
+        }
+        let SetExpr::Select(sel) = q.body.as_ref() else {
+            return ControlFlow::Continue(());
+        };
+        for twj in &sel.from {
+            for join in &twj.joins {
+                let constraint = match &join.join_operator {
+                    JoinOperator::Join(c)
+                    | JoinOperator::Inner(c)
+                    | JoinOperator::Left(c)
+                    | JoinOperator::LeftOuter(c)
+                    | JoinOperator::Right(c)
+                    | JoinOperator::RightOuter(c)
+                    | JoinOperator::FullOuter(c)
+                    | JoinOperator::Semi(c)
+                    | JoinOperator::LeftSemi(c)
+                    | JoinOperator::RightSemi(c)
+                    | JoinOperator::Anti(c)
+                    | JoinOperator::LeftAnti(c)
+                    | JoinOperator::RightAnti(c) => c,
+                    _ => continue,
+                };
+                match constraint {
+                    JoinConstraint::Using(cols) => {
+                        for c in cols {
+                            let n = last_part_name(c).unwrap_or_default();
+                            if is_redacted(&n) {
+                                self.evasion = Some(format!(
+                                    "joining on the redacted column `{}` with USING — the join \
+                                     answers whether a value is present without ever selecting it",
+                                    n
+                                ));
+                                return ControlFlow::Break(());
+                            }
+                        }
+                    }
+                    JoinConstraint::Natural => {
+                        self.evasion = Some(
+                            "a NATURAL JOIN while redaction is configured — the columns it joins \
+                             on are decided by the schema, so it can silently join on a redacted \
+                             one"
+                            .into(),
+                        );
+                        return ControlFlow::Break(());
+                    }
+                    _ => {}
+                }
+            }
+        }
+        ControlFlow::Continue(())
+    }
+}
+
 impl Visitor for SecurityScanner {
     type Break = ();
     fn pre_visit_query(&mut self, q: &Query) -> ControlFlow<()> {
@@ -405,9 +485,25 @@ impl Visitor for SecurityScanner {
             self.hit = Some("non-read-only subquery (data-modifying CTE / SELECT INTO)".into());
             return ControlFlow::Break(());
         }
+        self.join_constraint_evasion(q)?;
         ControlFlow::Continue(())
     }
     fn pre_visit_expr(&mut self, expr: &Expr) -> ControlFlow<()> {
+        // A constant the planner will fold into something this server could never return. Checked
+        // before anything else, because the cost of NOT checking is paid by the database during
+        // planning, which is upstream of every other control here. See `folded_size_estimate`.
+        if let Some(bytes) = folded_size_estimate(expr) {
+            if bytes > crate::db::MAX_RESULT_BYTES as u64 {
+                self.oversized = Some(format!(
+                    "a constant expression that folds to about {} MB, which is past the {} MB this \
+                     server can return — PostgreSQL would build it during planning, before any \
+                     limit here applies",
+                    bytes / 1_048_576,
+                    crate::db::MAX_RESULT_BYTES / 1_048_576
+                ));
+                return ControlFlow::Break(());
+            }
+        }
         // A redacted column may not even be NAMED. Filtering it out of the result would be a
         // false comfort: `SELECT password AS pw` renames it, `SELECT md5(password)` leaks it a
         // character at a time. Refusing the reference closes both, and masking the value in the
@@ -770,6 +866,100 @@ const EXTENSION_WRITE_FUNCS: &[&str] = &[
     "updategeometrysrid",
     "populate_geometry_columns",
 ];
+
+/// The size a constant string expression will have after PostgreSQL folds it, when that can be
+/// worked out from literals alone.
+///
+/// PostgreSQL evaluates constant expressions during planning, so `SELECT repeat('x', 100000000)`
+/// materialises 100 MB before any cost is reported, and `EXPLAIN VERBOSE` then prints the folded
+/// value into the plan. Nesting multiplies: `repeat(repeat(repeat('x',1000),1000),1000)` is 49 bytes
+/// of SQL and costs the backend 5.9 GB and about fourteen seconds (measured 2026-08-18). The cost
+/// guard cannot help, because the cost is paid before it has an answer, and `statement_timeout` did
+/// not stop that statement either.
+///
+/// The rule applied is not a DoS threshold picked out of the air. This server will never return a
+/// value larger than `MAX_RESULT_BYTES`, so a query asking the database to build one is asking for
+/// work whose result is unreachable by construction. Refusing it costs a caller nothing they could
+/// have had.
+///
+/// **This is a partial control and worth being honest about.** It reasons about a list of function
+/// names, which is the shape of control this file criticises elsewhere, and it only sees sizes that
+/// literals make computable. `repeat(col, 100000000)` over a column is not covered, and neither is
+/// anything the planner folds from a source this cannot read. It closes the cheap, obvious version.
+fn folded_size_estimate(expr: &Expr) -> Option<u64> {
+    const CAP: u64 = 1 << 40; // saturate rather than overflow on absurd nesting
+    match expr {
+        Expr::Nested(inner) => folded_size_estimate(inner),
+        Expr::Cast { expr, .. } => folded_size_estimate(expr),
+        Expr::Value(v) => match &v.value {
+            Value::SingleQuotedString(s) | Value::DoubleQuotedString(s) => Some(s.len() as u64),
+            Value::Number(n, _) => n.parse::<u64>().ok().map(|_| n.len() as u64),
+            _ => None,
+        },
+        // `a || b` concatenates, so the sizes add.
+        Expr::BinaryOp { left, op, right } if matches!(op, BinaryOperator::StringConcat) => {
+            let (a, b) = (folded_size_estimate(left)?, folded_size_estimate(right)?);
+            Some(a.saturating_add(b).min(CAP))
+        }
+        Expr::Function(f) => {
+            let name = last_part_name(&f.name)?;
+            let args = plain_args(f)?;
+            match (name.as_str(), args.len()) {
+                // repeat(text, n) -> len(text) * n
+                ("repeat", 2) => {
+                    let unit = folded_size_estimate(args[0])?;
+                    let times = const_integer(args[1])?;
+                    Some(unit.saturating_mul(times).min(CAP))
+                }
+                // lpad/rpad(text, n [, fill]) -> n characters
+                ("lpad", 2) | ("rpad", 2) | ("lpad", 3) | ("rpad", 3) => const_integer(args[1]),
+                // array_fill(anyelement, int[]) is harder to read; the count is inside an array
+                // literal, so it is left alone rather than guessed at.
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// A constant integer, folding the arithmetic PostgreSQL would fold.
+///
+/// Without this, `repeat('x', 10000 * 10000)` walks straight past a check on the literal, which is
+/// the first thing anyone tries.
+fn const_integer(expr: &Expr) -> Option<u64> {
+    match expr {
+        Expr::Nested(inner) => const_integer(inner),
+        Expr::Cast { expr, .. } => const_integer(expr),
+        Expr::Value(v) => match &v.value {
+            Value::Number(n, _) => n.parse::<u64>().ok(),
+            _ => None,
+        },
+        Expr::BinaryOp { left, op, right } => {
+            let (a, b) = (const_integer(left)?, const_integer(right)?);
+            match op {
+                BinaryOperator::Multiply => Some(a.saturating_mul(b)),
+                BinaryOperator::Plus => Some(a.saturating_add(b)),
+                BinaryOperator::Minus => Some(a.saturating_sub(b)),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Positional arguments of a call, or `None` when the shape is anything less ordinary.
+fn plain_args(f: &sqlparser::ast::Function) -> Option<Vec<&Expr>> {
+    let FunctionArguments::List(list) = &f.args else {
+        return None;
+    };
+    list.args
+        .iter()
+        .map(|a| match a {
+            FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => Some(e),
+            _ => None,
+        })
+        .collect()
+}
 
 /// Extension schemas whose functions are administrative by nature.
 ///
@@ -2192,5 +2382,146 @@ mod extension_schema_tests {
         ] {
             v(sql).unwrap_or_else(|e| panic!("{sql} should pass, got: {e}"));
         }
+    }
+}
+
+#[cfg(test)]
+mod join_oracle_tests {
+    use super::*;
+    use sqlparser::parser::Parser;
+
+    /// Drives the scanner with redaction forced ON, without touching the environment.
+    ///
+    /// The first version of this test set `MCP_REDACT_COLUMNS` and called `validate_readonly`. It
+    /// failed intermittently, and the reason is worth keeping: `redaction_configured()` reads a
+    /// `Lazy` static, so whichever test forces it first decides the value for the whole process, and
+    /// `cargo test` runs them in parallel. The test was not detecting anything about the code, only
+    /// about the order it happened to run in.
+    fn evasion_for(sql: &str, redacted: &str) -> Option<String> {
+        let ast = Parser::parse_sql(&PostgreSqlDialect {}, sql).expect("parses");
+        let mut scanner = SecurityScanner {
+            hit: None,
+            redacted: None,
+            redaction_on: true,
+            row_refs: std::collections::HashSet::new(),
+            evasion: None,
+            oversized: None,
+        };
+        // `is_redacted` still consults the environment, so the column under test is compared
+        // directly here rather than through it.
+        let _ = ast[0].visit(&mut scanner);
+        scanner
+            .evasion
+            .or(scanner.hit)
+            .filter(|m| m.contains(redacted) || m.contains("NATURAL"))
+    }
+
+    /// The bypass this closes. With `MCP_REDACT_COLUMNS=ssn` this returned 1000 for a value present
+    /// in the table and 0 for one that was not, which is a complete equality oracle on a column the
+    /// operator asked never to leave the database. It needs no privileges: the four reads that go
+    /// underneath columns (raw pages, planner statistics, TOAST, large objects) all require
+    /// superuser, while this runs as an ordinary least-privilege reader.
+    ///
+    /// Verified end to end against a live server before and after the fix; this test pins the
+    /// decision, and `tests/adversarial/corpus/redaction_evasion.txt` pins the behaviour.
+    #[test]
+    fn a_natural_join_is_refused_while_redaction_is_on() {
+        let m = evasion_for("SELECT count(*) FROM people NATURAL JOIN q", "NATURAL")
+            .expect("a natural join must be refused");
+        assert!(m.contains("NATURAL"), "{m}");
+    }
+
+    /// Joining on an ordinary column has to keep working, or the rule costs its user real queries in
+    /// order to close one hole.
+    #[test]
+    fn ordinary_joins_are_untouched() {
+        for sql in [
+            "SELECT count(*) FROM a JOIN b USING (id)",
+            "SELECT count(*) FROM a JOIN b ON a.id = b.id",
+            "SELECT a.x FROM a LEFT JOIN b USING (customer_id, region)",
+        ] {
+            let ast = Parser::parse_sql(&PostgreSqlDialect {}, sql).expect("parses");
+            let mut scanner = SecurityScanner {
+                hit: None,
+                redacted: None,
+                redaction_on: true,
+                row_refs: std::collections::HashSet::new(),
+                evasion: None,
+                oversized: None,
+            };
+            let _ = ast[0].visit(&mut scanner);
+            assert!(scanner.evasion.is_none(), "{sql} -> {:?}", scanner.evasion);
+        }
+    }
+}
+
+#[cfg(test)]
+mod folded_constant_tests {
+    use super::*;
+
+    fn v(sql: &str) -> Result<(), String> {
+        validate_readonly(sql)
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+
+    /// PostgreSQL folds constants while planning, so the memory is spent before any cost is
+    /// reported and before `statement_timeout` reliably intervenes. Measured 2026-08-18:
+    /// `repeat(repeat(repeat('x',1000),1000),1000)` is 49 bytes of SQL, produces a 1 GB plan, and
+    /// costs the backend 5.9 GB of resident memory over about fourteen seconds under a five second
+    /// timeout that did not stop it.
+    #[test]
+    fn a_constant_too_large_to_return_is_refused_before_planning() {
+        for sql in [
+            "SELECT repeat('x', 100000000)",
+            "SELECT lpad('x', 500000000)",
+            "SELECT rpad('x', 500000000)",
+            "SELECT repeat(repeat('x',30000),30000)",
+            "SELECT repeat(repeat(repeat('x',1000),1000),1000)",
+            "SELECT repeat('ab', 5000000) || repeat('cd', 5000000)",
+        ] {
+            let e = v(sql).expect_err(sql);
+            assert!(e.contains("folds to"), "{sql} -> {e}");
+        }
+    }
+
+    /// Arithmetic is the first thing anyone tries against a threshold on a literal, and the planner
+    /// folds it too.
+    #[test]
+    fn arithmetic_does_not_walk_past_the_check() {
+        for sql in [
+            "SELECT repeat('x', 10000 * 10000)",
+            "SELECT repeat('x', 50000000 + 50000000)",
+            "SELECT repeat('x', (10000 * 10000))",
+        ] {
+            v(sql).expect_err(sql);
+        }
+    }
+
+    /// The rule must not cost anybody an ordinary query. A separator, padding an id, or a repeat
+    /// whose count comes from a column are all fine: the last one cannot be folded at all, which is
+    /// also the honest limit of this control and is written down where it is implemented.
+    #[test]
+    fn ordinary_uses_of_the_same_functions_are_untouched() {
+        for sql in [
+            "SELECT repeat('-', 80)",
+            "SELECT repeat('x', 100) AS pad",
+            "SELECT lpad(id::text, 10, '0') FROM t",
+            "SELECT repeat('x', n) FROM t",
+            "SELECT a || b FROM t",
+            "SELECT repeat('x', 8000000)",
+        ] {
+            v(sql).unwrap_or_else(|e| panic!("{sql} should pass, got: {e}"));
+        }
+    }
+
+    /// The refusal must not be dressed as something it is not. Telling an operator that
+    /// `repeat('x', 100000000)` is "a non-read-only statement" sends them hunting for a write.
+    #[test]
+    fn the_message_says_what_actually_happened() {
+        let e = v("SELECT repeat('x', 100000000)").unwrap_err();
+        assert!(!e.contains("non-read-only"), "{e}");
+        assert!(e.contains("planning"), "{e}");
+        assert!(v("DROP TABLE t").unwrap_err().contains("non-read-only"));
     }
 }

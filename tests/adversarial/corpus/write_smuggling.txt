@@ -41,3 +41,9 @@ deny	SELECT DropGeometryColumn('{{T2}}', 'geom')	.
 deny	SELECT partman.run_maintenance()	creates and drops partitions
 deny	SELECT pglogical.create_subscription('s', 'host=evil')	replication to somewhere else entirely
 deny	SELECT squeeze.squeeze_table('public', '{{T2}}')	rewrites the table in place
+deny	SELECT repeat('x', 100000000)	round 0.1.8: folded during planning, 95 MB the server could never return
+deny	SELECT repeat('x', 10000 * 10000)	arithmetic walks past a check on the literal alone
+deny	SELECT repeat(repeat(repeat('x',1000),1000),1000)	49 bytes of SQL, 1 GB plan, 5.9 GB of backend memory measured
+deny	SELECT lpad('x', 500000000)	repeat is not the only expansion function
+deny	SELECT repeat('ab', 5000000) || repeat('cd', 5000000)	concatenation adds
+allow	SELECT repeat('-', 80)	a separator is not an attack, and the rule must not cost this

@@ -44,3 +44,6 @@ deny	SELECT chunk_data FROM pg_toast.pg_toast_16384	round 0.1.7: a value too lon
 deny	SELECT * FROM pg_toast.pg_toast_16384	.
 deny	SELECT data FROM pg_largeobject	the bytes underneath lo_get
 deny	SELECT stxdmcv FROM pg_statistic_ext_data	extended statistics keep their own sample of real values
+deny	SELECT count(*) FROM {{T}} JOIN (SELECT 'probe' AS {{COL}}) g USING ({{COL}})	round 0.1.8: an equality oracle needing NO privileges, unlike the reads that go underneath columns
+deny	SELECT count(*) FROM {{T}} LEFT JOIN q USING ({{COL}})	.
+deny	SELECT count(*) FROM {{T}} NATURAL JOIN q	the schema decides what a natural join joins on, and this validator has no schema
