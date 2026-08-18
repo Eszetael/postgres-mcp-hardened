@@ -1,52 +1,34 @@
 # postgres-mcp-hardened
 
-> ### 🚧 Version 0.1.7 — the release where the guard itself turned out to have holes
+> ### 🚧 Version 0.1.8 — a security release, and how it was found
 >
 > Published: binaries for five platforms with checksums, Sigstore signatures and build provenance;
-> `.mcpb` bundles for one-click install (new here, and the Windows one would not have started before
-> this release); an image on `ghcr.io` for amd64 and arm64; a package on npm; and an entry in the
-> official MCP registry.
+> `.mcpb` bundles for one-click install; an image on `ghcr.io` for amd64 and arm64; a package on npm;
+> and an entry in the official MCP registry.
 >
-> **0.1.7 closes six ways past the read-only and redaction controls, all of them demonstrated against
-> a running server rather than argued.** Four went around column names instead of dressing them up:
-> `get_raw_page` returned 8,192 bytes of a table with the redacted values in plain ASCII;
-> `SELECT * FROM pg_stats` returned real column values without naming the column at all; TOAST and
-> `pg_largeobject` are the same door from the storage side. The other two were writes through
-> extensions the deny list could not see, because it reasons about the `pg_*` catalog namespace and
-> `pg_cron` lives in a schema of its own — `cron.schedule('nightly','0 0 * * *','DROP TABLE users')`
-> was allowed. The pattern underneath all four redaction findings is now written down where the
-> feature is described: a column filter protects columns, so anything reading *underneath* columns is
-> outside what it can promise.
+> **0.1.8 closes six bypasses that were present in 0.1.7, and none of them were found by us.** They
+> came from four independent reviewers reading a draft article about this project. Two days of our
+> own adversarial work across every axis we could think of had come back mostly clean the day before.
+> Passing the tests you thought to write is not the same as looking.
 >
-> One limit was found and **not** closed, and is named in [`THREAT_MODEL.md`](THREAT_MODEL.md) with
-> the three repairs that were tried and what each one broke: the cost guard is the most expensive part
-> of a request, because `EXPLAIN VERBOSE` prints constants the planner folded.
+> The one that matters most needs **no privileges at all**: with a column redacted, a join on it
+> through `USING` answered whether a given value was present, which is a complete equality oracle
+> against the least-privilege reader this project tells you to configure. The others: a substring
+> comparison that let a remote database pass as loopback and skip TLS; two routes to an oracle over
+> the structure of a schema the caller was refused; `X-Forwarded-For` read from the wrong end, so a
+> header the client writes reset both rate limits; a memory bound that doubled as a rate-limit reset;
+> and the cost guard failing open when it could not read a plan. Each was reproduced against a
+> running server before being fixed, and each is in [`CHANGELOG.md`](CHANGELOG.md) with the query.
 >
-> Twelve claims this page used to make about itself were measured and found wrong — the download
-> figure, the binary size, the memory, the per-query overhead, the test count, and one that was off by
-> a whole MCP revision. Each is corrected below with its method, and five new gates check the classes
-> they belonged to on every commit.
+> One thing an existing unit test had been doing since it was written: asserting the vulnerable
+> behaviour. It was green for exactly as long as the hole existed.
 >
-> **What is actually proven**, in the sense that something other than an opinion checks it: the
-> read-only rules (a fuzz harness over 200k mutations, an adversarial corpus of every bypass found
-> so far, PostgreSQL 13–18); the authorisation path end to end; protocol conformance, checked by the
-> official MCP SDK rather than by our own tests; the release path, whose signatures have been
-> verified by hand — including that a tampered file and a wrong identity are both rejected; and the
-> published binary itself, downloaded from the release page and run against a live database.
+> A resource limit is documented and **not** solved, in [`THREAT_MODEL.md`](THREAT_MODEL.md): 49
+> bytes of SQL make PostgreSQL fold a constant into 5.9 GB of backend memory during planning, and a
+> five second `statement_timeout` does not stop it. 0.1.8 refuses the obvious shapes; the general
+> problem is upstream of anything this server can do.
 >
-> **What is not**: nobody outside this project has run it against their own data. That is the whole
-> reason this is 0.1.x and not 1.0. Every adversarial round run against this code so far has found
-> something real, including rounds run after the previous one came back clean — the day of the
-> release itself produced four, one of which handed a superuser role to anyone who could create a
-> table. The honest reading is that the next round would find something too.
->
-> Known limits, and the places we were wrong, are written down rather than tidied away:
-> [`THREAT_MODEL.md`](THREAT_MODEL.md), [`docs/AUDIT_2026-07-26.md`](docs/AUDIT_2026-07-26.md).
-> If you find something, [`SECURITY.md`](SECURITY.md) says how to say so.
->
-> The design, and the two defects the first day in public turned up, are written up here:
-> [**Rebuilding the Deprecated PostgreSQL MCP Server in Rust**](https://dev.to/eszetael_lab/rebuilding-the-deprecated-postgresql-mcp-server-in-rust-safe-by-default-1eb).
-
+> Everything here is 0.1.x because nobody outside this project has run it against their own data.
 
 **The official Postgres MCP server was deprecated in 2024 and still gets 437k downloads a month. Its entire defence is one database-level read-only transaction — and that alone does not stop every write. This is a maintained Rust replacement with defence in depth.**
 

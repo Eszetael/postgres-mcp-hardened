@@ -962,8 +962,19 @@ fn folded_size_estimate(expr: &Expr) -> Option<u64> {
             match (name.as_str(), args.len()) {
                 // repeat(text, n) -> len(text) * n
                 ("repeat", 2) => {
-                    let unit = folded_size_estimate(args[0])?;
                     let times = const_integer(args[1])?;
+                    // A unit whose size cannot be read still costs at least one byte, PROVIDED it is
+                    // constant — and then the planner folds it. `chr(120)` is not a literal, so the
+                    // first version of this estimate returned None and let
+                    // `repeat(repeat(repeat(chr(120),1000),1000),1000)` through, producing exactly
+                    // the same 1 GB plan as the version spelled with 'x'. Enumerating `chr` would
+                    // have invited the next spelling; the rule that holds is constant-ness, because
+                    // that is the rule PostgreSQL itself uses when deciding to fold.
+                    let unit = match folded_size_estimate(args[0]) {
+                        Some(n) => n,
+                        None if is_constant_expr(args[0]) => 1,
+                        None => return None,
+                    };
                     Some(unit.saturating_mul(times).min(CAP))
                 }
                 // lpad/rpad(text, n [, fill]) -> n characters
@@ -975,6 +986,28 @@ fn folded_size_estimate(expr: &Expr) -> Option<u64> {
         }
         _ => None,
     }
+}
+
+/// True when an expression contains no column reference, i.e. PostgreSQL can fold it at plan time.
+///
+/// This is the whole distinction the size estimate rests on. `repeat('x', 100000000)` is folded
+/// before the query runs and costs the backend the full result; `repeat(col, 100000000)` cannot be
+/// folded at all, because `col` is not known until execution, so the planner does not build it.
+fn is_constant_expr(expr: &Expr) -> bool {
+    struct HasColumn(bool);
+    impl Visitor for HasColumn {
+        type Break = ();
+        fn pre_visit_expr(&mut self, e: &Expr) -> ControlFlow<()> {
+            if matches!(e, Expr::Identifier(_) | Expr::CompoundIdentifier(_)) {
+                self.0 = true;
+                return ControlFlow::Break(());
+            }
+            ControlFlow::Continue(())
+        }
+    }
+    let mut h = HasColumn(false);
+    let _ = expr.visit(&mut h);
+    !h.0
 }
 
 /// A constant integer, folding the arithmetic PostgreSQL would fold.
@@ -2537,6 +2570,37 @@ mod folded_constant_tests {
         ] {
             let e = v(sql).expect_err(sql);
             assert!(e.contains("folds to"), "{sql} -> {e}");
+        }
+    }
+
+    /// `chr(120)` is not a string literal, so the first version of this estimate could not size it
+    /// and let `repeat(repeat(repeat(chr(120),1000),1000),1000)` through — the same 1 GB plan as the
+    /// version spelled with `'x'`, verified against a live server. Enumerating `chr` would have
+    /// invited `md5`, then `upper`, then the next one. The rule that holds is whether the expression
+    /// is CONSTANT, because that is the rule PostgreSQL uses when deciding to fold it.
+    #[test]
+    fn a_constant_unit_that_cannot_be_sized_still_counts() {
+        for sql in [
+            "SELECT repeat(chr(120), 100000000)",
+            "SELECT repeat(repeat(repeat(chr(120),1000),1000),1000)",
+            "SELECT repeat(md5('a'), 10000000)",
+            "SELECT repeat(upper('x'), 100000000)",
+        ] {
+            let e = v(sql).expect_err(sql);
+            assert!(e.contains("folds to"), "{sql} -> {e}");
+        }
+    }
+
+    /// And a unit that comes from a COLUMN is left alone, because the planner cannot fold it either:
+    /// nothing is built at plan time, so there is nothing to refuse.
+    #[test]
+    fn a_unit_from_a_column_is_not_a_folded_constant() {
+        for sql in [
+            "SELECT repeat(name, 3) FROM t",
+            "SELECT repeat('x', n) FROM t",
+            "SELECT repeat(chr(45), 80)",
+        ] {
+            v(sql).unwrap_or_else(|e| panic!("{sql} should pass, got: {e}"));
         }
     }
 

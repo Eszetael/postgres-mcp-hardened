@@ -1,5 +1,31 @@
 # Changelog
 
+## 0.1.9 — 2026-08-18 — the 0.1.8 mitigation had a one-word bypass
+
+0.1.8 refused a constant expression that folds to more than the server could ever return, which
+closed `SELECT repeat('x', 100000000)` and its nested forms. It did not close this:
+
+```sql
+SELECT repeat(repeat(repeat(chr(120),1000),1000),1000)
+```
+
+Same 1 GB plan, verified against a live server. `chr(120)` is a function call rather than a string
+literal, so the size estimate could not read it and gave up, and giving up meant allowing.
+
+Found within the hour by running the published 0.1.8 through `npx` from a clean container instead of
+trusting the local build, which is the only reason it is a same-day fix rather than a report from a
+stranger.
+
+Adding `chr` to a list would have invited `md5`, then `upper`, then whatever came next. The rule that
+holds is the one PostgreSQL itself uses to decide whether to fold an expression at all: **is it
+constant?** A constant unit whose size cannot be read now counts as one byte and is multiplied out;
+a unit that comes from a column is left alone, because the planner cannot fold that either and
+nothing is built at plan time. `repeat(chr(45), 80)` is still a separator, and
+`repeat(name, 3) FROM t` is still an ordinary query.
+
+148 unit tests, 312 acceptance cases, 121 adversarial corpus cases, 600,000 fuzz mutations per run,
+11 documentation controls.
+
 ## 0.1.8 — 2026-08-18 — security
 
 **Six bypasses, all present in 0.1.7, all found by an outside review of a draft article rather than
