@@ -1,5 +1,106 @@
 # Changelog
 
+## 0.1.8 — 2026-08-18 — security
+
+**Six bypasses, all present in 0.1.7, all found by an outside review of a draft article rather than
+by the person who wrote the code.** That is the honest headline. Two days of walking every axis I
+could think of had come back mostly clean, and four independent reviewers reading the same project
+found these in an afternoon. Passing the tests you thought to write is not the same as looking.
+
+Every one below was reproduced against a running server before being fixed, and pinned afterwards.
+
+### An oracle over a redacted column, needing no privileges at all
+
+With `MCP_REDACT_COLUMNS=ssn`:
+
+```sql
+SELECT count(*) FROM people JOIN (SELECT '123-45-6789' AS ssn) g USING (ssn);
+-- 1000 when that value is in the table, 0 when it is not
+```
+
+`SELECT ssn FROM people` is refused. This is not, because the column arrives through the `USING`
+list, which is a `Vec<Ident>` in the syntax tree and never reaches the expression visitor. Repeat
+with any candidate value and the count answers whether it is present.
+
+This one matters more than the four redaction bypasses fixed in 0.1.7 (`get_raw_page`, `pg_stats`,
+TOAST, `pg_largeobject`): those all need superuser. **This runs as the least-privilege reader this
+project tells operators to configure.** `NATURAL JOIN` is refused too while redaction is on, because
+which columns it joins on is decided by a schema this validator cannot see.
+
+### `db_is_local` compared a substring of the whole URL
+
+```
+postgres://u:p@real.example.com/db?application_name=@localhost
+```
+
+matched `@localhost`, and that predicate is what excuses a connection from TLS. A remote database
+could be dressed as loopback by a parameter nobody thinks of as security-relevant. It parses the host
+now, with tests for a password containing `@`, an explicit port, IPv6 in brackets, and
+`localhost.evil.com`.
+
+### An oracle over the structure of a schema the caller was refused
+
+Two routes, both closed. `WHERE false` folds the branch to a `Result` node with a one-time filter, so
+the plan named no relation at all and an empty relation list was being read as consent. No rows
+escape that way, but "0 rows" and `column "x" does not exist` are different answers about a table
+nobody was allowed to touch. The second route was earlier still: PostgreSQL analyses a statement
+before planning it, so the column error arrived before a plan existed for the allowlist to read.
+Schema-qualified names are now checked before `EXPLAIN` is sent.
+
+### `X-Forwarded-For` was read from the left
+
+Proxies append, so the list grows to the right and the leftmost entry is whatever the caller wrote.
+With `MCP_TRUST_PROXY=1` — the configuration the feature exists for — varying that header gave a
+fresh rate-limit bucket and a fresh concurrency slot on every request. Both limits bypassed by a
+header the client controls.
+
+An existing unit test asserted the old behaviour, so it was green for exactly as long as the
+vulnerability existed. That is the least useful thing a test can be, and it is now written down next
+to the fix.
+
+### The memory bound was also the rate-limit reset
+
+At `MAX_KEYS` the limiter called `clear()`, which bounded memory and handed everyone a full bucket at
+the same moment, including whoever caused the flood. It evicts the oldest quarter now: the opposite
+end of the map from an attacker who is hammering right now.
+
+### The cost guard failed open
+
+`.unwrap_or(0.0)` meant a plan whose shape we did not recognise — a different PostgreSQL version, a
+renamed field — scored zero and passed the cost limit with nothing in the log to say the guard had
+abstained. A guard that cannot read the cost has not measured a cheap query; it has failed to
+measure.
+
+### Constant folding, measured properly this time
+
+0.1.7 documented this as a residual risk and got the numbers wrong in both directions: too small, and
+in the wrong process.
+
+| statement | plan | backend memory |
+|---|---|---|
+| `repeat('x',1000)` | 1.3 kB | — |
+| `repeat(repeat('x',1000),1000)` | 1 MB | — |
+| `repeat(repeat(repeat('x',1000),1000),1000)` | **1 GB** | **5.9 GB** |
+
+That last one is 49 bytes of SQL. It ran for 13.7 s under a 5 s `statement_timeout` that did not stop
+it. The MCP process is unharmed and peaks at 9.9 MB; the database pays. Growth is multiplicative in
+nesting depth, not linear in the constant, and `repeat` is one of a dozen functions that fold.
+
+Refused now on a principle rather than a threshold: this server can never return a value larger than
+`MAX_RESULT_BYTES`, so a query asking the database to build one is asking for work whose result is
+unreachable by construction. The estimator folds arithmetic, because `repeat('x', 10000 * 10000)` is
+the first thing anyone tries against a check on a literal. It is a partial control and says so where
+it is implemented: it reasons about a list of function names, and `repeat(column, 100000000)` is not
+covered.
+
+### Also
+
+One reviewer claim was tested and rejected: positional `ORDER BY` is not a leak, because PostgreSQL
+refuses a position outside the select list, and naming the column is already refused.
+
+146 unit tests, 312 acceptance cases, 117 adversarial corpus cases, 600,000 fuzz mutations per run
+across three seeds, 11 documentation controls.
+
 ## 0.1.7 — 2026-08-17
 
 Two days of walking every path this project documents, as a stranger would, from an empty directory.
