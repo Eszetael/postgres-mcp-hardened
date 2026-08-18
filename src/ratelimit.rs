@@ -5,7 +5,9 @@
 //! RS256 signature costs real CPU. That is why this limit runs BEFORE authentication.
 //!
 //! The key is the peer address, never a header (the client controls headers). Behind a reverse
-//! proxy set `MCP_TRUST_PROXY=1` and the first `X-Forwarded-For` entry is used instead.
+//! proxy set `MCP_TRUST_PROXY=1` and the LAST `X-Forwarded-For` entry is used instead: the list
+//! grows to the right, so the entry our own proxy appended is the last one, and everything to its
+//! left was written by somebody further away.
 //! Disable with `MCP_RATE_RPM=0`. Default: 120 requests/min with burst headroom.
 
 use std::collections::HashMap;
@@ -95,8 +97,20 @@ pub fn allow_for(key: &str, transport: &str) -> bool {
     if l.buckets.len() >= MAX_KEYS {
         l.buckets.retain(|_, b| now - b.last < IDLE_SECS);
         if l.buckets.len() >= MAX_KEYS {
-            // still full (a multi-address flood) — start clean rather than grow without bound
-            l.buckets.clear();
+            // Still full: a flood across many keys. This used to `clear()` the whole map, which
+            // bounded memory and handed everybody a full bucket at the same time — including
+            // whoever caused the flood. The mechanism that limited memory became the mechanism that
+            // reset the rate limit, and it was reachable by anyone who could vary the key.
+            //
+            // Evict the oldest quarter instead. Memory stays bounded, and the entries that go are
+            // the least recently used, which is the opposite end from an attacker who is hammering
+            // right now. A long-idle legitimate client may get a fresh bucket, which costs nothing.
+            let mut ages: Vec<(String, f64)> =
+                l.buckets.iter().map(|(k, b)| (k.clone(), b.last)).collect();
+            ages.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+            for (k, _) in ages.into_iter().take(MAX_KEYS / 4) {
+                l.buckets.remove(&k);
+            }
         }
     }
     let b = l.buckets.entry(key.to_string()).or_insert(Bucket {
@@ -164,17 +178,39 @@ pub fn acquire_slot_capped(key: &str, cap: u32) -> Option<SlotGuard> {
     Some(SlotGuard(key.to_string()))
 }
 
-/// Client key: the peer address, or the first X-Forwarded-For entry when we explicitly trust a proxy.
+/// Client key: the peer address, or the entry our own proxy appended to `X-Forwarded-For`.
+///
+/// **The rightmost entry, not the leftmost.** This read the first one until 0.1.8, which is the
+/// opposite of what the header means. Every proxy in ordinary use — nginx, HAProxy, ELB — APPENDS
+/// the address it saw, so the list grows to the right and the entry closest to us is the last one.
+/// Everything to its left was supplied by whoever was further away, which for a hostile caller means
+/// themselves.
+///
+/// The consequence was not subtle: with `MCP_TRUST_PROXY=1`, the configuration this exists for, a
+/// caller sending a different `X-Forwarded-For` on every request got a fresh rate-limit bucket and a
+/// fresh concurrency slot each time. Both limits were bypassed by a header the client writes.
+///
+/// One trusted hop is assumed, which matches the boolean this is configured with. Behind two proxies
+/// the honest answer would be an integer count of trusted hops, and that is not what the setting is.
 pub fn client_key(peer: &str, xff: Option<&str>) -> String {
     let trust = std::env::var("MCP_TRUST_PROXY")
         .map(|v| v == "1" || v == "true")
         .unwrap_or(false);
+    client_key_with(peer, xff, trust)
+}
+
+/// The decision itself, with the trust flag passed in.
+///
+/// Split out so it can be tested without touching the environment: `cargo test` runs in parallel,
+/// and two tests setting the same variable decide each other's results rather than the code's. An
+/// earlier version of the tests below did exactly that and failed intermittently.
+pub fn client_key_with(peer: &str, xff: Option<&str>, trust: bool) -> String {
     if trust {
         if let Some(v) = xff {
-            if let Some(first) = v.split(',').next() {
-                let first = first.trim();
-                if !first.is_empty() {
-                    return first.to_string();
+            if let Some(last) = v.rsplit(',').next() {
+                let last = last.trim();
+                if !last.is_empty() {
+                    return last.to_string();
                 }
             }
         }
@@ -184,6 +220,8 @@ pub fn client_key(peer: &str, xff: Option<&str>) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[allow(unused_imports)]
+    use super::client_key_with;
     use super::*;
 
     #[test]
@@ -234,11 +272,59 @@ mod tests {
 
     #[test]
     fn xff_only_when_trusted() {
-        std::env::remove_var("MCP_TRUST_PROXY");
-        assert_eq!(client_key("10.0.0.1", Some("1.2.3.4")), "10.0.0.1");
-        std::env::set_var("MCP_TRUST_PROXY", "1");
-        assert_eq!(client_key("10.0.0.1", Some("1.2.3.4, 5.6.7.8")), "1.2.3.4");
-        assert_eq!(client_key("10.0.0.1", None), "10.0.0.1");
-        std::env::remove_var("MCP_TRUST_PROXY");
+        // This test used to assert that `1.2.3.4, 5.6.7.8` yields `1.2.3.4`, which pinned the bug
+        // rather than the behaviour: the leftmost entry is the one the caller wrote. It was green
+        // for as long as the vulnerability existed, which is the least useful thing a test can be.
+        // It also set an environment variable that `cargo test` shares with every parallel test, so
+        // `client_key_with` takes the flag directly now.
+        assert_eq!(
+            client_key_with("10.0.0.1", Some("1.2.3.4"), false),
+            "10.0.0.1"
+        );
+        assert_eq!(
+            client_key_with("10.0.0.1", Some("1.2.3.4, 5.6.7.8"), true),
+            "5.6.7.8"
+        );
+        assert_eq!(client_key_with("10.0.0.1", None, true), "10.0.0.1");
+    }
+}
+
+#[cfg(test)]
+mod forwarded_for_tests {
+    use super::client_key_with;
+
+    /// The bug this replaced. `X-Forwarded-For` grows to the RIGHT: a proxy appends the address it
+    /// saw. Reading the first entry therefore reads whatever the caller wrote, and with
+    /// `MCP_TRUST_PROXY=1` that handed out a fresh rate-limit bucket per request.
+    #[test]
+    fn the_trusted_entry_is_the_one_our_proxy_appended() {
+        assert_eq!(
+            client_key_with("10.0.0.1:1234", Some("1.2.3.4, 203.0.113.7"), true),
+            "203.0.113.7",
+            "the rightmost entry is the one a trusted proxy added"
+        );
+        assert_eq!(
+            client_key_with(
+                "10.0.0.1:1234",
+                Some("evil, evil, evil, 198.51.100.9"),
+                true
+            ),
+            "198.51.100.9",
+            "a caller cannot prepend their way to a new bucket"
+        );
+        assert_eq!(
+            client_key_with("10.0.0.1:1234", Some("203.0.113.7"), true),
+            "203.0.113.7"
+        );
+        unsafe { std::env::remove_var("MCP_TRUST_PROXY") };
+    }
+
+    /// Without the setting the header is ignored entirely, which is the safe default.
+    #[test]
+    fn an_untrusted_header_changes_nothing() {
+        assert_eq!(
+            client_key_with("10.0.0.1:1234", Some("1.2.3.4, 203.0.113.7"), false),
+            "10.0.0.1:1234"
+        );
     }
 }

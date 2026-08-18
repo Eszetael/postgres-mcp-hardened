@@ -526,16 +526,42 @@ pub(crate) fn cost_guard(sql: &str, max_cost: f64, db: Option<&str>) -> Result<(
     // What actually bounds it today is the memory limit on the process: a container `--memory` cap,
     // or a systemd `MemoryMax`. THREAT_MODEL.md says so under its own heading rather than leaving it
     // in a comment only the next maintainer would find.
+    // A schema-qualified name outside the surface is refused BEFORE the database is asked anything.
+    // PostgreSQL analyses a statement before planning it, so `SELECT nope FROM secret.t WHERE 1=0`
+    // came back as `column "nope" does not exist` — an answer about a table the caller was refused,
+    // produced before the plan existed for the allowlist to read. Names the caller did not qualify
+    // are left to the plan, which resolves them properly through the pinned `search_path`.
+    if surface::active() {
+        let qualified: Vec<(String, String)> = crate::validate::relations_named(sql)
+            .into_iter()
+            .filter(|(sch, _)| !sch.is_empty())
+            .collect();
+        let outside = surface::refused(&qualified, &|_, _| None);
+        if !outside.is_empty() {
+            return Err(CostErr::OutsideSurface(surface::refusal_message(&outside)));
+        }
+    }
     let row = client
         .query_one(&format!("EXPLAIN (FORMAT JSON, VERBOSE) {}", sql), &[])
         .map_err(|e| CostErr::QueryError(friendly_pg_error_for(&e, Some(sql))))?;
     let plan: Value = row.get(0); // kolumna json: [{"Plan":{"Total Cost":..}}]
-    let total = plan
+                                  // Fail CLOSED. This was `.unwrap_or(0.0)`, so a plan whose shape we did not recognise — a
+                                  // different PostgreSQL version, a renamed field — scored zero and sailed past the cost limit
+                                  // with nothing in the log to say the guard had abstained. A cost guard that cannot read the cost
+                                  // has not measured a cheap query; it has failed to measure, and those are different answers.
+    let Some(total) = plan
         .get(0)
         .and_then(|v| v.get("Plan"))
         .and_then(|v| v.get("Total Cost"))
         .and_then(|v| v.as_f64())
-        .unwrap_or(0.0);
+    else {
+        return Err(CostErr::QueryError(
+            "could not read the estimated cost out of the query plan, so the cost limit cannot be \
+             applied — refusing rather than guessing. This usually means an unexpected PostgreSQL \
+             version; please report it"
+                .to_string(),
+        ));
+    };
     // The surface check belongs here, on the plan, for the reason the module explains: the planner
     // has already resolved aliases, applied search_path, expanded views and distinguished a CTE from
     // the table it shadows. Reading the statement instead is what lost three rounds.
@@ -622,6 +648,27 @@ pub(crate) fn cost_guard(sql: &str, max_cost: f64, db: Option<&str>) -> Result<(
             }
         }
         let found = surface::relations_in_plan(&plan);
+        // An empty relation list is not consent. `SELECT x FROM secret.t WHERE false` plans to a
+        // `Result` node with a one-time false filter and no relation at all, so the allowlist had
+        // nothing to compare and let it through. No rows escape that way, but the difference between
+        // "0 rows" and "column does not exist" is an oracle over the structure of a table the caller
+        // was refused, and THREAT_MODEL.md lists schema knowledge as an asset. An uninformative plan
+        // is a refusal.
+        if found.is_empty() {
+            // Only names the caller qualified can be judged here: an unqualified one resolves
+            // through the `search_path` this server pins, which is inside the configured surface by
+            // construction. A qualified name outside it is the oracle, and it is refused.
+            let named: Vec<(String, String)> = crate::validate::relations_named(sql)
+                .into_iter()
+                .filter(|(sch, _)| !sch.is_empty())
+                .collect();
+            // No parent lookup here: the connection is busy with the EXPLAIN, and refusing a
+            // partition whose parent is allowed is the safe direction for a fallback path.
+            let outside = surface::refused(&named, &|_, _| None);
+            if !outside.is_empty() {
+                return Err(CostErr::OutsideSurface(surface::refusal_message(&outside)));
+            }
+        }
         let parents = |s: &str, r: &str| -> Option<(String, String)> {
             let v = query_catalog(
                 "SELECT pn.nspname AS schema, pc.relname AS rel \

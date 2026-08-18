@@ -1197,6 +1197,35 @@ case "$r" in *'"grade":"F"'*) no "a read-only role still grades F" "$r";; *) ok 
 echo "$r" | grep -q 'cannot write to any of' && ok "and the report says so in words" || no "no positive finding" "$r"
 stop
 
+section "Bypasses found by outside review, 2026-08-18"
+start DATABASE_URL="$URL" MCP_REDACT_COLUMNS=ssn
+# An equality oracle that needs no privileges at all. The four reads that go UNDERNEATH columns
+# (raw pages, planner statistics, TOAST, large objects) all require superuser; this one runs as the
+# least-privilege reader this project tells operators to use. The column never appears as an
+# expression: it arrives through the USING list, which is a Vec<Ident> the expression visitor never
+# saw. Measured before the fix: 1000 for a value in the table, 0 for one that was not.
+r=$(tool query '{"sql":"SELECT count(*) FROM people JOIN (SELECT '"'"'x'"'"' AS ssn) g USING (ssn)"}' | body)
+case "$r" in *ERROR*) ok "a join cannot use a redacted column as an oracle" ;;
+             *) no "REDACTION ORACLE VIA JOIN USING" "$r" ;; esac
+r=$(tool query '{"sql":"SELECT count(*) FROM people NATURAL JOIN other"}' | body)
+case "$r" in *ERROR*) ok "a NATURAL JOIN is refused while redaction is on" ;;
+             *) no "NATURAL JOIN NOT REFUSED" "$r" ;; esac
+r=$(tool query '{"sql":"SELECT count(*) FROM people a JOIN people b USING (id)"}' | body)
+case "$r" in *ERROR*) no "an ordinary join was refused" "$r" ;;
+             *) ok "joining on an ordinary column still works" ;; esac
+# PostgreSQL folds constants while planning, so the memory is spent before any cost is reported.
+# 49 bytes of SQL bought a 1 GB plan and 5.9 GB of backend memory, under a 5 s timeout that did not
+# stop it. Refused on the principle that the server could never return a value that large anyway.
+for big in "SELECT repeat('x', 100000000)" "SELECT repeat('x', 10000 * 10000)" "SELECT repeat(repeat(repeat('x',1000),1000),1000)"; do
+  r=$(tool query "{\"sql\":\"${big//\'/\\u0027}\"}" | body)
+  case "$r" in *"folds to"*) ok "a constant folding past the result limit is refused" ;;
+               *) no "OVERSIZED CONSTANT ACCEPTED" "$(printf '%s' "$r" | head -c 90)" ;; esac
+done
+r=$(tool query '{"sql":"SELECT repeat('"'"'-'"'"', 80) AS sep"}' | body)
+case "$r" in *ERROR*) no "an ordinary repeat was refused" "$r" ;;
+             *) ok "a separator is not an attack" ;; esac
+stop
+
 section "The surface allowlist reads the plan, not the SQL"
 docker exec -i acc_pg psql -U postgres -q -v ON_ERROR_STOP=1 <<'SQL' >/dev/null || { echo "fixture failed: surface"; exit 1; }
 CREATE TABLE salaries (person text, amount numeric);

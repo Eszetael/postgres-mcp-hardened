@@ -867,6 +867,57 @@ const EXTENSION_WRITE_FUNCS: &[&str] = &[
     "populate_geometry_columns",
 ];
 
+/// Relation names a statement mentions, read from its syntax.
+///
+/// NOT a replacement for asking the planner. The surface allowlist is built on the plan for good
+/// reasons the `surface` module explains: the planner has already resolved aliases, applied
+/// `search_path`, expanded views and told a CTE from the table it shadows. Reading the statement
+/// instead is what lost three earlier rounds.
+///
+/// This exists for one narrow purpose, and it can only ever make the answer stricter. A planner may
+/// legitimately return a plan with no relations at all: `SELECT x FROM secret.t WHERE false` folds
+/// to a `Result` node with a one-time false filter, and the table disappears. The allowlist then saw
+/// an empty relation list and read it as consent, which turned into an oracle: "no rows" and
+/// "column does not exist" are different answers, and both are answers about a table the caller was
+/// not allowed to touch. Comparing against the statement tells us the plan is uninformative, and an
+/// uninformative plan is a refusal, not a pass.
+/// Returns `(schema, relation)` pairs, with an empty schema when the name was not qualified.
+pub fn relations_named(sql: &str) -> Vec<(String, String)> {
+    struct Collector(Vec<(String, String)>);
+    impl Visitor for Collector {
+        type Break = ();
+        /// Only plain relations. A call in `FROM` — `SELECT * FROM public.f()` — is a function, and
+        /// functions are judged by the check that knows it cannot see inside their bodies, which
+        /// gives an operator a far more useful message than "outside the surface" would.
+        fn pre_visit_table_factor(&mut self, tf: &TableFactor) -> ControlFlow<()> {
+            if let TableFactor::Table {
+                name, args: None, ..
+            } = tf
+            {
+                let parts: Vec<String> = name
+                    .0
+                    .iter()
+                    .filter_map(|p| Some(p.as_ident()?.value.to_lowercase()))
+                    .collect();
+                match parts.len() {
+                    0 => {}
+                    1 => self.0.push((String::new(), parts[0].clone())),
+                    n => self.0.push((parts[n - 2].clone(), parts[n - 1].clone())),
+                }
+            }
+            ControlFlow::Continue(())
+        }
+    }
+    let Ok(ast) = parse(sql) else {
+        return Vec::new();
+    };
+    let mut c = Collector(Vec::new());
+    for st in &ast {
+        let _ = st.visit(&mut c);
+    }
+    c.0
+}
+
 /// The size a constant string expression will have after PostgreSQL folds it, when that can be
 /// worked out from literals alone.
 ///
@@ -897,7 +948,11 @@ fn folded_size_estimate(expr: &Expr) -> Option<u64> {
             _ => None,
         },
         // `a || b` concatenates, so the sizes add.
-        Expr::BinaryOp { left, op, right } if matches!(op, BinaryOperator::StringConcat) => {
+        Expr::BinaryOp {
+            left,
+            op: BinaryOperator::StringConcat,
+            right,
+        } => {
             let (a, b) = (folded_size_estimate(left)?, folded_size_estimate(right)?);
             Some(a.saturating_add(b).min(CAP))
         }

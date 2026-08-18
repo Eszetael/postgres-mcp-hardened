@@ -347,7 +347,7 @@ Beyond unit tests, the repository carries two harnesses that run in CI on every 
 - `--fuzz` — a deterministic fuzzer that mutates a corpus of known writes with transformations
   that do not change SQL meaning (comments, case, dollar-quoting, invisible Unicode, parentheses)
   and asserts that none of them ever becomes an allowed statement.
-- `tests/acceptance.sh` — an end-to-end suite that starts its own PostgreSQL and checks 305
+- `tests/acceptance.sh` — an end-to-end suite that starts its own PostgreSQL and checks 312
   behaviours: every write-bypass reported against the deprecated server (including the
   `COMMIT`/`END` injection), truthful results, schema introspection, protocol conformance,
   configuration mistakes failing loudly, audit tamper detection, fair use under load, and
