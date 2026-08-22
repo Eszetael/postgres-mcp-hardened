@@ -344,7 +344,13 @@ mod tests {
             ),
             (
                 "postgres://u:p@h:5432/db?sslmode=allow",
-                "postgres://u:p@h:5432/db?sslmode=prefer",
+                "postgres://u:p@h:5432/db?sslmode=require",
+            ),
+            // Loopback keeps the old, harmless mapping: no wire, and a local PostgreSQL ships with
+            // `ssl = off`.
+            (
+                "postgres://u:p@localhost:5432/db?sslmode=allow",
+                "postgres://u:p@localhost:5432/db?sslmode=prefer",
             ),
             (
                 "host=h user=u sslmode=verify-full",
@@ -354,10 +360,27 @@ mod tests {
                 "postgres://u:p@h/db?sslmode=require",
                 "postgres://u:p@h/db?sslmode=require",
             ),
-            ("postgres://u:p@h/db", "postgres://u:p@h/db"),
+            // No `sslmode` at all used to pass through untouched, which left the driver default
+            // `prefer` in force: TLS if the server offers it, plaintext if it declines, and anyone
+            // on the wire can make it decline. A remote host now gets `require`.
+            ("postgres://u:p@h/db", "postgres://u:p@h/db?sslmode=require"),
+            ("postgres://u:p@localhost/db", "postgres://u:p@localhost/db"),
+            (
+                "host=h user=u dbname=d",
+                "host=h user=u dbname=d sslmode=require",
+            ),
+            ("host=localhost user=u", "host=localhost user=u"),
         ] {
             assert_eq!(normalize_sslmode(input), expect, "input: {input}");
         }
+        // The keyword form takes a SPACE, not `?`. Appending URL syntax to it produced a string no
+        // driver can parse, which is why both dialects are asserted here.
+        assert!(
+            normalize_sslmode("host=h user=u dbname=d")
+                .parse::<postgres::Config>()
+                .is_ok(),
+            "keyword form must still parse after the rewrite"
+        );
         // after rewriting, the string MUST parse
         assert!(
             normalize_sslmode("postgres://u:p@h:5432/db?sslmode=verify-full")

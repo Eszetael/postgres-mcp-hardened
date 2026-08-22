@@ -82,10 +82,37 @@ pub(crate) fn database_name_of(url: &str) -> String {
 /// `verify-ca`/`verify-full` → `require` weakens nothing, and `allow` → `prefer` keeps the meaning
 /// "use TLS if it is available".
 pub(crate) fn normalize_sslmode(url: &str) -> String {
+    // A connection over the network with no `sslmode` at all is the most ordinary form there is —
+    // `postgres://user:pass@db.example.com/mydb` — and the driver's default for it is `prefer`,
+    // which means "use TLS if the server offers it". Measured 2026-08-19 against a non-loopback
+    // database with `ssl = off`: `pg_stat_ssl` reported `ssl: false`, so every query and every
+    // result travelled in the clear, with nothing said about it. `prefer` is not a weaker kind of
+    // encryption, it is encryption an attacker on the wire can decline on the server's behalf.
+    //
+    // Only `sslmode=disable` was refused, which catches the operator who said the dangerous thing
+    // out loud and misses the one who said nothing. So a non-local host with no explicit opinion
+    // gets `require`, and TLS becomes the default rather than the preference. Loopback is left
+    // alone: there is no wire to listen on, and a local PostgreSQL ships with `ssl = off`.
+    let has_mode = url.to_ascii_lowercase().contains("sslmode=");
+    if !has_mode && !db_is_local(url) {
+        // The separator depends on the dialect. A URL takes `?` or `&`; the keyword form takes a
+        // space, and appending `?sslmode=require` to `host=h user=u` produced a connection string
+        // no driver can parse. Caught before release by probing the form directly rather than
+        // assuming one shape of input.
+        let out = if url.contains("://") {
+            let joiner = if url.contains('?') { '&' } else { '?' };
+            format!("{}{}sslmode=require", url, joiner)
+        } else {
+            format!("{} sslmode=require", url)
+        };
+        return normalize_sslmode(&out);
+    }
     let lower = url.to_ascii_lowercase();
     for (from, to) in [
         ("verify-full", "require"),
         ("verify-ca", "require"),
+        // `allow` and `prefer` both mean "plaintext is acceptable", which over a network it is
+        // not. Upgraded for non-local hosts; left alone for loopback.
         ("allow", "prefer"),
     ] {
         let needle = format!("sslmode={}", from);
@@ -96,6 +123,18 @@ pub(crate) fn normalize_sslmode(url: &str) -> String {
             out.push_str(&url[pos + needle.len()..]);
             // recursion handles any further occurrence
             return normalize_sslmode(&out);
+        }
+    }
+    if !db_is_local(url) {
+        for weak in ["sslmode=prefer", "sslmode=allow"] {
+            let lower = url.to_ascii_lowercase();
+            if let Some(pos) = lower.find(weak) {
+                let mut out = String::with_capacity(url.len());
+                out.push_str(&url[..pos]);
+                out.push_str("sslmode=require");
+                out.push_str(&url[pos + weak.len()..]);
+                return out;
+            }
         }
     }
     url.to_string()
@@ -366,6 +405,17 @@ pub(crate) fn authority_has_extra_at(url: &str) -> bool {
 /// forever and offered `sslmode=verify-full` as the fix — advice that breaks a local PostgreSQL
 /// with no certificate. Two places judging the same fact must judge it with the same code.
 pub(crate) fn db_is_local(url: &str) -> bool {
+    // The keyword form has no scheme and no authority: `host=localhost user=u dbname=d`. It is a
+    // documented way to configure this server, and reading it as a URL made `host=localhost` look
+    // remote — which, once TLS became the default for remote hosts, would have forced encryption on
+    // a loopback socket and broken every developer's first run.
+    if !url.contains("://") {
+        if let Some(rest) = url.split("host=").nth(1) {
+            let h = rest.split_whitespace().next().unwrap_or("");
+            return matches!(h, "localhost" | "127.0.0.1" | "::1" | "[::1]") || h.starts_with('/');
+        }
+        return false;
+    }
     // Parse the host out. The previous version matched `@localhost` anywhere in the string, which
     // meant `postgres://u:p@real.example.com/db?application_name=@localhost` was treated as a
     // loopback connection — and this predicate is what excuses a database connection from being
@@ -483,6 +533,20 @@ pub(crate) fn pool_error_detail(db: Option<&str>) -> String {
                         Some(h) => format!("{}. {}", base, h),
                         None => base.to_string(),
                     }
+                } else if !db_is_local(&url) && !url.to_ascii_lowercase().contains("sslmode=") {
+                    // The operator did not ask for TLS; we did, on their behalf, because the host
+                    // is not loopback. Before 0.1.10 this connection succeeded IN THE CLEAR and said
+                    // nothing, which is worse. But a setup that worked yesterday and refuses today
+                    // deserves to be told why, in the sentence it fails in, rather than left with a
+                    // handshake error about certificates it never configured.
+                    "cannot connect to PostgreSQL: the database is not on this machine and offered \
+                     no TLS. Since 0.1.10 a remote connection without an explicit `sslmode` is made \
+                     with `sslmode=require` rather than the driver default `prefer`, because \
+                     `prefer` silently sends everything in the clear when the server declines — \
+                     which anyone on the wire can make it do. Enable TLS on the database, or say \
+                     `sslmode=disable` if you genuinely mean plaintext and the server will tell you \
+                     what it thinks of that"
+                        .to_string()
                 } else if d.contains("notvalidforname") || d.contains("not valid for name") {
                     "cannot connect to PostgreSQL: the server certificate does not cover this host \
                      name — connect using the name in the certificate rather than an IP address"
@@ -1283,5 +1347,65 @@ mod local_host_tests {
         ] {
             assert!(db_is_local(url), "{url} IS local");
         }
+    }
+}
+
+#[cfg(test)]
+mod sslmode_default_tests {
+    use super::normalize_sslmode;
+
+    /// The most ordinary connection string there is carries no `sslmode`, and the driver's default
+    /// for it is `prefer`: use TLS if the server offers it. Measured 2026-08-19 against a
+    /// non-loopback database with `ssl = off`, `pg_stat_ssl` reported `ssl: false` — every query and
+    /// result in the clear, silently. `prefer` is not weaker encryption; it is encryption that
+    /// anyone on the wire can decline on the server's behalf.
+    #[test]
+    fn a_remote_host_with_no_opinion_gets_require() {
+        for url in [
+            "postgres://u:p@db.example.com/mydb",
+            "postgres://u:p@db.example.com:5432/mydb",
+            "postgres://u:p@db.example.com/mydb?application_name=x",
+            "postgres://u:p@db.example.com/mydb?sslmode=prefer",
+            "postgres://u:p@db.example.com/mydb?sslmode=allow",
+        ] {
+            assert!(
+                normalize_sslmode(url).contains("sslmode=require"),
+                "{url} -> {}",
+                normalize_sslmode(url)
+            );
+        }
+    }
+
+    /// Loopback is left alone. There is no wire to listen on, and a local PostgreSQL ships with
+    /// `ssl = off` — the official Docker image, the apt packages and brew all do. Demanding TLS
+    /// there would break every first run on a developer machine to protect a connection that never
+    /// leaves it.
+    #[test]
+    fn loopback_is_left_alone() {
+        for url in [
+            "postgres://u:p@localhost/mydb",
+            "postgres://u:p@127.0.0.1:5432/mydb",
+            "postgres://u:p@[::1]/mydb?sslmode=prefer",
+        ] {
+            assert!(
+                !normalize_sslmode(url).contains("sslmode=require"),
+                "{url} -> {}",
+                normalize_sslmode(url)
+            );
+        }
+    }
+
+    /// An explicit opinion is still the operator's to hold. `disable` stays `disable` and meets the
+    /// start-up gate that already refuses it for a non-loopback host, which is a better place to
+    /// argue about it than here.
+    #[test]
+    fn an_explicit_choice_is_not_overridden() {
+        let u = "postgres://u:p@db.example.com/mydb?sslmode=disable";
+        assert!(normalize_sslmode(u).contains("sslmode=disable"));
+        let v = "postgres://u:p@db.example.com/mydb?sslmode=verify-full";
+        assert!(
+            normalize_sslmode(v).contains("sslmode=require"),
+            "verify-full maps to require"
+        );
     }
 }

@@ -18,7 +18,11 @@ pub(crate) fn handle_list_schemas(args: &Value) -> Value {
         &[],
         db,
     ) {
-        Ok(v) => { audit("list_schemas", "allowed", None); ok_content(&v) }
+        Ok(v) => {
+            let v = filter_visible_schemas(v);
+            audit("list_schemas", "allowed", None);
+            ok_content(&v)
+        }
         Err(e) => { audit("list_schemas", "error", None); err_content(-32000, e) }
     }
 }
@@ -50,6 +54,56 @@ pub(crate) fn schema_missing(schema: &str, db: Option<&str>) -> Option<Value> {
     }
 }
 
+/// Drops rows naming a relation the surface allowlist hides.
+///
+/// The allowlist governed the query path only, so `list_tables(schema: "secret")` happily returned
+/// every table in a schema the same caller could not read. A list of names is knowledge about data
+/// somebody chose not to expose.
+fn filter_visible_rows(v: Value, schema: &str, name_key: &str) -> Value {
+    let Some(rows) = v.get("rows").and_then(|r| r.as_array()) else {
+        return v;
+    };
+    let kept: Vec<Value> = rows
+        .iter()
+        .filter(|row| {
+            row.get(name_key)
+                .and_then(|n| n.as_str())
+                .map(|n| surface::relation_visible(schema, n))
+                .unwrap_or(true)
+        })
+        .cloned()
+        .collect();
+    let mut out = v.clone();
+    if let Some(o) = out.as_object_mut() {
+        o.insert("returnedRows".into(), json!(kept.len()));
+        o.insert("rows".into(), json!(kept));
+    }
+    out
+}
+
+/// The same for `list_schemas`: a schema is worth naming when anything in it is permitted.
+fn filter_visible_schemas(v: Value) -> Value {
+    let Some(rows) = v.get("rows").and_then(|r| r.as_array()) else {
+        return v;
+    };
+    let kept: Vec<Value> = rows
+        .iter()
+        .filter(|row| {
+            row.get("schema_name")
+                .and_then(|n| n.as_str())
+                .map(surface::schema_visible)
+                .unwrap_or(true)
+        })
+        .cloned()
+        .collect();
+    let mut out = v.clone();
+    if let Some(o) = out.as_object_mut() {
+        o.insert("returnedRows".into(), json!(kept.len()));
+        o.insert("rows".into(), json!(kept));
+    }
+    out
+}
+
 pub(crate) fn handle_list_tables(args: &Value) -> Value {
     let schema = args
         .get("schema")
@@ -76,6 +130,11 @@ pub(crate) fn handle_list_tables(args: &Value) -> Value {
     let show_parts = show_partitions();
     match query_catalog(SQL, &[&schema, &show_parts], db) {
         Ok(v) => {
+            // Filtered, not refused. With `MCP_ALLOW_TABLES=public.customers` the schema is
+            // partially visible, so listing it should show what is permitted rather than deny the
+            // question — an agent that cannot discover what it MAY read ends up guessing, and the
+            // operator switches the allowlist off.
+            let v = filter_visible_rows(v, schema, "table_name");
             audit("list_tables", "allowed", None);
             ok_content(&v)
         }
@@ -406,6 +465,12 @@ pub(crate) fn handle_describe_table(args: &Value) -> Value {
         Some(t) => t,
         None => return err_content(-32602, "missing 'table'".into()),
     };
+    // The allowlist governs describing a table exactly as it governs reading one. Until 0.1.10 it
+    // governed only the query path, so a caller refused `SELECT * FROM secret.salaries` could still
+    // ask for its columns and get them.
+    if !surface::relation_visible(schema, table) {
+        return err_content(-32602, surface::hidden_message(schema, table));
+    }
     // Comments from `pg_description` + primary key + default. An agent that sees ONLY a name and a type
     // guesses what the column means (`status`, `amount`, `rental_duration`) and builds queries on that
     // guess. A schema comment is the cheapest available truth about meaning, and the primary key says

@@ -1197,6 +1197,26 @@ case "$r" in *'"grade":"F"'*) no "a read-only role still grades F" "$r";; *) ok 
 echo "$r" | grep -q 'cannot write to any of' && ok "and the report says so in words" || no "no positive finding" "$r"
 stop
 
+section "The allowlist governs the catalogue too, 2026-08-19"
+start DATABASE_URL="$URL" MCP_ALLOW_TABLES="public.customers,public.events"
+# Until 0.1.10 the surface allowlist governed the QUERY path and nothing else. A caller refused
+# `SELECT * FROM salaries` could still ask `describe_table` for it and receive every column name,
+# type and default. THREAT_MODEL.md lists schema knowledge as a protected asset; the catalogue
+# tools were handing it over.
+r=$(tool describe_table '{"table":"salaries","schema":"public"}' | body)
+case "$r" in *"outside the configured surface"*) ok "describing a table off the list is refused" ;;
+             *) no "CATALOGUE BYPASSED THE SURFACE" "$(printf '%s' "$r" | head -c 90)" ;; esac
+r=$(tool describe_table '{"table":"customers","schema":"public"}' | body)
+case "$r" in *ERROR*) no "describing an allowed table was refused" "$r" ;;
+             *) ok "a table on the list can still be described" ;; esac
+# Lists are FILTERED rather than refused: an agent that cannot discover what it may read starts
+# guessing, and the operator switches the allowlist off.
+r=$(tool list_tables '{"schema":"public"}' | body)
+case "$r" in *salaries*) no "an unlisted table appeared in list_tables" "$(printf '%s' "$r" | head -c 90)" ;;
+             *customers*) ok "list_tables shows the permitted tables and hides the rest" ;;
+             *) no "list_tables returned nothing useful" "$(printf '%s' "$r" | head -c 90)" ;; esac
+stop
+
 section "Bypasses found by outside review, 2026-08-18"
 start DATABASE_URL="$URL" MCP_REDACT_COLUMNS=ssn
 # An equality oracle that needs no privileges at all. The four reads that go UNDERNEATH columns

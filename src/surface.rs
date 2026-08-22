@@ -72,6 +72,51 @@ fn permitted_in(pats: &[Pattern], schema: &str, relation: &str) -> bool {
     })
 }
 
+/// Whether a single relation may be described, listed, or otherwise talked about.
+///
+/// The allowlist was applied to the QUERY path and nowhere else, so with
+/// `MCP_ALLOW_SCHEMAS=public` a caller could not `SELECT * FROM secret.salaries` but could ask
+/// `describe_table(schema: "secret", table: "salaries")` and receive every column name and type.
+/// `THREAT_MODEL.md` lists schema knowledge as an asset, and the catalogue tools were handing it
+/// over. Found by outside review, verified 2026-08-19.
+pub(crate) fn relation_visible(schema: &str, relation: &str) -> bool {
+    if PATTERNS.is_empty() {
+        return true;
+    }
+    permitted_in(&PATTERNS, schema, relation)
+}
+
+/// Whether a schema is worth mentioning at all: true when anything in it is permitted.
+///
+/// Used to filter `list_schemas` rather than refuse it. Refusing would leave an agent unable to
+/// discover what it IS allowed to read, which turns a boundary into a puzzle and gets the whole
+/// allowlist switched off.
+pub(crate) fn schema_visible(schema: &str) -> bool {
+    if PATTERNS.is_empty() {
+        return true;
+    }
+    let s = schema.to_lowercase();
+    if s == "pg_catalog" || s == "information_schema" {
+        return catalog_allowed();
+    }
+    PATTERNS.iter().any(|p| match p {
+        Pattern::Schema(ps) => *ps == s,
+        Pattern::Relation(ps, _) => *ps == s,
+    })
+}
+
+/// The refusal a catalogue tool gives for a relation outside the surface.
+pub(crate) fn hidden_message(schema: &str, relation: &str) -> String {
+    format!(
+        "outside the configured surface: {}.{}. This server is limited to {} — the same limit \
+         applies to describing a table as to reading it, because a column list is knowledge about \
+         data somebody chose not to expose",
+        schema,
+        relation,
+        describe()
+    )
+}
+
 /// Every relation the plan says the query will read, as `(schema, relation)`.
 ///
 /// `EXPLAIN (VERBOSE)` labels each scan node with `Schema` and `Relation Name`; nodes nest through
