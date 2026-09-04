@@ -1,38 +1,43 @@
 # postgres-mcp-hardened
 
-> ### 🚧 Version 0.1.9 — a security release, and how it was found
+> ### 🚧 Version 0.1.10 — the rest of an outside review, and a fix that was too blunt
 >
 > Published: binaries for five platforms with checksums, Sigstore signatures and build provenance;
 > `.mcpb` bundles for one-click install; an image on `ghcr.io` for amd64 and arm64; a package on npm;
 > and an entry in the official MCP registry.
 >
-> **0.1.8 closes six bypasses that were present in 0.1.7, and none of them were found by us.** They
-> came from four independent reviewers reading a draft article about this project. Two days of our
-> own adversarial work across every axis we could think of had come back mostly clean the day before.
-> Passing the tests you thought to write is not the same as looking.
+> **0.1.8 and 0.1.9 closed six bypasses that four independent reviewers found in 0.1.7, none of them
+> found by us.** Two days of our own adversarial work had come back mostly clean the day before.
+> Passing the tests you thought to write is not the same as looking. The one that mattered most needs
+> no privileges at all: with a column redacted, a join on it through `USING` answered whether a given
+> value was present, which is a complete equality oracle against the least-privilege reader this
+> project tells you to configure.
 >
-> The one that matters most needs **no privileges at all**: with a column redacted, a join on it
-> through `USING` answered whether a given value was present, which is a complete equality oracle
-> against the least-privilege reader this project tells you to configure. The others: a substring
-> comparison that let a remote database pass as loopback and skip TLS; two routes to an oracle over
-> the structure of a schema the caller was refused; `X-Forwarded-For` read from the wrong end, so a
-> header the client writes reset both rate limits; a memory bound that doubled as a rate-limit reset;
-> and the cost guard failing open when it could not read a plan. Each was reproduced against a
-> running server before being fixed, and each is in [`CHANGELOG.md`](CHANGELOG.md) with the query.
+> **0.1.10 closes the three findings that were left open.** With `MCP_ALLOW_SCHEMAS=public`,
+> `SELECT * FROM secret.salaries` was refused while `describe_table` handed over every column, type
+> and default of that same table. An ordinary connection string carrying no `sslmode` used the
+> driver's `prefer`, which sends everything in the clear whenever the server declines TLS, and anyone
+> on the wire can make it decline. And `MCP_SSLROOTCERT` added a private certificate authority to 242
+> public ones instead of replacing them, so an operator who believed they had pinned trust to their
+> own issuer had not.
 >
-> One thing an existing unit test had been doing since it was written: asserting the vulnerable
-> behaviour. It was green for exactly as long as the hole existed.
+> **The first version of that TLS fix was wrong in a way worth reading about.** It asked "is this
+> loopback" and demanded TLS from everything else, which took down six PostgreSQL version jobs, the
+> conformance run, the container check and the adversarial corpus in a single push. All of them reach
+> the database the way ordinary deployments do: `postgres://user:pass@postgres:5432/db`, a service
+> name on a private network. Docker Compose and Kubernetes are not the public internet, and a server
+> that demands TLS from a container on a bridge network is a server people switch off entirely. The
+> question is now whether somebody untrusted can sit on the wire, not whether the address is loopback,
+> and a real socket to a PostgreSQL reachable only by service name is in the test suite, because a
+> rule about networks should be tested over a network.
 >
 > A resource limit is documented and **not** solved, in [`THREAT_MODEL.md`](THREAT_MODEL.md): 49
 > bytes of SQL make PostgreSQL fold a constant into 5.9 GB of backend memory during planning, and a
-> five second `statement_timeout` does not stop it. 0.1.8 refuses the obvious shapes; the general
+> five second `statement_timeout` does not stop it. The obvious shapes are refused; the general
 > problem is upstream of anything this server can do.
 >
-> **0.1.9 exists because the 0.1.8 fix had a one-word bypass**: `chr(120)` instead of `'x'` produced
-> the same gigabyte plan, because the size estimate could not read a function call and gave up, and
-> giving up meant allowing. It was caught within the hour by running the *published* build through
-> `npx` from a clean container rather than trusting the local one. The rule now is the one PostgreSQL
-> uses to decide whether to fold at all: is the expression constant.
+> Every change here was reproduced against a running server before being fixed, and each is in
+> [`CHANGELOG.md`](CHANGELOG.md) with the query.
 >
 > Everything here is 0.1.x because nobody outside this project has run it against their own data.
 
