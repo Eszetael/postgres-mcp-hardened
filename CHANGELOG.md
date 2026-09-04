@@ -25,9 +25,23 @@ database with `ssl = off` — `pg_stat_ssl` reported `ssl: false`. Every query a
 clear, silently. The start-up gate refused only an explicit `sslmode=disable`, which catches the
 operator who said the dangerous thing out loud and misses the one who said nothing.
 
-A remote host with no explicit opinion now gets `require`. Loopback is untouched: there is no wire,
-and a local PostgreSQL ships with `ssl = off`. The refusal says outright that *we* raised the
-requirement and why, rather than leaving a handshake error about certificates nobody configured.
+A host that can be reached across somebody else's equipment now gets `require`. The refusal says
+outright that *we* raised the requirement and why, rather than leaving a handshake error about
+certificates nobody configured.
+
+The first version of that rule drew the line at loopback, and it was too blunt by a wide margin: it
+took down six PostgreSQL version jobs, the conformance run, the container check and the adversarial
+corpus in a single push. All of them reach the database the way ordinary deployments do —
+`postgres://user:pass@postgres:5432/db`, a service name on a private network with no TLS in sight.
+Docker Compose, Kubernetes and a database on the same VPC are not the public internet, and a server
+that demands TLS from a container on a bridge network is a server people disable entirely.
+
+So the question is now "can somebody untrusted sit on this wire", not "is this loopback". Loopback,
+Unix sockets, RFC1918 and carrier-grade NAT ranges, IPv6 unique-local and link-local, single-label
+host names (which cannot resolve in public DNS) and the usual private suffixes keep the driver
+default. Everything else gets `require`. A real socket to a PostgreSQL reachable only by service name
+is in the TLS suite, because a rule about networks should be tested over a network rather than pinned
+as a string rewrite.
 
 Fixing this broke the keyword form (`host=h user=u`) on the way — `?sslmode=require` is URL syntax no
 driver parses, and `host=localhost` stopped reading as local, which would have failed every first
@@ -55,12 +69,22 @@ says that precisely now instead of leaving it as a general worry.
 
 ### Also
 
+A dependency we ship was **withdrawn by its own author**: `chacha20 0.10.1`, reached through `rand`,
+was yanked from crates.io and our lockfile still pinned it. Updated to `0.10.2`.
+
+The way that was found is worth more than the fix. `cargo deny check` passed on the machine it was
+written on and failed in CI from the identical lockfile, and the difference was not the tool or the
+toolchain — both were the same version. Detecting a yank needs a current crates.io index, and a
+cached index answers "all clear" for as long as it stays cached. The local check had been quietly
+lying. The pre-push gate now forces the index refresh before asking, and skips the check outright
+without a network rather than blocking a push on a train.
+
 The archived server's download figure aged out of tolerance on its own and Control G caught it:
 437k when it was written, 391k today. Corrected. That control exists because a number is only true
 on the day it was measured.
 
-152 unit tests, 315 acceptance cases, 121 adversarial corpus cases, 600,000 fuzz mutations per run,
-6 TLS scenarios, 11 documentation controls.
+152 unit tests, 317 acceptance cases, 121 adversarial corpus cases, 600,000 fuzz mutations per run,
+7 TLS scenarios, 11 documentation controls.
 
 ## 0.1.9 — 2026-08-18 — the 0.1.8 mitigation had a one-word bypass
 

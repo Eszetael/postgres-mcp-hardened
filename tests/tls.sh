@@ -126,5 +126,46 @@ else
   no "MCP_SSLROOTCERT DID NOT REPLACE THE TRUST ANCHORS" "prywatny=$n_private publiczny=$n_public"
 fi
 
+printf '\n== A private network is not the public internet ==\n'
+# 0.1.10 first shipped a rule that read "not loopback, therefore demand TLS", and it took down six
+# PostgreSQL version jobs, the conformance run, the container check and the adversarial corpus in one
+# push. Every one of them reaches the database the way Docker Compose and Kubernetes do: a
+# single-label service name on a private network with no TLS anywhere near it.
+#
+# The unit tests pin the string rewrite, which is not the same claim. This one opens a real socket to
+# a real PostgreSQL that is reachable ONLY by service name, because that is the arrangement that
+# broke, and a rule about networks should be tested over a network.
+if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
+  NET="mcptls-net-$$"; PGC="mcptls-pg-$$"
+  docker network create "$NET" >/dev/null 2>&1
+  docker run -d --name "$PGC" --network "$NET" --network-alias postgres \
+    -e POSTGRES_PASSWORD=ci -e POSTGRES_DB=postgres postgres:16 >/dev/null 2>&1
+  for _ in $(seq 1 45); do
+    docker exec "$PGC" pg_isready -U postgres >/dev/null 2>&1 && break; sleep 1
+  done
+  RPC="$DIR/service_name_rpc.jsonl"
+  {
+    printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"tls-suite","version":"1"}}}'
+    printf '%s\n' '{"jsonrpc":"2.0","method":"notifications/initialized"}'
+    printf '%s\n' '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"query","arguments":{"sql":"SELECT 1 AS ok"}}}'
+  } > "$RPC"
+  out=$(docker run --rm -i --network "$NET" \
+    -v "$(cd "$(dirname "$BIN")" && pwd):/srv:ro" -v "$DIR:/in:ro" \
+    -e DATABASE_URL="postgres://postgres:ci@postgres:5432/postgres" \
+    debian:bookworm-slim sh -c "/srv/$(basename "$BIN") --stdio < /in/$(basename "$RPC")" 2>&1)
+  docker rm -f "$PGC" >/dev/null 2>&1; docker network rm "$NET" >/dev/null 2>&1
+  # The row arrives inside a JSON string, so the quotes are backslash-escaped one level down and a
+  # literal `"ok":1` never matches. grep on the row count instead of hand-escaping.
+  if printf '%s' "$out" | grep -q 'returnedRows.*1'; then
+    ok "a service name on a private network connects without demanding TLS"
+  elif printf '%s' "$out" | grep -qE 'TLS handshake|offered no TLS'; then
+    no "TLS WAS DEMANDED FROM A PRIVATE NETWORK — this is the regression that broke CI" "$out"
+  else
+    no "THE SERVICE-NAME CONNECTION DID NOT RETURN A ROW" "$out"
+  fi
+else
+  printf '  \033[33mSKIP\033[0m docker unavailable, service-name case not run\n'
+fi
+
 printf '\n== %d passed, %d failed ==\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ] || exit 1

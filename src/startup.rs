@@ -470,14 +470,21 @@ pub(crate) fn preflight_config() {
             if !url.contains("sslmode=disable") {
                 continue;
             }
-            let remote = !db_is_local(url);
-            if remote
+            // The same notion of "somebody untrusted could sit on this wire" that decides the TLS
+            // default, and for the same reason. Judging this one by loopback while the default judged
+            // by network left the strictness inverted against the information: an operator on a
+            // container network who said NOTHING got plaintext silently, and the one who wrote
+            // `sslmode=disable` — the same wire, the same risk, stated out loud — was refused at
+            // start-up. Punishing the more explicit of two identical deployments teaches people to be
+            // vaguer, which is the opposite of what this gate is for.
+            let untrusted = !db_on_trusted_network(url);
+            if untrusted
                 && !std::env::var("MCP_ALLOW_PLAINTEXT_DB").is_ok_and(|v| v == "i-accept-the-risk")
             {
                 fatal.push(format!(
-                    "{} disables TLS to a host that is not loopback: every query and every row \
-                     would cross the network in the clear. Use sslmode=verify-full, or set \
-                     MCP_ALLOW_PLAINTEXT_DB=i-accept-the-risk",
+                    "{} disables TLS to a database reachable over a network outside this machine: \
+                     every query and every row would cross it in the clear. Use sslmode=verify-full, \
+                     or set MCP_ALLOW_PLAINTEXT_DB=i-accept-the-risk",
                     var
                 ));
             }

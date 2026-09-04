@@ -94,7 +94,7 @@ pub(crate) fn normalize_sslmode(url: &str) -> String {
     // gets `require`, and TLS becomes the default rather than the preference. Loopback is left
     // alone: there is no wire to listen on, and a local PostgreSQL ships with `ssl = off`.
     let has_mode = url.to_ascii_lowercase().contains("sslmode=");
-    if !has_mode && !db_is_local(url) {
+    if !has_mode && !db_on_trusted_network(url) {
         // The separator depends on the dialect. A URL takes `?` or `&`; the keyword form takes a
         // space, and appending `?sslmode=require` to `host=h user=u` produced a connection string
         // no driver can parse. Caught before release by probing the form directly rather than
@@ -125,7 +125,7 @@ pub(crate) fn normalize_sslmode(url: &str) -> String {
             return normalize_sslmode(&out);
         }
     }
-    if !db_is_local(url) {
+    if !db_on_trusted_network(url) {
         for weak in ["sslmode=prefer", "sslmode=allow"] {
             let lower = url.to_ascii_lowercase();
             if let Some(pos) = lower.find(weak) {
@@ -421,6 +421,95 @@ pub(crate) fn authority_has_extra_at(url: &str) -> bool {
 /// plaintext to localhost as a finding, which capped a correctly configured local setup at B
 /// forever and offered `sslmode=verify-full` as the fix — advice that breaks a local PostgreSQL
 /// with no certificate. Two places judging the same fact must judge it with the same code.
+/// Whether the connection stays on a network nobody untrusted can sit on.
+///
+/// `db_is_local` answers a narrower question — is this loopback — and that is the right question for
+/// the start-up gate, which refuses an explicit `sslmode=disable` to somewhere else. It is the WRONG
+/// question for deciding whether to force TLS on a caller who expressed no opinion, and forcing it
+/// on everything non-loopback broke six PostgreSQL version jobs, the conformance run, the container
+/// check and the adversarial corpus in one push. All of them reach the database the way real
+/// deployments do: `postgres://user:pass@postgres:5432/db`, a service name on a private network.
+///
+/// Docker Compose, Kubernetes and a database on the same VPC are not the public internet, and a
+/// server that demands TLS from a container on a bridge network is a server people work around by
+/// turning the whole thing off. So: loopback, Unix sockets, RFC1918 and carrier-grade NAT ranges,
+/// IPv6 unique-local and link-local, single-label host names (which cannot resolve in public DNS),
+/// and the usual private suffixes.
+///
+/// Anything else is a name that can route across somebody else's equipment, and there a caller with
+/// no stated preference gets `sslmode=require` rather than the driver's `prefer`.
+pub(crate) fn db_on_trusted_network(url: &str) -> bool {
+    if db_is_local(url) {
+        return true;
+    }
+    let host = host_of(url).unwrap_or_default();
+    if host.is_empty() {
+        return false;
+    }
+    if host.starts_with('/') || host.starts_with("%2f") || host.starts_with("%2F") {
+        return true; // Unix socket directory
+    }
+    // Single label: `postgres`, `db`, `pg`. Public DNS has no such names.
+    if !host.contains('.') && !host.contains(':') {
+        return true;
+    }
+    for suffix in [
+        ".local",
+        ".internal",
+        ".lan",
+        ".home.arpa",
+        ".svc",
+        ".cluster.local",
+        ".localdomain",
+    ] {
+        if host.ends_with(suffix) {
+            return true;
+        }
+    }
+    let o: Vec<u32> = host
+        .split('.')
+        .filter_map(|p| p.parse::<u32>().ok())
+        .collect();
+    if o.len() == 4 && o.iter().all(|n| *n <= 255) {
+        return match (o[0], o[1]) {
+            (10, _) => true, // RFC1918
+            (172, b) if (16..=31).contains(&b) => true,
+            (192, 168) => true,
+            (169, 254) => true,                          // link-local
+            (100, b) if (64..=127).contains(&b) => true, // RFC6598 carrier-grade NAT
+            _ => false,
+        };
+    }
+    let h = host.to_ascii_lowercase();
+    h.starts_with("fc") || h.starts_with("fd") || h.starts_with("fe80") // IPv6 ULA / link-local
+}
+
+/// The host part of either connection-string dialect, lowercased.
+fn host_of(url: &str) -> Option<String> {
+    if !url.contains("://") {
+        return url
+            .split("host=")
+            .nth(1)
+            .and_then(|r| r.split_whitespace().next())
+            .map(|h| h.to_ascii_lowercase());
+    }
+    let after = url.split_once("://")?.1;
+    let authority = after.split(['/', '?']).next()?;
+    let host_port = authority
+        .rsplit_once('@')
+        .map(|(_, h)| h)
+        .unwrap_or(authority);
+    // `strip_prefix('[')?` would have returned None for every host that is NOT bracketed IPv6,
+    // which is almost all of them — the `?` propagates out of the whole function, not out of the
+    // branch. The first version of this did exactly that, so every host read as empty and every
+    // connection looked untrusted.
+    let host = match host_port.strip_prefix('[').and_then(|r| r.split_once(']')) {
+        Some((inner, _)) => inner.to_string(),
+        None => host_port.split(':').next().unwrap_or(host_port).to_string(),
+    };
+    Some(host.to_ascii_lowercase())
+}
+
 pub(crate) fn db_is_local(url: &str) -> bool {
     // The keyword form has no scheme and no authority: `host=localhost user=u dbname=d`. It is a
     // documented way to configure this server, and reading it as a URL made `host=localhost` look
@@ -550,14 +639,21 @@ pub(crate) fn pool_error_detail(db: Option<&str>) -> String {
                         Some(h) => format!("{}. {}", base, h),
                         None => base.to_string(),
                     }
-                } else if !db_is_local(&url) && !url.to_ascii_lowercase().contains("sslmode=") {
-                    // The operator did not ask for TLS; we did, on their behalf, because the host
-                    // is not loopback. Before 0.1.10 this connection succeeded IN THE CLEAR and said
-                    // nothing, which is worse. But a setup that worked yesterday and refuses today
-                    // deserves to be told why, in the sentence it fails in, rather than left with a
-                    // handshake error about certificates it never configured.
-                    "cannot connect to PostgreSQL: the database is not on this machine and offered \
-                     no TLS. Since 0.1.10 a remote connection without an explicit `sslmode` is made \
+                } else if !db_on_trusted_network(&url)
+                    && !url.to_ascii_lowercase().contains("sslmode=")
+                {
+                    // The operator did not ask for TLS; we did, on their behalf, because this host can
+                    // be reached across equipment neither of us controls. Before 0.1.10 the connection
+                    // succeeded IN THE CLEAR and said nothing, which is worse. But a setup that worked
+                    // yesterday and refuses today deserves to be told why, in the sentence it fails in,
+                    // rather than left with a handshake error about certificates it never configured.
+                    //
+                    // The condition asks the same question the default did, so this explanation cannot
+                    // be given to a connection we did not change: a service name on a private network
+                    // that fails its handshake gets the generic message, which is the true one for it.
+                    "cannot connect to PostgreSQL: the database is reachable over a network outside \
+                     this machine and offered no TLS. Since 0.1.10 such a connection without an \
+                     explicit `sslmode` is made \
                      with `sslmode=require` rather than the driver default `prefer`, because \
                      `prefer` silently sends everything in the clear when the server declines — \
                      which anyone on the wire can make it do. Enable TLS on the database, or say \
@@ -1376,10 +1472,41 @@ mod sslmode_default_tests {
     /// non-loopback database with `ssl = off`, `pg_stat_ssl` reported `ssl: false` — every query and
     /// result in the clear, silently. `prefer` is not weaker encryption; it is encryption that
     /// anyone on the wire can decline on the server's behalf.
+    /// The blast radius that the first version of this rule missed. Every one of these is how a
+    /// real deployment reaches its database, and demanding TLS from them broke six PostgreSQL
+    /// version jobs, the conformance run, the container check and the adversarial corpus in a
+    /// single push. A server that refuses a container on a bridge network is a server people work
+    /// around by turning the whole thing off.
+    #[test]
+    fn a_private_network_is_not_the_public_internet() {
+        for url in [
+            "postgres://u:p@postgres:5432/db", // docker compose / GitHub Actions service
+            "postgres://u:p@db/mydb",          // single label, cannot exist in public DNS
+            "postgres://u:p@10.0.0.5:5432/db", // RFC1918
+            "postgres://u:p@172.20.0.3/db",
+            "postgres://u:p@192.168.1.10/db",
+            "postgres://u:p@100.64.0.1/db",   // carrier-grade NAT
+            "postgres://u:p@169.254.10.1/db", // link-local
+            "postgres://u:p@pg.internal/db",
+            "postgres://u:p@postgres.default.svc.cluster.local/db",
+            "postgres://u:p@[fd00::1]/db", // IPv6 unique-local
+            "host=postgres user=u dbname=d",
+        ] {
+            assert!(
+                !super::normalize_sslmode(url).contains("sslmode=require"),
+                "{url} is on a trusted network -> {}",
+                super::normalize_sslmode(url)
+            );
+        }
+    }
+
     #[test]
     fn a_remote_host_with_no_opinion_gets_require() {
         for url in [
             "postgres://u:p@db.example.com/mydb",
+            "postgres://u:p@mydb.abc123.eu-central-1.rds.amazonaws.com/postgres",
+            "postgres://u:p@db.abcdef.supabase.co/postgres",
+            "postgres://u:p@203.0.113.7/db",
             "postgres://u:p@db.example.com:5432/mydb",
             "postgres://u:p@db.example.com/mydb?application_name=x",
             "postgres://u:p@db.example.com/mydb?sslmode=prefer",

@@ -333,18 +333,23 @@ mod tests {
     /// first step (verified against PostgreSQL with an intermediate certificate chain).
     #[test]
     fn sslmode_from_cloud_is_accepted() {
+        // `h` was the host in every case here until 04.09, and `h` is a SINGLE-LABEL name — the shape
+        // Docker Compose and Kubernetes use, which cannot resolve in public DNS. Once the TLS default
+        // started asking "can somebody untrusted sit on this wire" instead of "is this loopback", the
+        // fixture stopped standing for what the test claims to check. A test about cloud hosts has to
+        // use a host that looks like the cloud.
         for (input, expect) in [
             (
-                "postgres://u:p@h:5432/db?sslmode=verify-full",
-                "postgres://u:p@h:5432/db?sslmode=require",
+                "postgres://u:p@db.example.com:5432/db?sslmode=verify-full",
+                "postgres://u:p@db.example.com:5432/db?sslmode=require",
             ),
             (
-                "postgres://u:p@h:5432/db?sslmode=verify-ca",
-                "postgres://u:p@h:5432/db?sslmode=require",
+                "postgres://u:p@db.example.com:5432/db?sslmode=verify-ca",
+                "postgres://u:p@db.example.com:5432/db?sslmode=require",
             ),
             (
-                "postgres://u:p@h:5432/db?sslmode=allow",
-                "postgres://u:p@h:5432/db?sslmode=require",
+                "postgres://u:p@db.example.com:5432/db?sslmode=allow",
+                "postgres://u:p@db.example.com:5432/db?sslmode=require",
             ),
             // Loopback keeps the old, harmless mapping: no wire, and a local PostgreSQL ships with
             // `ssl = off`.
@@ -352,22 +357,31 @@ mod tests {
                 "postgres://u:p@localhost:5432/db?sslmode=allow",
                 "postgres://u:p@localhost:5432/db?sslmode=prefer",
             ),
+            // A service name on a private network is treated like loopback for the DEFAULT, but an
+            // explicit `verify-full` is still rewritten, because the driver cannot parse it either way.
             (
-                "host=h user=u sslmode=verify-full",
-                "host=h user=u sslmode=require",
+                "postgres://u:p@postgres:5432/db?sslmode=verify-full",
+                "postgres://u:p@postgres:5432/db?sslmode=require",
             ),
             (
-                "postgres://u:p@h/db?sslmode=require",
-                "postgres://u:p@h/db?sslmode=require",
+                "host=db.example.com user=u sslmode=verify-full",
+                "host=db.example.com user=u sslmode=require",
+            ),
+            (
+                "postgres://u:p@db.example.com/db?sslmode=require",
+                "postgres://u:p@db.example.com/db?sslmode=require",
             ),
             // No `sslmode` at all used to pass through untouched, which left the driver default
             // `prefer` in force: TLS if the server offers it, plaintext if it declines, and anyone
-            // on the wire can make it decline. A remote host now gets `require`.
-            ("postgres://u:p@h/db", "postgres://u:p@h/db?sslmode=require"),
+            // on the wire can make it decline. A host out on the internet now gets `require`.
+            (
+                "postgres://u:p@db.example.com/db",
+                "postgres://u:p@db.example.com/db?sslmode=require",
+            ),
             ("postgres://u:p@localhost/db", "postgres://u:p@localhost/db"),
             (
-                "host=h user=u dbname=d",
-                "host=h user=u dbname=d sslmode=require",
+                "host=db.example.com user=u dbname=d",
+                "host=db.example.com user=u dbname=d sslmode=require",
             ),
             ("host=localhost user=u", "host=localhost user=u"),
         ] {
@@ -376,14 +390,14 @@ mod tests {
         // The keyword form takes a SPACE, not `?`. Appending URL syntax to it produced a string no
         // driver can parse, which is why both dialects are asserted here.
         assert!(
-            normalize_sslmode("host=h user=u dbname=d")
+            normalize_sslmode("host=db.example.com user=u dbname=d")
                 .parse::<postgres::Config>()
                 .is_ok(),
             "keyword form must still parse after the rewrite"
         );
         // after rewriting, the string MUST parse
         assert!(
-            normalize_sslmode("postgres://u:p@h:5432/db?sslmode=verify-full")
+            normalize_sslmode("postgres://u:p@db.example.com:5432/db?sslmode=verify-full")
                 .parse::<postgres::Config>()
                 .is_ok()
         );

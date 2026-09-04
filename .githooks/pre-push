@@ -27,6 +27,19 @@ run "cargo fmt --check"        cargo fmt --check
 run "cargo clippy -D warnings" cargo clippy --release --all-targets -- -D warnings
 run "cargo test"               cargo test --release
 [ -x tests/docs_claims.sh ] && run "documentation claims" ./tests/docs_claims.sh
+# A yanked dependency is a crate its own author withdrew, and it reaches everyone who builds us.
+# This is here because of one specific way the check LIED: detecting a yank needs a fresh crates.io
+# index, and a cached index answers "all clear" for as long as it stays cached. `cargo deny check`
+# passed on this machine and failed in CI on the same commit, from the same lockfile — the only
+# difference was that CI had no cache. So the refresh is forced, not assumed.
+#
+# It is skipped without network rather than blocking a push on a train.
+if command -v cargo-deny >/dev/null && curl -sf -o /dev/null --max-time 6 https://index.crates.io/config.json; then
+  run "yanked dependencies" bash -c 'cargo update --dry-run -q >/dev/null 2>&1; cargo deny check advisories'
+else
+  printf '  %-34s%s\n' "yanked dependencies" "skipped (no network or cargo-deny)"
+fi
+
 # The version lives in five places: Cargo.toml, Cargo.lock, mcpb/manifest.json, and TWICE in
 # server.json (the field, and the image tag the MCP registry pulls). Bumping four of them and
 # tagging cost a failed 0.1.8 release: `checks / audit` caught it, but only after the tag existed.

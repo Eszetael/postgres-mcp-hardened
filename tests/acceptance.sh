@@ -151,6 +151,23 @@ for env in "MCP_RATE_RPM=abc" "MCP_RATE_RPM=-5" "MCP_MAX_COST=0" "MCP_AUDIT_HMAC
   out=$(env DATABASE_URL="$URL" $env timeout 5 "$BIN" 2>&1); rc=$?
   [ $rc -eq 2 ] && ok "refuses to start: $env" || no "started with $env" "rc=$rc"
 done
+# Plaintext is judged by the wire, not by the wording, and the two used to disagree. The TLS default
+# asked "could somebody untrusted sit on this network"; this gate asked "is it loopback". The result
+# was inverted against the information the operator gave: on a container network, saying NOTHING got
+# a plaintext connection silently, and writing `sslmode=disable` — same wire, same risk, stated out
+# loud — was fatal at start-up. A gate that punishes the more explicit of two identical deployments
+# teaches people to be vaguer.
+out=$(env DATABASE_URL="postgres://u:p@postgres:5432/db?sslmode=disable" timeout 5 "$BIN" 2>&1); rc=$?
+case "$out" in
+  *"disables TLS"*) no "PLAINTEXT REFUSED ON A PRIVATE NETWORK while silence is allowed there" "$out";;
+  *) ok "explicit sslmode=disable on a private network is judged like silence there";;
+esac
+out=$(env DATABASE_URL="postgres://u:p@db.example.com/db?sslmode=disable" timeout 5 "$BIN" 2>&1); rc=$?
+case "$out$rc" in
+  *"disables TLS"*2) ok "and plaintext to a host out on the internet is still fatal";;
+  *) no "PLAINTEXT TO A REMOTE HOST WAS ACCEPTED" "rc=$rc $out";;
+esac
+
 out=$(env -u DATABASE_URL timeout 5 "$BIN" --validate "SELECT 1")
 [ "$out" = "ALLOW" ] && ok "validator works without a database" || no "offline validator" "$out"
 
