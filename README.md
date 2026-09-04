@@ -36,7 +36,7 @@
 >
 > Everything here is 0.1.x because nobody outside this project has run it against their own data.
 
-**The official Postgres MCP server was deprecated in 2024 and still gets 437k downloads a month. Its entire defence is one database-level read-only transaction — and that alone does not stop every write. This is a maintained Rust replacement with defence in depth.**
+**The official Postgres MCP server was deprecated in 2024 and still gets 391k downloads a month. Its entire defence is one database-level read-only transaction — and that alone does not stop every write. This is a maintained Rust replacement with defence in depth.**
 
 A drop-in [Model Context Protocol](https://modelcontextprotocol.io) server that lets an AI agent query PostgreSQL — **read-only, enforced at the database level**, with real SQL validation, timeouts, cost limits, OAuth 2.1, and an audit trail. Speaks **Streamable HTTP** and stdio, and negotiates the MCP revision: `2026-07-28` (current, and the default since upstream released it on 2026-08-03), `2025-11-25`, and `2025-06-18` — what most shipping clients still speak today. A client asks for what it knows; it is not negotiated down.
 

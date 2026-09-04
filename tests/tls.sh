@@ -106,5 +106,25 @@ case "$r" in
   *) no "A CERTIFICATE FOR ANOTHER HOST WAS ACCEPTED" "$r";;
 esac
 
+printf '\n== MCP_SSLROOTCERT replaces the trust anchors, it does not add to them ==\n'
+# Until 0.1.10 the private CA was ADDED to the system store plus every bundled Mozilla root, so an
+# operator pointing this at an RDS bundle — believing they had pinned trust to one issuer — still
+# trusted roughly 150 public authorities for that connection. Counting the anchors the server
+# reports at start-up is the cheapest way to keep the semantic from drifting back: nobody reverts a
+# number that a test is watching, and "more trusted roots is surely better" is a plausible-sounding
+# change for somebody who has not read this comment.
+start_pg good >/dev/null 2>&1
+anchors() {  # ile kotwic zaufania melduje serwer przy starcie
+  env DATABASE_URL="$URL" MCP_ADDR="127.0.0.1:$((PGPORT_TLS + 500 + RANDOM % 200))" "$@" \
+    timeout 8 "$BIN" 2>&1 | grep -oE 'TLS: [0-9]+ trust anchors' | grep -oE '[0-9]+' | head -1
+}
+n_private=$(anchors MCP_SSLROOTCERT="$DIR/ca.crt")
+n_public=$(anchors)
+if [ -n "$n_private" ] && [ -n "$n_public" ] && [ "$n_private" -lt 5 ] && [ "$n_public" -gt 50 ]; then
+  ok "a private CA is the ONLY anchor ($n_private), against $n_public without one"
+else
+  no "MCP_SSLROOTCERT DID NOT REPLACE THE TRUST ANCHORS" "prywatny=$n_private publiczny=$n_public"
+fi
+
 printf '\n== %d passed, %d failed ==\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ] || exit 1

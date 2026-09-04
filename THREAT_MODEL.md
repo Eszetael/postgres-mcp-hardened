@@ -193,8 +193,22 @@ server checks each one rather than assuming it.
   parsing it, it is deciding about a request it has not seen. We refuse the mismatch where the
   headers exist; we cannot invent them where they do not.
 
-- **Side channels.** Query cost and timing reveal information about data the caller may not read.
-  Unaddressed; addressing it properly would mean refusing legitimate work.
+- **Side channels, and the shape of what they actually reach.** Any predicate a caller can express
+  is a one-bit oracle: `SELECT CASE WHEN (subquery) THEN 1/0 ELSE 1 END` answers yes or no by
+  erroring or not, and timing answers a slower version of the same question. Unaddressed, because
+  addressing it properly would mean refusing arithmetic.
+
+  What it reaches is narrower than that sounds, and worth stating precisely rather than leaving as a
+  general worry. Tested 2026-09-04 with `MCP_REDACT_COLUMNS=ssn`: every form of the oracle aimed at
+  the redacted column is refused before it runs — through `WHERE`, through `EXISTS`, through
+  division, and through the `JOIN … USING` route that was itself a bypass until 0.1.8. The oracle
+  works only over columns the caller may already `SELECT`, where it tells them nothing they could
+  not have asked for directly.
+
+  So the residual risk is real but bounded by the same name-based rules as everything else: it is a
+  way to read what you can already read, one bit at a time. It becomes a leak exactly when those
+  rules have a hole — which is the argument for the role and the transaction being the boundary, not
+  this.
 - **`EXPLAIN` output.** A plan contains row estimates for tables the caller can see. This is
   inherent to giving anyone a planner.
 - **The model downstream.** Once data reaches the model, this server has no say in where it goes.

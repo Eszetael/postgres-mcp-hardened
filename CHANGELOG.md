@@ -1,5 +1,67 @@
 # Changelog
 
+## 0.1.10 — 2026-09-04 — the rest of the outside review
+
+0.1.8 and 0.1.9 closed the six bypasses an outside review found in a draft article. Three of its
+findings were left open at the time. They are closed here, and the last one turned out to need
+describing rather than fixing.
+
+### The allowlist governed queries and nothing else
+
+With `MCP_ALLOW_SCHEMAS=public`, `SELECT * FROM secret.salaries` was refused — and
+`describe_table(schema: "secret", table: "salaries")` returned every column, type and default, while
+`list_tables(schema: "secret")` named the table. `THREAT_MODEL.md` lists schema knowledge as a
+protected asset; the catalogue tools were handing it over.
+
+A named relation is now refused. Lists are **filtered** rather than refused, which is a deliberate
+difference: an agent that cannot discover what it MAY read starts guessing, and the operator turns
+the allowlist off.
+
+### The most ordinary connection string sent everything in the clear
+
+`postgres://user:pass@db.example.com/mydb` carries no `sslmode`, and the driver's default is
+`prefer`: TLS if the server offers it, plaintext if it declines. Measured against a non-loopback
+database with `ssl = off` — `pg_stat_ssl` reported `ssl: false`. Every query and every result in the
+clear, silently. The start-up gate refused only an explicit `sslmode=disable`, which catches the
+operator who said the dangerous thing out loud and misses the one who said nothing.
+
+A remote host with no explicit opinion now gets `require`. Loopback is untouched: there is no wire,
+and a local PostgreSQL ships with `ssl = off`. The refusal says outright that *we* raised the
+requirement and why, rather than leaving a handshake error about certificates nobody configured.
+
+Fixing this broke the keyword form (`host=h user=u`) on the way — `?sslmode=require` is URL syntax no
+driver parses, and `host=localhost` stopped reading as local, which would have failed every first
+run on a developer machine. Caught before release by probing both dialects instead of assuming one
+shape of input. Both are asserted now.
+
+### `MCP_SSLROOTCERT` extended the trust anchors instead of replacing them
+
+An operator pointing this at their RDS bundle, believing they had pinned trust to one issuer, still
+trusted **242** public authorities for that connection — anyone able to obtain a certificate for the
+database host from any of them could sit in the middle. It is also not what the name means anywhere
+else: libpq's `sslrootcert` names the file verification is done against.
+
+Now the only anchor. `tests/tls.sh` counts them (1 with a private CA, 242 without), because "more
+trusted roots is surely better" is a plausible-sounding change for somebody who has not read the
+comment, and a number a test is watching is harder to revert.
+
+### The side channel needed describing, not fixing
+
+Any predicate a caller can express is a one-bit oracle: `CASE WHEN (subquery) THEN 1/0 ELSE 1 END`
+answers by erroring or not. Tested against a redacted column through `WHERE`, `EXISTS`, division and
+the `JOIN … USING` route: every form is refused before it runs. It works only over columns the caller
+may already `SELECT`, where it reveals nothing they could not ask for directly. `THREAT_MODEL.md`
+says that precisely now instead of leaving it as a general worry.
+
+### Also
+
+The archived server's download figure aged out of tolerance on its own and Control G caught it:
+437k when it was written, 391k today. Corrected. That control exists because a number is only true
+on the day it was measured.
+
+152 unit tests, 315 acceptance cases, 121 adversarial corpus cases, 600,000 fuzz mutations per run,
+6 TLS scenarios, 11 documentation controls.
+
 ## 0.1.9 — 2026-08-18 — the 0.1.8 mitigation had a one-word bypass
 
 0.1.8 refused a constant expression that folds to more than the server could ever return, which

@@ -152,12 +152,25 @@ pub(crate) fn build_tls() -> Result<PgTls, String> {
     let _ = rustls::crypto::ring::default_provider().install_default();
 
     let mut roots = rustls::RootCertStore::empty();
-    // 1. the system store, if the image has one
-    for cert in rustls_native_certs::load_native_certs().certs {
-        let _ = roots.add(cert);
+    // `MCP_SSLROOTCERT` REPLACES the trust anchors; it does not extend them.
+    //
+    // Until 0.1.10 the private CA was added to the system store plus every bundled Mozilla root, so
+    // an operator who pointed this at their RDS bundle — believing they had pinned trust to one
+    // issuer — still trusted roughly 150 public authorities for that connection. Anyone able to get
+    // a certificate for the database host from ANY of them could sit in the middle.
+    //
+    // It is also what the name means everywhere else. libpq's `sslrootcert` names the file
+    // verification is done against, not a file to add to the pile, and an operator who has read the
+    // PostgreSQL documentation is entitled to that meaning here.
+    let private_ca = std::env::var("MCP_SSLROOTCERT").ok();
+    if private_ca.is_none() {
+        // 1. the system store, if the image has one
+        for cert in rustls_native_certs::load_native_certs().certs {
+            let _ = roots.add(cert);
+        }
+        // 2. bundled Mozilla roots — so it also works without a system store
+        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
     }
-    // 2. bundled Mozilla roots — so it also works without a system store
-    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
     // 3. the operator's private CA (an RDS/Supabase bundle, or self-signed on an intranet).
     //    PEM parsing comes from rustls' own pki-types; the separate rustls-pemfile crate was
     //    dropped after cargo-deny flagged it unmaintained (RUSTSEC-2025-0134). Carrying fewer
@@ -185,9 +198,13 @@ pub(crate) fn build_tls() -> Result<PgTls, String> {
     eprintln!(
         "TLS: {} trust anchors ({})",
         roots.len(),
-        match std::env::var("MCP_SSLROOTCERT") {
-            Ok(p) => format!("including private CA from {}", p),
-            Err(_) => "system + bundled Mozilla roots".to_string(),
+        match &private_ca {
+            Some(p) => format!(
+                "ONLY the CA in {} — the system store and the bundled Mozilla roots are not \
+                 trusted for this connection",
+                p
+            ),
+            None => "system + bundled Mozilla roots".to_string(),
         }
     );
     let cfg = rustls::ClientConfig::builder()
