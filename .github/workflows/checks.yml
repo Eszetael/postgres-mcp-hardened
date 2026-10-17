@@ -48,7 +48,7 @@ jobs:
     # image rather than from whatever was last installed on the machine (rustup had already vanished
     # from the host twice).
     container:
-      image: rust:1.97.1-bookworm  # matches rust-toolchain.toml, so `rustup show` is a confirmation
+      image: rust:1.99.1-bookworm  # matches rust-toolchain.toml, so `rustup show` is a confirmation
     services:
       postgres:
         image: postgres:${{ matrix.pg }}
@@ -132,7 +132,7 @@ jobs:
     # not. A job that assumes tooling is a job that fails on the first machine that lacks it, so the
     # tooling comes from the image and stops being a property of the host.
     container:
-      image: rust:1.97.1-bookworm
+      image: rust:1.99.1-bookworm
     services:
       postgres:
         image: postgres:16
@@ -300,7 +300,7 @@ jobs:
     # over stdio and Streamable HTTP. A protocol mistake shows up as a client that cannot talk to us.
     runs-on: ${{ vars.RUNNER_LABEL || 'ubuntu-latest' }}
     container:
-      image: rust:1.97.1-bookworm
+      image: rust:1.99.1-bookworm
     services:
       postgres:
         image: postgres:18

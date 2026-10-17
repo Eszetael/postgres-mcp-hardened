@@ -5,5 +5,5 @@
 # dependency tree had moved to a crate requiring 1.85 (edition 2024). Everything passed locally on a
 # newer toolchain and every job failed on the first real CI run.
 [toolchain]
-channel = "1.97.1"
+channel = "1.99.1"
 components = ["clippy", "rustfmt"]
