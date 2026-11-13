@@ -431,6 +431,48 @@ fn alias_renames_columns(alias: Option<&TableAlias>) -> bool {
     alias.is_some_and(|a| !a.columns.is_empty())
 }
 impl SecurityScanner {
+    /// `TABLE x` as a query body or a set-operation branch is `SELECT * FROM x`, but the parser keeps
+    /// its name as two `String`s, not an `ObjectName`, so `pre_visit_relation` never ran for it:
+    /// `SELECT 1 UNION ALL TABLE pg_largeobject` was allowed while `SELECT * FROM pg_largeobject`
+    /// was refused as raw storage. The same two rules are applied here.
+    fn table_branches(&mut self, se: &SetExpr) -> ControlFlow<()> {
+        match se {
+            SetExpr::Table(t) => {
+                let Some(table) = t.table_name.as_deref() else {
+                    self.hit =
+                        Some("a TABLE statement with no readable name — refused unread".into());
+                    return ControlFlow::Break(());
+                };
+                let parts: Vec<String> = t
+                    .schema_name
+                    .iter()
+                    .map(|s| s.to_lowercase())
+                    .chain([table.to_lowercase()])
+                    .collect();
+                if let Some(r) = raw_storage_parts(&parts) {
+                    self.hit = Some(format!(
+                        "raw-storage relation: {} — it holds physical storage rather than columns, \
+                         so column controls (redaction, projection) cannot inspect it",
+                        r
+                    ));
+                    return ControlFlow::Break(());
+                }
+                let lowered = table.to_lowercase();
+                if matches!(classify_function(&lowered), FnVerdict::SideEffect) {
+                    self.hit = Some(format!("side-effect function: {}", lowered));
+                    return ControlFlow::Break(());
+                }
+                ControlFlow::Continue(())
+            }
+            SetExpr::Query(q) => self.table_branches(&q.body),
+            SetExpr::SetOperation { left, right, .. } => {
+                self.table_branches(left)?;
+                self.table_branches(right)
+            }
+            _ => ControlFlow::Continue(()),
+        }
+    }
+
     /// Redaction masks a value by the KEY it comes back under, so what has to be closed is every way
     /// of moving a column to a key the operator did not list.
     ///
@@ -558,6 +600,7 @@ impl SecurityScanner {
 impl Visitor for SecurityScanner {
     type Break = ();
     fn pre_visit_query(&mut self, q: &Query) -> ControlFlow<()> {
+        self.table_branches(&q.body)?;
         if self.redaction_on {
             if let Some(w) = &q.with {
                 for cte in &w.cte_tables {
@@ -943,6 +986,12 @@ fn is_raw_storage_relation(name: &ObjectName) -> Option<String> {
         .iter()
         .filter_map(|p| Some(p.as_ident()?.value.to_lowercase()))
         .collect();
+    raw_storage_parts(&parts)
+}
+
+/// The same rule over already-split, lower-cased name parts, for the places that do not hold an
+/// `ObjectName`: `TABLE x` keeps its schema and table as two plain strings.
+fn raw_storage_parts(parts: &[String]) -> Option<String> {
     if parts.is_empty() {
         return None;
     }
@@ -2447,6 +2496,10 @@ mod adversarial {
         r#"SELECT * FROM crosstab('select 1,2,3') AS ct(a int, b int)"#,
         r#"SELECT * FROM LATERAL ts_stat('select 1') x"#,
         r#"SELECT pg_catalog.ts_stat('select 1')"#,
+        // `TABLE x` carries its name as a plain String, so the relation rules never saw it.
+        r#"(TABLE pg_toast.pg_toast_16384)"#,
+        r#"SELECT 1 UNION ALL TABLE pg_largeobject"#,
+        r#"SELECT 1 UNION ALL TABLE pg_statistic"#,
         // Garbage / parse errors
         r#"garbage(((("#,
         r#""#,
