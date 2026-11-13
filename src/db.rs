@@ -840,15 +840,27 @@ pub(crate) fn is_row_query(sql: &str) -> bool {
         || up.starts_with("TABLE")
 }
 
+/// Leaves the session in a known state whatever the previous user of this pooled connection did.
+///
+/// A statement that fails inside `BEGIN TRANSACTION READ ONLY` leaves the transaction aborted, and
+/// `DISCARD ALL` cannot run in one, so every later request that drew the connection died on
+/// `db error` until `idle_in_transaction_session_timeout` (10 s) killed it. `SHOW no_such_setting`
+/// was enough. ROLLBACK first makes that independent of which exit path forgot to say it; outside a
+/// transaction it is only a warning, so its result is ignored.
+pub(crate) fn reset_session(client: &mut postgres::Client) -> Result<(), String> {
+    let _ = client.batch_execute("ROLLBACK");
+    client
+        .batch_execute("DISCARD ALL")
+        .map_err(|e| e.to_string())
+}
+
 pub(crate) fn execute_readonly(final_sql: &str, db: Option<&str>) -> Result<Value, String> {
     let pool = pool_for(db)?;
     let mut client = pool.get().map_err(|_| pool_error_detail(db))?;
     // Session-level defence in depth: timeouts + read-only (the database refuses a write even if the
     // validator let something through). DISCARD ALL resets pooled session state (Session Pollution).
     // It MUST be its own statement — a multi-statement batch is an implicit transaction, and
-    client
-        .batch_execute("DISCARD ALL")
-        .map_err(|e| e.to_string())?;
+    reset_session(&mut client)?;
     // Configurable, because a hardcoded ceiling is either too low for analytics or too high for a
     // shared database — the most requested setting against the leading alternative.
     client
@@ -977,9 +989,14 @@ pub(crate) fn execute_readonly(final_sql: &str, db: Option<&str>) -> Result<Valu
         // EXPLAIN / SHOW — cannot be wrapped in a subquery; text columns, col_to_json is enough.
         // This branch has NO cost guard (you cannot EXPLAIN an EXPLAIN), so the byte cap is the only
         // defence here — `EXPLAIN VERBOSE` of a long UNION can return hundreds of KB of plan.
-        let rows = client
-            .query(final_sql, &[])
-            .map_err(|e| friendly_pg_error_for(&e, Some(final_sql)))?;
+        // The transaction is aborted by a failure here, and the connection goes back to the pool.
+        let rows = match client.query(final_sql, &[]) {
+            Ok(rows) => rows,
+            Err(e) => {
+                let _ = client.batch_execute("ROLLBACK");
+                return Err(friendly_pg_error_for(&e, Some(final_sql)));
+            }
+        };
         let mut acc: Vec<Value> = Vec::new();
         let mut bytes = 0usize;
         for row in rows.iter() {
@@ -1022,9 +1039,7 @@ pub(crate) fn query_catalog(
 ) -> Result<Value, String> {
     let pool = pool_for(db)?;
     let mut client = pool.get().map_err(|_| pool_error_detail(db))?;
-    client
-        .batch_execute("DISCARD ALL")
-        .map_err(|e| e.to_string())?;
+    reset_session(&mut client)?;
     client
         .batch_execute(&format!(
             "SET statement_timeout='{}'; SET default_transaction_read_only=on;{}",
@@ -1184,9 +1199,7 @@ pub(crate) fn simulate_index(
 
     let pool = pool_for(db)?;
     let mut client = pool.get().map_err(|_| pool_error_detail(db))?;
-    client
-        .batch_execute("DISCARD ALL")
-        .map_err(|e| e.to_string())?;
+    reset_session(&mut client)?;
     client
         .batch_execute(&format!(
             "SET statement_timeout='{}'; SET idle_in_transaction_session_timeout='10s'; \
