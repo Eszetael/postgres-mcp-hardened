@@ -2,9 +2,9 @@
 //! We trust the AST (sqlparser), not regexes: comments and obfuscation disappear when the tree is built.
 use once_cell::sync::Lazy;
 use sqlparser::ast::{
-    BinaryOperator, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, JoinConstraint,
-    JoinOperator, LimitClause, ObjectName, Query, SelectItem, SetExpr, Statement, TableAlias,
-    TableFactor, Value, Visit, Visitor,
+    BinaryOperator, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr,
+    JoinConstraint, JoinOperator, LimitClause, ObjectName, OrderBy, OrderByKind, Query, SelectItem,
+    SetExpr, Statement, TableAlias, TableFactor, Value, Visit, Visitor,
 };
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
@@ -370,6 +370,45 @@ pub fn is_query_stmt(sql: &str) -> bool {
     matches!(parse(sql).as_deref(), Ok([Statement::Query(_)]))
 }
 
+/// The text of a string literal, in every spelling that carries one, so the list of variants lives
+/// in one place. `U&'..'` is returned undecoded: its `\XXXX` escapes are not resolved, which is as far
+/// as this best-effort layer goes (see `unescape_sql_literal`).
+fn string_literal_text(v: &Value) -> Option<&str> {
+    match v {
+        Value::SingleQuotedString(s)
+        | Value::EscapedStringLiteral(s)
+        | Value::NationalStringLiteral(s)
+        | Value::DoubleQuotedString(s)
+        | Value::UnicodeStringLiteral(s) => Some(s),
+        Value::DollarQuotedString(d) => Some(&d.value),
+        _ => None,
+    }
+}
+
+/// Does a query body hand back `*` (or `t.*`) columns? Fail-closed: a body this does not recognise
+/// counts as yes. `TABLE t` is `SELECT * FROM t`, and it carries its name as a plain `String`, so
+/// `RowRefCollector` never saw it either; refusing it here is what covers that route under redaction.
+fn projects_wildcard(se: &SetExpr) -> bool {
+    match se {
+        SetExpr::Select(s) => s.projection.iter().any(|i| {
+            matches!(
+                i,
+                SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(..)
+            )
+        }),
+        SetExpr::Query(q) => projects_wildcard(&q.body),
+        SetExpr::SetOperation { left, right, .. } => {
+            projects_wildcard(left) || projects_wildcard(right)
+        }
+        SetExpr::Values(_) => false,
+        _ => true,
+    }
+}
+
+fn is_number_literal(e: &Expr) -> bool {
+    matches!(e, Expr::Value(vs) if matches!(vs.value, Value::Number(..)))
+}
+
 /// Walks the AST and detects a denylisted function by the NAME IN THE TREE (Expr::Function and
 /// relation/table-function names), regardless of how literals or comments are rendered as text —
 /// and checks the read-only shape of EVERY Query node, not just the top level.
@@ -392,6 +431,62 @@ fn alias_renames_columns(alias: Option<&TableAlias>) -> bool {
     alias.is_some_and(|a| !a.columns.is_empty())
 }
 impl SecurityScanner {
+    /// Redaction masks a value by the KEY it comes back under, so what has to be closed is every way
+    /// of moving a column to a key the operator did not list.
+    ///
+    /// A set operation takes its column names from the FIRST branch and matches the rest by position:
+    /// `SELECT 0 AS a, 'x' AS b, 'y' AS c UNION ALL SELECT * FROM staff` returned the password column
+    /// under the name `c`. `INTERSECT` and `EXCEPT` do not move the value but answer "is this value
+    /// in the column" as a row count. `ORDER BY 3` and `GROUP BY 3` over a `*` name a column that
+    /// the statement never writes. All of it is refused while redaction is on and a `*` is involved;
+    /// naming the columns instead is the price, and the message says so.
+    fn positional_evasion(&mut self, q: &Query) -> ControlFlow<()> {
+        if !self.redaction_on {
+            return ControlFlow::Continue(());
+        }
+        if let SetExpr::SetOperation { left, right, .. } = q.body.as_ref() {
+            if projects_wildcard(left) || projects_wildcard(right) {
+                self.evasion = Some(
+                    "`*` inside UNION/INTERSECT/EXCEPT — a set operation matches columns by \
+                     position and takes their names from the first branch, so a redacted column \
+                     would come back under another name (name the columns instead)"
+                        .into(),
+                );
+                return ControlFlow::Break(());
+            }
+        }
+        if !projects_wildcard(&q.body) {
+            return ControlFlow::Continue(());
+        }
+        if let Some(OrderBy {
+            kind: OrderByKind::Expressions(exprs),
+            ..
+        }) = &q.order_by
+        {
+            if exprs.iter().any(|o| is_number_literal(&o.expr)) {
+                self.evasion = Some(
+                    "ORDER BY <position> together with `*` — it orders by a column that is never \
+                     named (name the columns instead)"
+                        .into(),
+                );
+                return ControlFlow::Break(());
+            }
+        }
+        if let SetExpr::Select(s) = q.body.as_ref() {
+            if let GroupByExpr::Expressions(exprs, _) = &s.group_by {
+                if exprs.iter().any(is_number_literal) {
+                    self.evasion = Some(
+                        "GROUP BY <position> together with `*` — it groups by a column that is \
+                         never named (name the columns instead)"
+                            .into(),
+                    );
+                    return ControlFlow::Break(());
+                }
+            }
+        }
+        ControlFlow::Continue(())
+    }
+
     /// A join can name a redacted column without ever writing it as an expression.
     ///
     /// `SELECT count(*) FROM people JOIN (SELECT '123-45-6789' AS ssn) g USING (ssn)` was ALLOWED
@@ -486,6 +581,7 @@ impl Visitor for SecurityScanner {
             return ControlFlow::Break(());
         }
         self.join_constraint_evasion(q)?;
+        self.positional_evasion(q)?;
         ControlFlow::Continue(())
     }
     fn pre_visit_expr(&mut self, expr: &Expr) -> ControlFlow<()> {
@@ -528,9 +624,15 @@ impl Visitor for SecurityScanner {
                 }
             }
             // `t.*` inside an expression is a QualifiedWildcard, not an Identifier, so the whole-row
-            // check above walked straight past `ROW(t.*)::text` and `to_jsonb(t.*)::text`. In a plain
-            // projection `SELECT t.*` the columns keep their names and masking still applies, and that
-            // form is a SelectItem, not an Expr — so it is unaffected by this.
+            // check above walked straight past `ROW(t.*)::text` and `to_jsonb(t.*)::text`, and
+            // `(t.*)::text` and `VALUES (t.*)` after them: a record flattened into one value carries
+            // the redacted column out under a key that is not its name. In a plain projection
+            // `SELECT t.*` the columns keep their names and masking still applies, and that form is
+            // a SelectItem, not an Expr, so it is unaffected. `count(*)` is a function argument.
+            Expr::QualifiedWildcard(..) | Expr::Wildcard(..) if self.redaction_on => {
+                self.evasion = Some("using a whole row (`t.*`) as a value".into());
+                return ControlFlow::Break(());
+            }
             // The column name as a STRING, not an identifier: `to_jsonb(t) ->> 'password'`,
             // `#>> '{password}'`, `jsonb_path_query(…, '$.password')`. The scanner matches
             // identifiers, so none of these looked like a reference to anything.
@@ -538,29 +640,27 @@ impl Visitor for SecurityScanner {
             // `$$password$$` and the national/unicode forms all name the same key.
             // `Expr::Value` carries a `ValueWithSpan` from sqlparser 0.62; the literal itself
             // sits in `.value`. Matching through it changes nothing about which spellings count.
-            Expr::Value(vs)
-                if matches!(
-                    &vs.value,
-                    Value::SingleQuotedString(_)
-                        | Value::EscapedStringLiteral(_)
-                        | Value::NationalStringLiteral(_)
-                        | Value::DoubleQuotedString(_)
-                ) =>
-            {
-                let s = match &vs.value {
-                    Value::SingleQuotedString(s)
-                    | Value::EscapedStringLiteral(s)
-                    | Value::NationalStringLiteral(s)
-                    | Value::DoubleQuotedString(s) => s,
-                    _ => unreachable!("guarded by the match above"),
-                };
-                if let Some(col) = redacted_name_inside(&unescape_sql_literal(s).to_lowercase()) {
-                    self.evasion = Some(format!(
-                        "naming the redacted column `{}` inside a string literal",
-                        col
-                    ));
-                    return ControlFlow::Break(());
+            Expr::Value(vs) => {
+                if let Some(s) = string_literal_text(&vs.value) {
+                    if let Some(col) = redacted_name_inside(&unescape_sql_literal(s).to_lowercase())
+                    {
+                        self.evasion = Some(format!(
+                            "naming the redacted column `{}` inside a string literal",
+                            col
+                        ));
+                        return ControlFlow::Break(());
+                    }
                 }
+            }
+            // A subquery compared by POSITION: `(id, name, 'guess') IN (SELECT * FROM staff)` and
+            // `ROW(..) = (SELECT * FROM staff)` ask whether a value is in a column nobody named, and
+            // the answer comes back as a row count. EXISTS is left alone: `EXISTS (SELECT * ..)` is
+            // how everybody writes it and it compares nothing.
+            Expr::InSubquery { subquery, .. } | Expr::Subquery(subquery)
+                if self.redaction_on && projects_wildcard(&subquery.body) =>
+            {
+                self.evasion = Some("`*` in a subquery compared by position".into());
+                return ControlFlow::Break(());
             }
             Expr::CompoundIdentifier(parts) => {
                 if let Some(last) = parts.last() {
@@ -2702,6 +2802,79 @@ mod join_oracle_tests {
             .evasion
             .or(scanner.hit)
             .filter(|m| m.contains(redacted) || m.contains("NATURAL"))
+    }
+
+    /// What the scanner says about a statement with redaction on, whatever the wording. Structural
+    /// rules (a wildcard as a value, a positional rename) name no column, so `evasion_for`'s filter
+    /// on the column name would hide them.
+    fn refusal_with_redaction(sql: &str) -> Option<String> {
+        let ast = Parser::parse_sql(&PostgreSqlDialect {}, sql)
+            .unwrap_or_else(|e| panic!("does not parse: {sql}: {e}"));
+        let mut scanner = SecurityScanner {
+            hit: None,
+            redacted: None,
+            redaction_on: true,
+            row_refs: std::collections::HashSet::new(),
+            evasion: None,
+            oversized: None,
+        };
+        let _ = ast[0].visit(&mut scanner);
+        scanner.evasion.or(scanner.hit)
+    }
+
+    /// Redaction masks by KEY, so anything that carries a value out under a key of the caller's
+    /// choosing walks past it: a set operation takes its column names from the first branch, a whole
+    /// row flattened to text has no keys, `ORDER BY 3` sorts by a column never named. Found by
+    /// review of 0.1.10 against a live server, each returning the password column in the clear.
+    #[test]
+    fn positional_and_wildcard_routes_around_redaction_are_refused() {
+        let refused = [
+            "SELECT 0 AS a, 'x' AS b, 'y' AS c UNION ALL SELECT * FROM staff",
+            "SELECT * FROM staff UNION ALL SELECT 0, 'x', 'y'",
+            "VALUES (0,'x','y') UNION ALL SELECT * FROM staff",
+            "SELECT 0, 'x', 'y' UNION ALL TABLE staff",
+            "SELECT 0, 'x', 'y' UNION ALL (SELECT s.* FROM staff s)",
+            "SELECT max(c) FROM (SELECT 0 AS a, 'x' AS b, 'y' AS c UNION ALL SELECT * FROM staff) u",
+            "SELECT count(*) FROM (SELECT * FROM staff INTERSECT SELECT 1, 'Ada', 'guess') q",
+            "SELECT * FROM staff EXCEPT SELECT 1, 'Ada', 'guess'",
+            "SELECT (s.*)::text FROM staff s",
+            "SELECT CAST(s.* AS text) FROM staff s",
+            "SELECT z.* FROM staff s, LATERAL (VALUES (s.*)) z",
+            "SELECT * FROM staff s WHERE (s.*)::text LIKE '%a%'",
+            "SELECT * FROM staff WHERE (staff_id, first_name, 'guess') IN (SELECT * FROM staff)",
+            "SELECT 1 WHERE ROW(1, 'Ada', 'guess') = (SELECT * FROM staff LIMIT 1)",
+            "SELECT * FROM staff ORDER BY 3",
+            "SELECT * FROM staff ORDER BY 3 DESC, 1",
+            "SELECT s.* FROM staff s ORDER BY 3",
+        ];
+        let allowed = [
+            "SELECT * FROM staff",
+            "SELECT s.* FROM staff s",
+            "SELECT * FROM staff LIMIT 1",
+            "SELECT count(*) FROM staff",
+            "SELECT * FROM staff ORDER BY staff_id",
+            "SELECT staff_id, first_name FROM staff ORDER BY 2",
+            "SELECT first_name, count(*) FROM staff GROUP BY 1",
+            "SELECT staff_id FROM staff UNION ALL SELECT staff_id FROM staff",
+            "SELECT 1 FROM film WHERE EXISTS (SELECT * FROM staff WHERE staff_id = 1)",
+            "SELECT * FROM (SELECT * FROM staff) q",
+            "WITH w AS (SELECT * FROM staff) SELECT * FROM w",
+            "SELECT * FROM staff a JOIN film b ON true",
+            "SELECT 1 WHERE 1 IN (SELECT staff_id FROM staff)",
+        ];
+        let leaked: Vec<_> = refused
+            .iter()
+            .filter(|s| refusal_with_redaction(s).is_none())
+            .collect();
+        assert!(
+            leaked.is_empty(),
+            "NOT REFUSED under redaction: {leaked:#?}"
+        );
+        let broken: Vec<_> = allowed
+            .iter()
+            .filter_map(|s| refusal_with_redaction(s).map(|m| (s, m)))
+            .collect();
+        assert!(broken.is_empty(), "REFUSED, MUST STILL WORK: {broken:#?}");
     }
 
     /// The bypass this closes. With `MCP_REDACT_COLUMNS=ssn` this returned 1000 for a value present
