@@ -51,3 +51,4 @@ deny	SELECT repeat(repeat(repeat(chr(120),1000),1000),1000)	round 0.1.9: chr() i
 deny	SELECT repeat(chr(120), 100000000)	.
 deny	SELECT repeat(md5('a'), 10000000)	enumerating chr would have invited md5, then upper, then the next one
 allow	SELECT repeat(chr(45), 80)	a separator written with chr is still a separator
+deny	EXPLAIN (ANALYSE) SELECT * FROM {{T2}}	round 0.1.11: PostgreSQL accepts the British spelling and it executes just the same

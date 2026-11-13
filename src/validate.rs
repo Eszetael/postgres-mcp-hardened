@@ -740,16 +740,37 @@ fn structural_readonly(stmt: &Statement) -> Result<(), ValidationError> {
             // did not exist when this check was written. Reading only the bool let the parenthesised
             // form through, and ANALYZE executes the statement. The old parser hid this by failing
             // to parse the form at all, which is not a control; it is luck.
-            let analyze_in_options = options.as_ref().is_some_and(|opts| {
+            //
+            // Then a third: PostgreSQL accepts `ANALYSE` as the same option, and the parser returns
+            // the name as written. Looking for the one word somebody thought of missed the other
+            // spelling, and `EXPLAIN (ANALYSE)` ran a 50k x 50k cross join to statement_timeout past
+            // the cost guard. So the options are an allowlist: a name nobody listed is refused.
+            const ALLOWED_OPTIONS: &[&str] = &[
+                "verbose",
+                "costs",
+                "settings",
+                "generic_plan",
+                "buffers",
+                "summary",
+                "memory",
+                "format",
+            ];
+            let refused_option = options.as_ref().and_then(|opts| {
                 opts.iter()
-                    .any(|o| o.name.value.eq_ignore_ascii_case("analyze"))
+                    .map(|o| o.name.value.to_lowercase())
+                    .find(|n| !ALLOWED_OPTIONS.contains(&n.as_str()))
             });
-            if *analyze || analyze_in_options {
-                Err(ValidationError::NotReadOnly(
+            match refused_option {
+                _ if *analyze => Err(ValidationError::NotReadOnly(
                     "EXPLAIN ANALYZE (executes the plan)".into(),
-                ))
-            } else {
-                structural_readonly(statement)
+                )),
+                Some(n) if n == "analyze" || n == "analyse" => Err(ValidationError::NotReadOnly(
+                    "EXPLAIN ANALYZE (executes the plan)".into(),
+                )),
+                Some(n) => Err(ValidationError::NotReadOnly(format!(
+                    "EXPLAIN option {n} is not on the allowlist"
+                ))),
+                None => structural_readonly(statement),
             }
         }
         Statement::ExplainTable { .. } => Ok(()),
@@ -1943,6 +1964,15 @@ mod tests {
             "EXPLAIN (ANALYZE) SELECT * FROM t",
             "EXPLAIN (ANALYZE true, VERBOSE) SELECT * FROM t",
             "EXPLAIN (VERBOSE, ANALYZE) SELECT * FROM t",
+            // PostgreSQL takes the British spelling as the same option; the parser hands the name
+            // back as written, and a deny-list only knows what somebody thought of.
+            "EXPLAIN (ANALYSE) SELECT * FROM t",
+            "EXPLAIN (analyse true) SELECT * FROM t",
+            "EXPLAIN (VERBOSE, ANALYSE) SELECT * FROM t",
+            "EXPLAIN (WAL) SELECT 1",
+            "EXPLAIN (TIMING) SELECT 1",
+            "EXPLAIN (SERIALIZE) SELECT 1",
+            "EXPLAIN (NO_SUCH_OPTION) SELECT 1",
         ] {
             assert!(
                 validate_readonly(sql).is_err(),
@@ -1950,8 +1980,29 @@ mod tests {
             );
         }
         // Plain EXPLAIN still has to work, or we have replaced a hole with a regression.
-        assert!(validate_readonly("EXPLAIN SELECT 1").is_ok());
-        assert!(validate_readonly("EXPLAIN (VERBOSE) SELECT 1").is_ok());
+        for sql in [
+            "EXPLAIN SELECT 1",
+            "EXPLAIN VERBOSE SELECT 1",
+            "EXPLAIN (VERBOSE) SELECT 1",
+            "EXPLAIN (FORMAT JSON) SELECT 1",
+            "EXPLAIN (COSTS off, VERBOSE) SELECT 1",
+            "EXPLAIN (GENERIC_PLAN) SELECT 1",
+        ] {
+            assert!(
+                validate_readonly(sql).is_ok(),
+                "plain EXPLAIN must stay allowed: {sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_allowed_explain_option_still_exposes_the_explained_statement() {
+        // The surface check reads the statement under EXPLAIN; an option that made this return None
+        // would switch that check off for it.
+        assert_eq!(
+            explained_statement("EXPLAIN (GENERIC_PLAN, MEMORY) SELECT 1 FROM secret.t").as_deref(),
+            Some("SELECT 1 FROM secret.t")
+        );
     }
 
     #[test]
