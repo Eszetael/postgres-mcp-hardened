@@ -794,6 +794,8 @@ pub enum FnVerdict {
     UnknownCatalog,
     /// Reads real data, but in a shape column-level controls cannot see: raw pages, raw tuples.
     RawStorage,
+    /// Runs SQL it was handed as text, so nothing in the statement shows what it will read.
+    SqlAsText,
 }
 
 /// Relations that ARE the storage, rather than a view of it.
@@ -862,6 +864,28 @@ const RAW_STORAGE_FUNCS: &[&str] = &[
     "fsm_page_contents",
     "gist_page_items",
     "gist_page_items_bytea",
+];
+
+/// Functions that run a query handed to them as TEXT.
+///
+/// The `query_to_*`, `table_to_*` and `cursor_to_*` families are denied for this reason, and these
+/// do the same thing under names nobody would put in a family: `ts_stat(text)` and the two-argument
+/// `ts_rewrite(tsquery, text)` run their argument through SPI. The AST cannot see inside a string
+/// literal, so every rule here is blind to what they read. Shown live on 0.1.10:
+/// `SELECT * FROM ts_stat('select to_tsvector(''simple'', s::text) from staff s')` returned the
+/// redacted column as words, and with `pg_read_file(..)` in the argument it returned a server file.
+/// The list is names, so for extensions it cannot be complete; the core is.
+const SQL_AS_TEXT_FUNCS: &[&str] = &[
+    "ts_stat",
+    "ts_rewrite",
+    // tablefunc
+    "crosstab",
+    "crosstab2",
+    "crosstab3",
+    "crosstab4",
+    "connectby",
+    // xml2: assembles and runs a query from its arguments
+    "xpath_table",
 ];
 
 /// Extension functions that change the database while living outside the catalog namespace.
@@ -1144,6 +1168,9 @@ pub fn classify_function(name: &str) -> FnVerdict {
     if RAW_STORAGE_FUNCS.contains(&name) {
         return FnVerdict::RawStorage;
     }
+    if SQL_AS_TEXT_FUNCS.contains(&name) {
+        return FnVerdict::SqlAsText;
+    }
     if SIDE_EFFECT_FUNCS.contains(&name)
         || EXTENSION_WRITE_FUNCS.contains(&name)
         || DENY_FAMILIES.iter().any(|p| name.starts_with(p))
@@ -1166,6 +1193,11 @@ fn function_rejection(name: &str) -> Option<String> {
         FnVerdict::RawStorage => Some(format!(
             "raw-storage function: {} — it returns pages or tuples as bytes, which column controls \
              (redaction, projection) cannot inspect",
+            name
+        )),
+        FnVerdict::SqlAsText => Some(format!(
+            "function that runs SQL passed as text: {} — nothing inside a string literal is visible \
+             to this validator (allow it with MCP_ALLOW_FUNCTIONS if you accept that)",
             name
         )),
         FnVerdict::UnknownCatalog => Some(format!(
@@ -2257,6 +2289,13 @@ mod adversarial {
         // FOR UPDATE / FOR SHARE — blokady wierszy, PG odrzuca w read-only txn
         r#"SELECT * FROM t FOR UPDATE"#,
         r#"SELECT * FROM t FOR SHARE"#,
+        // The same class as query_to_xml, outside its families: the argument is a query, run through SPI.
+        r#"SELECT * FROM ts_stat('select 1')"#,
+        r#"SELECT ts_stat('select 1')"#,
+        r#"SELECT ts_rewrite('a'::tsquery, 'select 1')"#,
+        r#"SELECT * FROM crosstab('select 1,2,3') AS ct(a int, b int)"#,
+        r#"SELECT * FROM LATERAL ts_stat('select 1') x"#,
+        r#"SELECT pg_catalog.ts_stat('select 1')"#,
         // Garbage / parse errors
         r#"garbage(((("#,
         r#""#,
@@ -2282,6 +2321,11 @@ mod adversarial {
         r#"SELECT now(), current_date"#,
         // A literal containing the name of a writing function — literal stripping must let this through
         r#"SELECT 'setval(x)' AS note"#,
+        // Full-text search is not the door: only the functions that take a query as text are.
+        r#"SELECT to_tsvector('simple','a b')"#,
+        r#"SELECT plainto_tsquery('a')"#,
+        r#"SELECT ts_rank(to_tsvector('a'), to_tsquery('a'))"#,
+        r#"SELECT ts_headline('a b', to_tsquery('a'))"#,
     ];
 
     // Uncertain / for manual inspection: no hard assertion, logged only
@@ -2336,6 +2380,7 @@ mod adversarial {
             "get_raw_page('t',0)",
             "cron.schedule('a','b','c')",
             "pg_export_snapshot()",
+            "ts_stat('select 1')",
         ];
         const SITES: &[&str] = &[
             "SELECT {f}",
