@@ -24,3 +24,5 @@ deny	SELECT database_to_xml(true, false, '')	.
 allow	SELECT version()	an ordinary read-only builtin
 allow	SELECT pg_size_pretty(pg_relation_size('{{T2}}'))	catalog functions known to read
 allow	SELECT generate_series(1, 3)	set-returning builtins are fine
+deny	SELECT * FROM LATERAL pg_read_file('postgresql.conf') x	round 0.1.11: LATERAL makes a function in FROM a different AST node, and the name was never read
+deny	SELECT * FROM {{T2}} JOIN LATERAL pg_sleep(1) s ON true	round 0.1.11: the same door through a join

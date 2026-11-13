@@ -64,6 +64,8 @@ impl Rng {
 /// Corpus of WRITES/side effects — each MUST be rejected under every semantically equivalent mutation.
 /// Collected from unit tests, adversarial review rounds, the vector generator and the parser differential.
 const WRITE_SEEDS: &[&str] = &[
+    "SELECT * FROM LATERAL pg_read_file('/etc/passwd') x",
+    "SELECT * FROM t JOIN LATERAL dblink_exec('c', 'DROP TABLE t') d ON true",
     "INSERT INTO users VALUES (1)",
     "UPDATE users SET name = 'bob' WHERE id = 1",
     "DELETE FROM users WHERE id = 1",

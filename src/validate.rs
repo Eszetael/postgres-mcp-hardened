@@ -658,6 +658,8 @@ impl Visitor for SecurityScanner {
                 TableFactor::Table { alias, .. }
                 | TableFactor::Derived { alias, .. }
                 | TableFactor::TableFunction { alias, .. }
+                | TableFactor::Function { alias, .. }
+                | TableFactor::UNNEST { alias, .. }
                 | TableFactor::NestedJoin { alias, .. } => alias.as_ref(),
                 _ => None,
             };
@@ -666,24 +668,49 @@ impl Visitor for SecurityScanner {
                 return ControlFlow::Break(());
             }
         }
-        if let TableFactor::Table {
-            name,
-            args: Some(_),
-            ..
-        } = tf
-        {
-            if name_has_unreadable_part(name) {
-                self.hit =
-                    Some("a table function named by a function call — refused unread".into());
-                return ControlFlow::Break(());
+        // No `_` arm on purpose. `FROM f(..)` and `FROM LATERAL f(..)` are two different variants, and
+        // the second one went unread until 0.1.11: `SELECT * FROM LATERAL pg_read_file('/etc/hostname') x`
+        // returned the file. A variant added by a parser upgrade has to stop the build here.
+        match tf {
+            TableFactor::Table {
+                name,
+                args: Some(_),
+                ..
             }
-            if let Some(msg) = qualified_function_rejection(name) {
-                self.hit = Some(msg);
-                return ControlFlow::Break(());
+            | TableFactor::Function { name, .. } => {
+                if name_has_unreadable_part(name) {
+                    self.hit =
+                        Some("a table function named by a function call — refused unread".into());
+                    return ControlFlow::Break(());
+                }
+                if let Some(msg) = qualified_function_rejection(name) {
+                    self.hit = Some(msg);
+                    return ControlFlow::Break(());
+                }
+                ControlFlow::Continue(())
             }
+            // Their expressions still pass through `pre_visit_expr`.
+            TableFactor::Table { args: None, .. }
+            | TableFactor::Derived { .. }
+            | TableFactor::TableFunction { .. }
+            | TableFactor::UNNEST { .. }
+            | TableFactor::NestedJoin { .. }
+            | TableFactor::JsonTable { .. }
+            | TableFactor::XmlTable { .. } => ControlFlow::Continue(()),
+            TableFactor::Pivot { .. } => refuse_unwritten_factor(self, "PIVOT"),
+            TableFactor::Unpivot { .. } => refuse_unwritten_factor(self, "UNPIVOT"),
+            TableFactor::MatchRecognize { .. } => refuse_unwritten_factor(self, "MATCH_RECOGNIZE"),
+            TableFactor::OpenJsonTable { .. } => refuse_unwritten_factor(self, "OPENJSON"),
+            TableFactor::SemanticView { .. } => refuse_unwritten_factor(self, "SEMANTIC_VIEW"),
         }
-        ControlFlow::Continue(())
     }
+}
+
+fn refuse_unwritten_factor(scanner: &mut SecurityScanner, what: &str) -> ControlFlow<()> {
+    scanner.hit = Some(format!(
+        "{what} is not PostgreSQL syntax, refused because no rule here was written for it"
+    ));
+    ControlFlow::Break(())
 }
 
 /// Structural verdict: ONLY Query (recursing into CTEs), EXPLAIN and SHOW* are allowed.
@@ -1261,7 +1288,8 @@ impl Visitor for FunctionCollector {
             name,
             args: Some(_),
             ..
-        } = tf
+        }
+        | TableFactor::Function { name, .. } = tf
         {
             self.names
                 .push(last_part_name(name).unwrap_or_else(|| UNREADABLE_NAME.to_string()));
@@ -1339,6 +1367,8 @@ impl Visitor for RowRefCollector {
             TableFactor::Table { alias, .. }
             | TableFactor::Derived { alias, .. }
             | TableFactor::TableFunction { alias, .. }
+            | TableFactor::Function { alias, .. }
+            | TableFactor::UNNEST { alias, .. }
             | TableFactor::NestedJoin { alias, .. } => alias.as_ref(),
             _ => None,
         };
@@ -2286,6 +2316,80 @@ mod adversarial {
             "LEGIT READS REJECTED ({}): {:#?}",
             rejected.len(),
             rejected
+        );
+    }
+
+    /// A denied function is denied wherever the grammar lets a call stand. Each rule used to be
+    /// pinned to one AST variant: `FROM LATERAL pg_read_file(..)` is a different `TableFactor` from
+    /// `FROM pg_read_file(..)`, and only the second was read. The matrix is names x call sites, so the
+    /// next variant a parser release adds fails here instead of opening a door.
+    #[test]
+    fn a_denied_function_is_refused_at_every_call_site() {
+        const DENIED: &[&str] = &[
+            "pg_read_file('/x')",
+            "pg_sleep(1)",
+            "dblink_exec('c','x')",
+            "setval('s',1)",
+            "lo_export(1,'/x')",
+            "pg_terminate_backend(1)",
+            "query_to_xml('select 1',true,true,'')",
+            "get_raw_page('t',0)",
+            "cron.schedule('a','b','c')",
+            "pg_export_snapshot()",
+        ];
+        const SITES: &[&str] = &[
+            "SELECT {f}",
+            "SELECT * FROM {f}",
+            "SELECT * FROM {f} AS a",
+            "SELECT * FROM LATERAL {f} a",
+            "SELECT * FROM t, LATERAL {f} a",
+            "SELECT * FROM t JOIN LATERAL {f} a ON true",
+            "SELECT * FROM t LEFT JOIN LATERAL {f} a ON true",
+            "SELECT * FROM t CROSS JOIN LATERAL {f} a",
+            "SELECT * FROM {f} WITH ORDINALITY",
+            "SELECT * FROM LATERAL {f} WITH ORDINALITY a",
+            "SELECT 1 FROM t WHERE {f} IS NULL",
+            "SELECT 1 FROM t ORDER BY {f}",
+            "SELECT 1 FROM t GROUP BY {f}",
+            "SELECT 1 FROM t GROUP BY 1 HAVING {f} IS NULL",
+            "SELECT (SELECT {f})",
+            "SELECT * FROM (SELECT {f}) q",
+            "WITH c AS (SELECT {f}) SELECT * FROM c",
+            "SELECT CASE WHEN true THEN {f} END",
+            "SELECT ARRAY[{f}]",
+            "SELECT ({f})::text",
+            "SELECT COALESCE({f}, NULL)",
+            "SELECT count(*) FILTER (WHERE {f} IS NULL) FROM t",
+            "SELECT sum(1) OVER (ORDER BY {f}) FROM t",
+            "SELECT * FROM unnest(ARRAY[{f}])",
+            "VALUES ({f})",
+            "SELECT 1 FROM t WHERE x IN (SELECT {f})",
+            "EXPLAIN SELECT * FROM LATERAL {f} a",
+            "SELECT 1 UNION ALL SELECT 1 FROM LATERAL {f} a",
+        ];
+        // A template that does not parse would "reject" everything and the test would be green for
+        // the wrong reason, so each one must accept a harmless call first.
+        for site in SITES {
+            let sql = site.replace("{f}", "generate_series(1,2)");
+            assert!(
+                validate_readonly(&sql).is_ok(),
+                "call-site template is not a valid read, fix or drop it: {sql}"
+            );
+        }
+        let mut leaked = vec![];
+        for f in DENIED {
+            for site in SITES {
+                let sql = site.replace("{f}", f);
+                if validate_readonly(&sql).is_ok() {
+                    leaked.push(sql);
+                }
+            }
+        }
+        assert!(
+            leaked.is_empty(),
+            "DENIED FUNCTION PASSED ({}): {:#?}",
+            leaked.len(),
+            leaked
         );
     }
 

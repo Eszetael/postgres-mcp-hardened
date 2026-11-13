@@ -1318,6 +1318,8 @@ r=$(tool query '{"sql":"SELECT public.acc_hidden_ssn()"}' | body)
 case "$r" in *"cannot see inside"*) ok "a function the planner cannot see into is refused";; *) no "FUNCTION READ OUTSIDE THE SURFACE" "$r";; esac
 r=$(tool query '{"sql":"SELECT * FROM public.acc_definer_leak()"}' | body)
 case "$r" in *"cannot see inside"*) ok "a SECURITY DEFINER function is refused";; *) no "SECURITY DEFINER BYPASSED THE SURFACE" "$r";; esac
+r=$(tool query '{"sql":"SELECT * FROM LATERAL public.acc_definer_leak() z"}' | body)
+case "$r" in *"cannot see inside"*) ok "a SECURITY DEFINER function behind LATERAL is refused";; *) no "LATERAL BYPASSED THE SURFACE" "$r";; esac
 r=$(tool query '{"sql":"SELECT upper(name) FROM customers LIMIT 1"}' | body)
 case "$r" in ERROR:*) no "a built-in function was refused" "$r";; *) ok "built-in functions still work";; esac
 # EXPLAIN skips the cost guard, and the surface check used to live only inside it — so the plan of a
