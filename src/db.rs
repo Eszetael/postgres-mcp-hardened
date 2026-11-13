@@ -449,11 +449,31 @@ pub(crate) fn db_on_trusted_network(url: &str) -> bool {
     if host.starts_with('/') || host.starts_with("%2f") || host.starts_with("%2F") {
         return true; // Unix socket directory
     }
+    // An address is whatever PARSES as one. Reading the host as text is what let `fd-prod.example.com`
+    // pass for an IPv6 unique-local prefix and `10.0.0.5.db.example.com` for an IPv4 address, both
+    // excused from TLS. Only after this fails is the host judged as a name.
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        return match ip {
+            std::net::IpAddr::V4(a) => {
+                let o = a.octets();
+                a.is_private()
+                    || a.is_link_local()
+                    || a.is_loopback()
+                    || (o[0] == 100 && (64..=127).contains(&o[1])) // RFC6598 carrier-grade NAT
+            }
+            std::net::IpAddr::V6(a) => {
+                let first = a.segments()[0];
+                a.is_loopback()
+                    || (first & 0xfe00) == 0xfc00 // unique-local
+                    || (first & 0xffc0) == 0xfe80 // link-local
+            }
+        };
+    }
     // Single label: `postgres`, `db`, `pg`. Public DNS has no such names.
     if !host.contains('.') && !host.contains(':') {
         return true;
     }
-    for suffix in [
+    [
         ".local",
         ".internal",
         ".lan",
@@ -461,27 +481,9 @@ pub(crate) fn db_on_trusted_network(url: &str) -> bool {
         ".svc",
         ".cluster.local",
         ".localdomain",
-    ] {
-        if host.ends_with(suffix) {
-            return true;
-        }
-    }
-    let o: Vec<u32> = host
-        .split('.')
-        .filter_map(|p| p.parse::<u32>().ok())
-        .collect();
-    if o.len() == 4 && o.iter().all(|n| *n <= 255) {
-        return match (o[0], o[1]) {
-            (10, _) => true, // RFC1918
-            (172, b) if (16..=31).contains(&b) => true,
-            (192, 168) => true,
-            (169, 254) => true,                          // link-local
-            (100, b) if (64..=127).contains(&b) => true, // RFC6598 carrier-grade NAT
-            _ => false,
-        };
-    }
-    let h = host.to_ascii_lowercase();
-    h.starts_with("fc") || h.starts_with("fd") || h.starts_with("fe80") // IPv6 ULA / link-local
+    ]
+    .iter()
+    .any(|suffix| host.ends_with(suffix))
 }
 
 /// The host part of either connection-string dialect, lowercased.
@@ -1511,6 +1513,52 @@ mod sslmode_default_tests {
                 super::normalize_sslmode(url)
             );
         }
+    }
+
+    /// `db_on_trusted_network` is what excuses a connection from TLS, and it used to read the host as
+    /// text: any name starting `fc`, `fd` or `fe80` was an IPv6 prefix (`fd-prod.example.com` got
+    /// `sslmode=prefer`, so plaintext; measured with `fd.localhost`, `ssl=false`), and `10.0.0.5.db.example.com`
+    /// was an IPv4 address because the non-numeric labels were silently dropped. An address is
+    /// something that parses as one; everything else is a name and is judged as a name.
+    #[test]
+    fn a_name_that_looks_like_an_address_is_still_a_name() {
+        let mut wrong: Vec<String> = Vec::new();
+        for url in [
+            "postgres://u:p@fd-prod.example.com/db",
+            "postgres://u:p@fcustomers.example.com/db",
+            "postgres://u:p@fe80.example.org/db",
+            "postgres://u:p@10.0.0.5.db.example.com/db",
+            "postgres://u:p@192.168.1.1.nip.io/db",
+            "postgres://u:p@172.16.0.1.example.com:5432/db",
+            "host=fd-prod.example.com user=u dbname=d",
+            "postgres://u:p@[2001:db8::1]/db",
+            "postgres://u:p@8.8.8.8/db",
+            "postgres://u:p@db.example.com/db",
+        ] {
+            if super::db_on_trusted_network(url) {
+                wrong.push(format!("{url} must NOT count as a trusted network"));
+            }
+        }
+        for url in [
+            "postgres://u:p@[fd12:3456:789a::1]/db",
+            "postgres://u:p@[fe80::1]/db",
+            "postgres://u:p@[fc00::1]:5432/db",
+            "postgres://u:p@10.1.2.3/db",
+            "postgres://u:p@172.20.0.2:5432/db",
+            "postgres://u:p@192.168.0.10/db",
+            "postgres://u:p@100.64.0.1/db",
+            "postgres://u:p@169.254.1.1/db",
+            "postgres://u:p@postgres:5432/db",
+            "postgres://u:p@db.internal/db",
+            "postgres://u:p@pg.svc.cluster.local/db",
+            "postgres://u:p@localhost/db",
+            "host=/var/run/postgresql user=u",
+        ] {
+            if !super::db_on_trusted_network(url) {
+                wrong.push(format!("{url} must count as a trusted network"));
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
     }
 
     #[test]
