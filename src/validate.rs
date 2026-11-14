@@ -2,7 +2,7 @@
 //! We trust the AST (sqlparser), not regexes: comments and obfuscation disappear when the tree is built.
 use once_cell::sync::Lazy;
 use sqlparser::ast::{
-    BinaryOperator, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr,
+    BinaryOperator, Distinct, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr,
     JoinConstraint, JoinOperator, LimitClause, ObjectName, OrderBy, OrderByKind, Query, SelectItem,
     SetExpr, Statement, TableAlias, TableFactor, Value, Visit, Visitor,
 };
@@ -515,6 +515,18 @@ impl SecurityScanner {
             }
         }
         if let SetExpr::Select(s) = q.body.as_ref() {
+            // Same idea as ORDER BY <position>: `DISTINCT ON (3)` keeps one row per value of a column
+            // the statement never names, and which row survives is an answer about that column.
+            if let Some(Distinct::On(exprs)) = &s.distinct {
+                if exprs.iter().any(is_number_literal) {
+                    self.evasion = Some(
+                        "DISTINCT ON (<position>) together with `*` — it deduplicates by a column \
+                         that is never named (name the columns instead)"
+                            .into(),
+                    );
+                    return ControlFlow::Break(());
+                }
+            }
             if let GroupByExpr::Expressions(exprs, _) = &s.group_by {
                 if exprs.iter().any(is_number_literal) {
                     self.evasion = Some(
@@ -2948,6 +2960,8 @@ mod join_oracle_tests {
             "SELECT * FROM staff ORDER BY 3",
             "SELECT * FROM staff ORDER BY 3 DESC, 1",
             "SELECT s.* FROM staff s ORDER BY 3",
+            "SELECT DISTINCT ON (3) * FROM staff",
+            "SELECT DISTINCT ON (1, 3) s.* FROM staff s",
         ];
         let allowed = [
             "SELECT * FROM staff",
@@ -2963,6 +2977,9 @@ mod join_oracle_tests {
             "WITH w AS (SELECT * FROM staff) SELECT * FROM w",
             "SELECT * FROM staff a JOIN film b ON true",
             "SELECT 1 WHERE 1 IN (SELECT staff_id FROM staff)",
+            "SELECT DISTINCT * FROM staff",
+            "SELECT DISTINCT ON (staff_id) * FROM staff",
+            "SELECT DISTINCT ON (1) staff_id, first_name FROM staff",
         ];
         let leaked: Vec<_> = refused
             .iter()

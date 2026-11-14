@@ -9,7 +9,7 @@ trusted a host name, and a supply chain that had been red for three weeks.
 
 What the three bypasses share: each rule was written for one variant of the syntax tree, and the same
 thing has a second variant in the grammar. The answer is a class, not an example. A test now takes
-ten denied functions and tries each at 28 places a call can stand, and the match over `FROM` items
+eleven denied functions and tries each at 28 places a call can stand, and the match over `FROM` items
 has no catch-all arm, so a variant added by a parser upgrade stops the build instead of passing.
 
 ### `FROM LATERAL f()` skipped the whole function deny-list
@@ -40,7 +40,7 @@ written, and the check compared against `analyze` only. A 50,000 by 50,000 cross
 
 With `password` redacted, `SELECT 0 AS a, 'x' AS b, 'y' AS c UNION ALL SELECT * FROM staff` returned
 the passwords under the key `c`, and `SELECT (s.*)::text FROM staff s` returned them as one string.
-Also closed: a `*` in a subquery compared by position, `ORDER BY 3` over a `*`, and `TABLE staff` as a
+Also closed: a `*` in a subquery compared by position, `ORDER BY 3` and `DISTINCT ON (3)` over a `*`, and `TABLE staff` as a
 branch of a set operation. With redaction on, those shapes now ask you to name the columns.
 `SELECT *`, `SELECT t.*`, `count(*)` and `EXISTS (SELECT * ...)` work as before.
 
@@ -66,11 +66,11 @@ An address now has to parse as one; anything else is judged as a name.
 
 ### Supply chain
 
-`rustls-webpki`, `webpki-roots` and `ctutils` are updated past four advisories that had turned CI red
-for every pull request. `crypto-bigint` (RUSTSEC-2026-0387) remains as a documented exception: it is
-reached only through the ECDSA code of `jsonwebtoken`, this server verifies RS256 only, and it holds
-no private key. The container image moves to distroless on Debian 13, which clears a `libssl3`
-finding in the old base that this binary does not load anyway.
+`rustls-webpki`, `webpki-roots` and `ctutils` are updated, which clears three of the four advisories
+that had turned CI red for every pull request. The fourth, `crypto-bigint` (RUSTSEC-2026-0387), remains
+as a documented exception: it is reached only through the ECDSA code of `jsonwebtoken`, this server
+verifies RS256 only, and it holds no private key. The container image moves to distroless on Debian 13,
+which clears a `libssl3` finding in the old base that this binary does not load anyway.
 
 ## 0.1.10 — 2026-09-04 — the rest of the outside review
 
