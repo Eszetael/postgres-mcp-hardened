@@ -21,4 +21,16 @@ ignore = [
     # alongside the rustls/ring one already in the binary. Revisit if zero exceptions becomes worth
     # more than a simple build.
     "RUSTSEC-2023-0071",
+
+    # RUSTSEC-2026-0387 (crypto-bigint 0.5.5: timing variability in operations meant to be
+    # constant-time). Added 2026-11-13; no fixed 0.5 release.
+    #
+    # Scope: the crate reaches the binary only through the elliptic-curve stack of jsonwebtoken
+    # (`cargo tree -i crypto-bigint`: elliptic-curve 0.13 -> ecdsa -> p256/p384 -> jsonwebtoken).
+    # Why it is not exploitable here: the server verifies RS256 only (`Validation::new(Algorithm::RS256)`
+    # in src/auth.rs), so ECDSA code is never reached, and the issue is timing on operations over
+    # secrets while this process holds no private key at all (the public key comes from JWT_PUBKEY_PEM).
+    #
+    # Remove when jsonwebtoken releases on elliptic-curve >= 0.14.
+    "RUSTSEC-2026-0387",
 ]

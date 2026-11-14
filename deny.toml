@@ -2,9 +2,13 @@
 [advisories]
 yanked = "deny"
 ignore = [
-    # Dev-dependency only (ephemeral RSA keys in the auth tests); never in the release binary.
+    # In the release binary via jsonwebtoken's rust_crypto backend, but no RSA private key exists in
+    # the process, so there is nothing for the timing side-channel to recover.
     # See audit.toml for the full rationale.
     "RUSTSEC-2023-0071",
+    # Only through jsonwebtoken's ECDSA stack, which an RS256-only verifier never reaches.
+    # See audit.toml; remove when jsonwebtoken moves to elliptic-curve >= 0.14.
+    "RUSTSEC-2026-0387",
 ]
 
 [licenses]
