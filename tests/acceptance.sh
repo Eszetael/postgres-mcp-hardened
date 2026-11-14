@@ -92,16 +92,6 @@ for sql in "DROP TABLE orders" "INSERT INTO orders VALUES (9,1,1)" "UPDATE order
 done
 r=$(tool query '{"sql":"SELECT count(*) AS n FROM orders"}' | body)
 [ "$(echo "$r" | grep -c '"n":2')" = 1 ] && ok "ordinary read works" || no "ordinary read" "$r"
-# A failing SHOW or EXPLAIN used to hand its connection back mid-transaction, and the next request
-# died on `db error` until idle_in_transaction_session_timeout (10 s) cleared it. Repeated, because
-# the pool holds more than one connection and the poisoned one is not always the next one drawn.
-for i in 1 2 3 4 5; do
-  for sql in "SHOW no_such_setting" "EXPLAIN SELECT * FROM no_such_table_xyz"; do
-    tool query "{\"sql\":\"$sql\"}" >/dev/null
-    r=$(tool query '{"sql":"SELECT 1 AS alive"}' | body)
-    case "$r" in *alive*) ok "a failed statement does not poison the pool: $sql";; *) no "FAILED $sql POISONED THE NEXT REQUEST" "$r";; esac
-  done
-done
 
 # Its own server with the rate limit off: ten extra requests on a shared instance ate the burst
 # budget and made unrelated sections fail, which is how a suite starts being ignored.
@@ -113,6 +103,16 @@ for sql in "COMMIT" "COMMIT WORK" "COMMIT TRANSACTION" "COMMIT AND CHAIN" \
            "ROLLBACK" "ABORT"; do
   r=$(tool query "{\"sql\":\"$sql\"}" | body)
   case "$r" in ERROR:*) ok "transaction control refused: $sql";; *) no "TRANSACTION CONTROL ACCEPTED" "$sql -> $r";; esac
+done
+# A failing SHOW or EXPLAIN used to hand its connection back mid-transaction, and the next request
+# died on `db error` until idle_in_transaction_session_timeout (10 s) cleared it. Repeated, because
+# the pool holds more than one connection and the poisoned one is not always the next one drawn.
+for i in 1 2 3 4 5; do
+  for sql in "SHOW no_such_setting" "EXPLAIN SELECT * FROM no_such_table_xyz"; do
+    tool query "{\"sql\":\"$sql\"}" >/dev/null
+    r=$(tool query '{"sql":"SELECT 1 AS alive"}' | body)
+    case "$r" in *alive*) ok "a failed statement does not poison the pool: $sql";; *) no "FAILED $sql POISONED THE NEXT REQUEST" "$r";; esac
+  done
 done
 stop
 # The next section reuses this server, so put one back.
