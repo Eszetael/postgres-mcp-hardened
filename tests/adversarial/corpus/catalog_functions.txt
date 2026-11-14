@@ -24,3 +24,8 @@ deny	SELECT database_to_xml(true, false, '')	.
 allow	SELECT version()	an ordinary read-only builtin
 allow	SELECT pg_size_pretty(pg_relation_size('{{T2}}'))	catalog functions known to read
 allow	SELECT generate_series(1, 3)	set-returning builtins are fine
+deny	SELECT * FROM LATERAL pg_read_file('postgresql.conf') x	round 0.1.11: LATERAL makes a function in FROM a different AST node, and the name was never read
+deny	SELECT * FROM {{T2}} JOIN LATERAL pg_sleep(1) s ON true	round 0.1.11: the same door through a join
+deny	SELECT * FROM ts_stat('SELECT to_tsvector(''x'')')	round 0.1.11: full-text statistics run their argument as a query, so the validator never saw what it read
+deny	SELECT ts_rewrite('a'::tsquery, 'SELECT ''a''::tsquery, ''b''::tsquery')	the same door in tsquery_rewrite
+deny	SELECT NULL::bytea UNION ALL TABLE pg_largeobject	round 0.1.11: TABLE x carries its name as a string, so the relation rules never saw it

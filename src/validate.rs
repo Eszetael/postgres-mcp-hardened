@@ -2,9 +2,9 @@
 //! We trust the AST (sqlparser), not regexes: comments and obfuscation disappear when the tree is built.
 use once_cell::sync::Lazy;
 use sqlparser::ast::{
-    BinaryOperator, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, JoinConstraint,
-    JoinOperator, LimitClause, ObjectName, Query, SelectItem, SetExpr, Statement, TableAlias,
-    TableFactor, Value, Visit, Visitor,
+    BinaryOperator, Distinct, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr,
+    JoinConstraint, JoinOperator, LimitClause, ObjectName, OrderBy, OrderByKind, Query, SelectItem,
+    SetExpr, Statement, TableAlias, TableFactor, Value, Visit, Visitor,
 };
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
@@ -370,6 +370,45 @@ pub fn is_query_stmt(sql: &str) -> bool {
     matches!(parse(sql).as_deref(), Ok([Statement::Query(_)]))
 }
 
+/// The text of a string literal, in every spelling that carries one, so the list of variants lives
+/// in one place. `U&'..'` is returned undecoded; the scanner refuses that spelling before it gets here
+/// when redaction is on, so the undecoded text is never matched against a column name.
+fn string_literal_text(v: &Value) -> Option<&str> {
+    match v {
+        Value::SingleQuotedString(s)
+        | Value::EscapedStringLiteral(s)
+        | Value::NationalStringLiteral(s)
+        | Value::DoubleQuotedString(s)
+        | Value::UnicodeStringLiteral(s) => Some(s),
+        Value::DollarQuotedString(d) => Some(&d.value),
+        _ => None,
+    }
+}
+
+/// Does a query body hand back `*` (or `t.*`) columns? Fail-closed: a body this does not recognise
+/// counts as yes. `TABLE t` is `SELECT * FROM t`, and it carries its name as a plain `String`, so
+/// `RowRefCollector` never saw it either; refusing it here is what covers that route under redaction.
+fn projects_wildcard(se: &SetExpr) -> bool {
+    match se {
+        SetExpr::Select(s) => s.projection.iter().any(|i| {
+            matches!(
+                i,
+                SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(..)
+            )
+        }),
+        SetExpr::Query(q) => projects_wildcard(&q.body),
+        SetExpr::SetOperation { left, right, .. } => {
+            projects_wildcard(left) || projects_wildcard(right)
+        }
+        SetExpr::Values(_) => false,
+        _ => true,
+    }
+}
+
+fn is_number_literal(e: &Expr) -> bool {
+    matches!(e, Expr::Value(vs) if matches!(vs.value, Value::Number(..)))
+}
+
 /// Walks the AST and detects a denylisted function by the NAME IN THE TREE (Expr::Function and
 /// relation/table-function names), regardless of how literals or comments are rendered as text —
 /// and checks the read-only shape of EVERY Query node, not just the top level.
@@ -392,6 +431,116 @@ fn alias_renames_columns(alias: Option<&TableAlias>) -> bool {
     alias.is_some_and(|a| !a.columns.is_empty())
 }
 impl SecurityScanner {
+    /// `TABLE x` as a query body or a set-operation branch is `SELECT * FROM x`, but the parser keeps
+    /// its name as two `String`s, not an `ObjectName`, so `pre_visit_relation` never ran for it:
+    /// `SELECT 1 UNION ALL TABLE pg_largeobject` was allowed while `SELECT * FROM pg_largeobject`
+    /// was refused as raw storage. The same two rules are applied here.
+    fn table_branches(&mut self, se: &SetExpr) -> ControlFlow<()> {
+        match se {
+            SetExpr::Table(t) => {
+                let Some(table) = t.table_name.as_deref() else {
+                    self.hit =
+                        Some("a TABLE statement with no readable name — refused unread".into());
+                    return ControlFlow::Break(());
+                };
+                let parts: Vec<String> = t
+                    .schema_name
+                    .iter()
+                    .map(|s| s.to_lowercase())
+                    .chain([table.to_lowercase()])
+                    .collect();
+                if let Some(r) = raw_storage_parts(&parts) {
+                    self.hit = Some(format!(
+                        "raw-storage relation: {} — it holds physical storage rather than columns, \
+                         so column controls (redaction, projection) cannot inspect it",
+                        r
+                    ));
+                    return ControlFlow::Break(());
+                }
+                let lowered = table.to_lowercase();
+                if matches!(classify_function(&lowered), FnVerdict::SideEffect) {
+                    self.hit = Some(format!("side-effect function: {}", lowered));
+                    return ControlFlow::Break(());
+                }
+                ControlFlow::Continue(())
+            }
+            SetExpr::Query(q) => self.table_branches(&q.body),
+            SetExpr::SetOperation { left, right, .. } => {
+                self.table_branches(left)?;
+                self.table_branches(right)
+            }
+            _ => ControlFlow::Continue(()),
+        }
+    }
+
+    /// Redaction masks a value by the KEY it comes back under, so what has to be closed is every way
+    /// of moving a column to a key the operator did not list.
+    ///
+    /// A set operation takes its column names from the FIRST branch and matches the rest by position:
+    /// `SELECT 0 AS a, 'x' AS b, 'y' AS c UNION ALL SELECT * FROM staff` returned the password column
+    /// under the name `c`. `INTERSECT` and `EXCEPT` do not move the value but answer "is this value
+    /// in the column" as a row count. `ORDER BY 3` and `GROUP BY 3` over a `*` name a column that
+    /// the statement never writes. All of it is refused while redaction is on and a `*` is involved;
+    /// naming the columns instead is the price, and the message says so.
+    fn positional_evasion(&mut self, q: &Query) -> ControlFlow<()> {
+        if !self.redaction_on {
+            return ControlFlow::Continue(());
+        }
+        if let SetExpr::SetOperation { left, right, .. } = q.body.as_ref() {
+            if projects_wildcard(left) || projects_wildcard(right) {
+                self.evasion = Some(
+                    "`*` inside UNION/INTERSECT/EXCEPT — a set operation matches columns by \
+                     position and takes their names from the first branch, so a redacted column \
+                     would come back under another name (name the columns instead)"
+                        .into(),
+                );
+                return ControlFlow::Break(());
+            }
+        }
+        if !projects_wildcard(&q.body) {
+            return ControlFlow::Continue(());
+        }
+        if let Some(OrderBy {
+            kind: OrderByKind::Expressions(exprs),
+            ..
+        }) = &q.order_by
+        {
+            if exprs.iter().any(|o| is_number_literal(&o.expr)) {
+                self.evasion = Some(
+                    "ORDER BY <position> together with `*` — it orders by a column that is never \
+                     named (name the columns instead)"
+                        .into(),
+                );
+                return ControlFlow::Break(());
+            }
+        }
+        if let SetExpr::Select(s) = q.body.as_ref() {
+            // Same idea as ORDER BY <position>: `DISTINCT ON (3)` keeps one row per value of a column
+            // the statement never names, and which row survives is an answer about that column.
+            if let Some(Distinct::On(exprs)) = &s.distinct {
+                if exprs.iter().any(is_number_literal) {
+                    self.evasion = Some(
+                        "DISTINCT ON (<position>) together with `*` — it deduplicates by a column \
+                         that is never named (name the columns instead)"
+                            .into(),
+                    );
+                    return ControlFlow::Break(());
+                }
+            }
+            if let GroupByExpr::Expressions(exprs, _) = &s.group_by {
+                if exprs.iter().any(is_number_literal) {
+                    self.evasion = Some(
+                        "GROUP BY <position> together with `*` — it groups by a column that is \
+                         never named (name the columns instead)"
+                            .into(),
+                    );
+                    return ControlFlow::Break(());
+                }
+            }
+        }
+        ControlFlow::Continue(())
+    }
+
     /// A join can name a redacted column without ever writing it as an expression.
     ///
     /// `SELECT count(*) FROM people JOIN (SELECT '123-45-6789' AS ssn) g USING (ssn)` was ALLOWED
@@ -463,6 +612,7 @@ impl SecurityScanner {
 impl Visitor for SecurityScanner {
     type Break = ();
     fn pre_visit_query(&mut self, q: &Query) -> ControlFlow<()> {
+        self.table_branches(&q.body)?;
         if self.redaction_on {
             if let Some(w) = &q.with {
                 for cte in &w.cte_tables {
@@ -486,6 +636,7 @@ impl Visitor for SecurityScanner {
             return ControlFlow::Break(());
         }
         self.join_constraint_evasion(q)?;
+        self.positional_evasion(q)?;
         ControlFlow::Continue(())
     }
     fn pre_visit_expr(&mut self, expr: &Expr) -> ControlFlow<()> {
@@ -528,9 +679,15 @@ impl Visitor for SecurityScanner {
                 }
             }
             // `t.*` inside an expression is a QualifiedWildcard, not an Identifier, so the whole-row
-            // check above walked straight past `ROW(t.*)::text` and `to_jsonb(t.*)::text`. In a plain
-            // projection `SELECT t.*` the columns keep their names and masking still applies, and that
-            // form is a SelectItem, not an Expr — so it is unaffected by this.
+            // check above walked straight past `ROW(t.*)::text` and `to_jsonb(t.*)::text`, and
+            // `(t.*)::text` and `VALUES (t.*)` after them: a record flattened into one value carries
+            // the redacted column out under a key that is not its name. In a plain projection
+            // `SELECT t.*` the columns keep their names and masking still applies, and that form is
+            // a SelectItem, not an Expr, so it is unaffected. `count(*)` is a function argument.
+            Expr::QualifiedWildcard(..) | Expr::Wildcard(..) if self.redaction_on => {
+                self.evasion = Some("using a whole row (`t.*`) as a value".into());
+                return ControlFlow::Break(());
+            }
             // The column name as a STRING, not an identifier: `to_jsonb(t) ->> 'password'`,
             // `#>> '{password}'`, `jsonb_path_query(…, '$.password')`. The scanner matches
             // identifiers, so none of these looked like a reference to anything.
@@ -538,29 +695,37 @@ impl Visitor for SecurityScanner {
             // `$$password$$` and the national/unicode forms all name the same key.
             // `Expr::Value` carries a `ValueWithSpan` from sqlparser 0.62; the literal itself
             // sits in `.value`. Matching through it changes nothing about which spellings count.
-            Expr::Value(vs)
-                if matches!(
-                    &vs.value,
-                    Value::SingleQuotedString(_)
-                        | Value::EscapedStringLiteral(_)
-                        | Value::NationalStringLiteral(_)
-                        | Value::DoubleQuotedString(_)
-                ) =>
-            {
-                let s = match &vs.value {
-                    Value::SingleQuotedString(s)
-                    | Value::EscapedStringLiteral(s)
-                    | Value::NationalStringLiteral(s)
-                    | Value::DoubleQuotedString(s) => s,
-                    _ => unreachable!("guarded by the match above"),
-                };
-                if let Some(col) = redacted_name_inside(&unescape_sql_literal(s).to_lowercase()) {
-                    self.evasion = Some(format!(
-                        "naming the redacted column `{}` inside a string literal",
-                        col
-                    ));
+            Expr::Value(vs) => {
+                // `U&'\0070assword'` names `password` without ever spelling it, and decoding it
+                // would be one more escape grammar to get wrong (`UESCAPE` moves the escape
+                // character). Under redaction the form is refused instead of read.
+                if self.redaction_on && matches!(vs.value, Value::UnicodeStringLiteral(_)) {
+                    self.evasion = Some(
+                        "a `U&'..'` literal, whose escapes could spell a redacted column name"
+                            .into(),
+                    );
                     return ControlFlow::Break(());
                 }
+                if let Some(s) = string_literal_text(&vs.value) {
+                    if let Some(col) = redacted_name_inside(&unescape_sql_literal(s).to_lowercase())
+                    {
+                        self.evasion = Some(format!(
+                            "naming the redacted column `{}` inside a string literal",
+                            col
+                        ));
+                        return ControlFlow::Break(());
+                    }
+                }
+            }
+            // A subquery compared by POSITION: `(id, name, 'guess') IN (SELECT * FROM staff)` and
+            // `ROW(..) = (SELECT * FROM staff)` ask whether a value is in a column nobody named, and
+            // the answer comes back as a row count. EXISTS is left alone: `EXISTS (SELECT * ..)` is
+            // how everybody writes it and it compares nothing.
+            Expr::InSubquery { subquery, .. } | Expr::Subquery(subquery)
+                if self.redaction_on && projects_wildcard(&subquery.body) =>
+            {
+                self.evasion = Some("`*` in a subquery compared by position".into());
+                return ControlFlow::Break(());
             }
             Expr::CompoundIdentifier(parts) => {
                 if let Some(last) = parts.last() {
@@ -658,6 +823,8 @@ impl Visitor for SecurityScanner {
                 TableFactor::Table { alias, .. }
                 | TableFactor::Derived { alias, .. }
                 | TableFactor::TableFunction { alias, .. }
+                | TableFactor::Function { alias, .. }
+                | TableFactor::UNNEST { alias, .. }
                 | TableFactor::NestedJoin { alias, .. } => alias.as_ref(),
                 _ => None,
             };
@@ -666,24 +833,49 @@ impl Visitor for SecurityScanner {
                 return ControlFlow::Break(());
             }
         }
-        if let TableFactor::Table {
-            name,
-            args: Some(_),
-            ..
-        } = tf
-        {
-            if name_has_unreadable_part(name) {
-                self.hit =
-                    Some("a table function named by a function call — refused unread".into());
-                return ControlFlow::Break(());
+        // No `_` arm on purpose. `FROM f(..)` and `FROM LATERAL f(..)` are two different variants, and
+        // the second one went unread until 0.1.11: `SELECT * FROM LATERAL pg_read_file('/etc/hostname') x`
+        // returned the file. A variant added by a parser upgrade has to stop the build here.
+        match tf {
+            TableFactor::Table {
+                name,
+                args: Some(_),
+                ..
             }
-            if let Some(msg) = qualified_function_rejection(name) {
-                self.hit = Some(msg);
-                return ControlFlow::Break(());
+            | TableFactor::Function { name, .. } => {
+                if name_has_unreadable_part(name) {
+                    self.hit =
+                        Some("a table function named by a function call — refused unread".into());
+                    return ControlFlow::Break(());
+                }
+                if let Some(msg) = qualified_function_rejection(name) {
+                    self.hit = Some(msg);
+                    return ControlFlow::Break(());
+                }
+                ControlFlow::Continue(())
             }
+            // Their expressions still pass through `pre_visit_expr`.
+            TableFactor::Table { args: None, .. }
+            | TableFactor::Derived { .. }
+            | TableFactor::TableFunction { .. }
+            | TableFactor::UNNEST { .. }
+            | TableFactor::NestedJoin { .. }
+            | TableFactor::JsonTable { .. }
+            | TableFactor::XmlTable { .. } => ControlFlow::Continue(()),
+            TableFactor::Pivot { .. } => refuse_unwritten_factor(self, "PIVOT"),
+            TableFactor::Unpivot { .. } => refuse_unwritten_factor(self, "UNPIVOT"),
+            TableFactor::MatchRecognize { .. } => refuse_unwritten_factor(self, "MATCH_RECOGNIZE"),
+            TableFactor::OpenJsonTable { .. } => refuse_unwritten_factor(self, "OPENJSON"),
+            TableFactor::SemanticView { .. } => refuse_unwritten_factor(self, "SEMANTIC_VIEW"),
         }
-        ControlFlow::Continue(())
     }
+}
+
+fn refuse_unwritten_factor(scanner: &mut SecurityScanner, what: &str) -> ControlFlow<()> {
+    scanner.hit = Some(format!(
+        "{what} is not PostgreSQL syntax, refused because no rule here was written for it"
+    ));
+    ControlFlow::Break(())
 }
 
 /// Structural verdict: ONLY Query (recursing into CTEs), EXPLAIN and SHOW* are allowed.
@@ -713,16 +905,37 @@ fn structural_readonly(stmt: &Statement) -> Result<(), ValidationError> {
             // did not exist when this check was written. Reading only the bool let the parenthesised
             // form through, and ANALYZE executes the statement. The old parser hid this by failing
             // to parse the form at all, which is not a control; it is luck.
-            let analyze_in_options = options.as_ref().is_some_and(|opts| {
+            //
+            // Then a third: PostgreSQL accepts `ANALYSE` as the same option, and the parser returns
+            // the name as written. Looking for the one word somebody thought of missed the other
+            // spelling, and `EXPLAIN (ANALYSE)` ran a 50k x 50k cross join to statement_timeout past
+            // the cost guard. So the options are an allowlist: a name nobody listed is refused.
+            const ALLOWED_OPTIONS: &[&str] = &[
+                "verbose",
+                "costs",
+                "settings",
+                "generic_plan",
+                "buffers",
+                "summary",
+                "memory",
+                "format",
+            ];
+            let refused_option = options.as_ref().and_then(|opts| {
                 opts.iter()
-                    .any(|o| o.name.value.eq_ignore_ascii_case("analyze"))
+                    .map(|o| o.name.value.to_lowercase())
+                    .find(|n| !ALLOWED_OPTIONS.contains(&n.as_str()))
             });
-            if *analyze || analyze_in_options {
-                Err(ValidationError::NotReadOnly(
+            match refused_option {
+                _ if *analyze => Err(ValidationError::NotReadOnly(
                     "EXPLAIN ANALYZE (executes the plan)".into(),
-                ))
-            } else {
-                structural_readonly(statement)
+                )),
+                Some(n) if n == "analyze" || n == "analyse" => Err(ValidationError::NotReadOnly(
+                    "EXPLAIN ANALYZE (executes the plan)".into(),
+                )),
+                Some(n) => Err(ValidationError::NotReadOnly(format!(
+                    "EXPLAIN option {n} is not on the allowlist"
+                ))),
+                None => structural_readonly(statement),
             }
         }
         Statement::ExplainTable { .. } => Ok(()),
@@ -767,6 +980,8 @@ pub enum FnVerdict {
     UnknownCatalog,
     /// Reads real data, but in a shape column-level controls cannot see: raw pages, raw tuples.
     RawStorage,
+    /// Runs SQL it was handed as text, so nothing in the statement shows what it will read.
+    SqlAsText,
 }
 
 /// Relations that ARE the storage, rather than a view of it.
@@ -793,6 +1008,12 @@ fn is_raw_storage_relation(name: &ObjectName) -> Option<String> {
         .iter()
         .filter_map(|p| Some(p.as_ident()?.value.to_lowercase()))
         .collect();
+    raw_storage_parts(&parts)
+}
+
+/// The same rule over already-split, lower-cased name parts, for the places that do not hold an
+/// `ObjectName`: `TABLE x` keeps its schema and table as two plain strings.
+fn raw_storage_parts(parts: &[String]) -> Option<String> {
     if parts.is_empty() {
         return None;
     }
@@ -835,6 +1056,28 @@ const RAW_STORAGE_FUNCS: &[&str] = &[
     "fsm_page_contents",
     "gist_page_items",
     "gist_page_items_bytea",
+];
+
+/// Functions that run a query handed to them as TEXT.
+///
+/// The `query_to_*`, `table_to_*` and `cursor_to_*` families are denied for this reason, and these
+/// do the same thing under names nobody would put in a family: `ts_stat(text)` and the two-argument
+/// `ts_rewrite(tsquery, text)` run their argument through SPI. The AST cannot see inside a string
+/// literal, so every rule here is blind to what they read. Shown live on 0.1.10:
+/// `SELECT * FROM ts_stat('select to_tsvector(''simple'', s::text) from staff s')` returned the
+/// redacted column as words, and with `pg_read_file(..)` in the argument it returned a server file.
+/// The list is names, so for extensions it cannot be complete; the core is.
+const SQL_AS_TEXT_FUNCS: &[&str] = &[
+    "ts_stat",
+    "ts_rewrite",
+    // tablefunc
+    "crosstab",
+    "crosstab2",
+    "crosstab3",
+    "crosstab4",
+    "connectby",
+    // xml2: assembles and runs a query from its arguments
+    "xpath_table",
 ];
 
 /// Extension functions that change the database while living outside the catalog namespace.
@@ -1117,6 +1360,9 @@ pub fn classify_function(name: &str) -> FnVerdict {
     if RAW_STORAGE_FUNCS.contains(&name) {
         return FnVerdict::RawStorage;
     }
+    if SQL_AS_TEXT_FUNCS.contains(&name) {
+        return FnVerdict::SqlAsText;
+    }
     if SIDE_EFFECT_FUNCS.contains(&name)
         || EXTENSION_WRITE_FUNCS.contains(&name)
         || DENY_FAMILIES.iter().any(|p| name.starts_with(p))
@@ -1139,6 +1385,11 @@ fn function_rejection(name: &str) -> Option<String> {
         FnVerdict::RawStorage => Some(format!(
             "raw-storage function: {} — it returns pages or tuples as bytes, which column controls \
              (redaction, projection) cannot inspect",
+            name
+        )),
+        FnVerdict::SqlAsText => Some(format!(
+            "function that runs SQL passed as text: {} — nothing inside a string literal is visible \
+             to this validator (allow it with MCP_ALLOW_FUNCTIONS if you accept that)",
             name
         )),
         FnVerdict::UnknownCatalog => Some(format!(
@@ -1261,7 +1512,8 @@ impl Visitor for FunctionCollector {
             name,
             args: Some(_),
             ..
-        } = tf
+        }
+        | TableFactor::Function { name, .. } = tf
         {
             self.names
                 .push(last_part_name(name).unwrap_or_else(|| UNREADABLE_NAME.to_string()));
@@ -1339,6 +1591,8 @@ impl Visitor for RowRefCollector {
             TableFactor::Table { alias, .. }
             | TableFactor::Derived { alias, .. }
             | TableFactor::TableFunction { alias, .. }
+            | TableFactor::Function { alias, .. }
+            | TableFactor::UNNEST { alias, .. }
             | TableFactor::NestedJoin { alias, .. } => alias.as_ref(),
             _ => None,
         };
@@ -1881,6 +2135,15 @@ mod tests {
             "EXPLAIN (ANALYZE) SELECT * FROM t",
             "EXPLAIN (ANALYZE true, VERBOSE) SELECT * FROM t",
             "EXPLAIN (VERBOSE, ANALYZE) SELECT * FROM t",
+            // PostgreSQL takes the British spelling as the same option; the parser hands the name
+            // back as written, and a deny-list only knows what somebody thought of.
+            "EXPLAIN (ANALYSE) SELECT * FROM t",
+            "EXPLAIN (analyse true) SELECT * FROM t",
+            "EXPLAIN (VERBOSE, ANALYSE) SELECT * FROM t",
+            "EXPLAIN (WAL) SELECT 1",
+            "EXPLAIN (TIMING) SELECT 1",
+            "EXPLAIN (SERIALIZE) SELECT 1",
+            "EXPLAIN (NO_SUCH_OPTION) SELECT 1",
         ] {
             assert!(
                 validate_readonly(sql).is_err(),
@@ -1888,8 +2151,29 @@ mod tests {
             );
         }
         // Plain EXPLAIN still has to work, or we have replaced a hole with a regression.
-        assert!(validate_readonly("EXPLAIN SELECT 1").is_ok());
-        assert!(validate_readonly("EXPLAIN (VERBOSE) SELECT 1").is_ok());
+        for sql in [
+            "EXPLAIN SELECT 1",
+            "EXPLAIN VERBOSE SELECT 1",
+            "EXPLAIN (VERBOSE) SELECT 1",
+            "EXPLAIN (FORMAT JSON) SELECT 1",
+            "EXPLAIN (COSTS off, VERBOSE) SELECT 1",
+            "EXPLAIN (GENERIC_PLAN) SELECT 1",
+        ] {
+            assert!(
+                validate_readonly(sql).is_ok(),
+                "plain EXPLAIN must stay allowed: {sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_allowed_explain_option_still_exposes_the_explained_statement() {
+        // The surface check reads the statement under EXPLAIN; an option that made this return None
+        // would switch that check off for it.
+        assert_eq!(
+            explained_statement("EXPLAIN (GENERIC_PLAN, MEMORY) SELECT 1 FROM secret.t").as_deref(),
+            Some("SELECT 1 FROM secret.t")
+        );
     }
 
     #[test]
@@ -2227,6 +2511,17 @@ mod adversarial {
         // FOR UPDATE / FOR SHARE — blokady wierszy, PG odrzuca w read-only txn
         r#"SELECT * FROM t FOR UPDATE"#,
         r#"SELECT * FROM t FOR SHARE"#,
+        // The same class as query_to_xml, outside its families: the argument is a query, run through SPI.
+        r#"SELECT * FROM ts_stat('select 1')"#,
+        r#"SELECT ts_stat('select 1')"#,
+        r#"SELECT ts_rewrite('a'::tsquery, 'select 1')"#,
+        r#"SELECT * FROM crosstab('select 1,2,3') AS ct(a int, b int)"#,
+        r#"SELECT * FROM LATERAL ts_stat('select 1') x"#,
+        r#"SELECT pg_catalog.ts_stat('select 1')"#,
+        // `TABLE x` carries its name as a plain String, so the relation rules never saw it.
+        r#"(TABLE pg_toast.pg_toast_16384)"#,
+        r#"SELECT 1 UNION ALL TABLE pg_largeobject"#,
+        r#"SELECT 1 UNION ALL TABLE pg_statistic"#,
         // Garbage / parse errors
         r#"garbage(((("#,
         r#""#,
@@ -2252,6 +2547,11 @@ mod adversarial {
         r#"SELECT now(), current_date"#,
         // A literal containing the name of a writing function — literal stripping must let this through
         r#"SELECT 'setval(x)' AS note"#,
+        // Full-text search is not the door: only the functions that take a query as text are.
+        r#"SELECT to_tsvector('simple','a b')"#,
+        r#"SELECT plainto_tsquery('a')"#,
+        r#"SELECT ts_rank(to_tsvector('a'), to_tsquery('a'))"#,
+        r#"SELECT ts_headline('a b', to_tsquery('a'))"#,
     ];
 
     // Uncertain / for manual inspection: no hard assertion, logged only
@@ -2286,6 +2586,81 @@ mod adversarial {
             "LEGIT READS REJECTED ({}): {:#?}",
             rejected.len(),
             rejected
+        );
+    }
+
+    /// A denied function is denied wherever the grammar lets a call stand. Each rule used to be
+    /// pinned to one AST variant: `FROM LATERAL pg_read_file(..)` is a different `TableFactor` from
+    /// `FROM pg_read_file(..)`, and only the second was read. The matrix is names x call sites, so the
+    /// next variant a parser release adds fails here instead of opening a door.
+    #[test]
+    fn a_denied_function_is_refused_at_every_call_site() {
+        const DENIED: &[&str] = &[
+            "pg_read_file('/x')",
+            "pg_sleep(1)",
+            "dblink_exec('c','x')",
+            "setval('s',1)",
+            "lo_export(1,'/x')",
+            "pg_terminate_backend(1)",
+            "query_to_xml('select 1',true,true,'')",
+            "get_raw_page('t',0)",
+            "cron.schedule('a','b','c')",
+            "pg_export_snapshot()",
+            "ts_stat('select 1')",
+        ];
+        const SITES: &[&str] = &[
+            "SELECT {f}",
+            "SELECT * FROM {f}",
+            "SELECT * FROM {f} AS a",
+            "SELECT * FROM LATERAL {f} a",
+            "SELECT * FROM t, LATERAL {f} a",
+            "SELECT * FROM t JOIN LATERAL {f} a ON true",
+            "SELECT * FROM t LEFT JOIN LATERAL {f} a ON true",
+            "SELECT * FROM t CROSS JOIN LATERAL {f} a",
+            "SELECT * FROM {f} WITH ORDINALITY",
+            "SELECT * FROM LATERAL {f} WITH ORDINALITY a",
+            "SELECT 1 FROM t WHERE {f} IS NULL",
+            "SELECT 1 FROM t ORDER BY {f}",
+            "SELECT 1 FROM t GROUP BY {f}",
+            "SELECT 1 FROM t GROUP BY 1 HAVING {f} IS NULL",
+            "SELECT (SELECT {f})",
+            "SELECT * FROM (SELECT {f}) q",
+            "WITH c AS (SELECT {f}) SELECT * FROM c",
+            "SELECT CASE WHEN true THEN {f} END",
+            "SELECT ARRAY[{f}]",
+            "SELECT ({f})::text",
+            "SELECT COALESCE({f}, NULL)",
+            "SELECT count(*) FILTER (WHERE {f} IS NULL) FROM t",
+            "SELECT sum(1) OVER (ORDER BY {f}) FROM t",
+            "SELECT * FROM unnest(ARRAY[{f}])",
+            "VALUES ({f})",
+            "SELECT 1 FROM t WHERE x IN (SELECT {f})",
+            "EXPLAIN SELECT * FROM LATERAL {f} a",
+            "SELECT 1 UNION ALL SELECT 1 FROM LATERAL {f} a",
+        ];
+        // A template that does not parse would "reject" everything and the test would be green for
+        // the wrong reason, so each one must accept a harmless call first.
+        for site in SITES {
+            let sql = site.replace("{f}", "generate_series(1,2)");
+            assert!(
+                validate_readonly(&sql).is_ok(),
+                "call-site template is not a valid read, fix or drop it: {sql}"
+            );
+        }
+        let mut leaked = vec![];
+        for f in DENIED {
+            for site in SITES {
+                let sql = site.replace("{f}", f);
+                if validate_readonly(&sql).is_ok() {
+                    leaked.push(sql);
+                }
+            }
+        }
+        assert!(
+            leaked.is_empty(),
+            "DENIED FUNCTION PASSED ({}): {:#?}",
+            leaked.len(),
+            leaked
         );
     }
 
@@ -2502,6 +2877,123 @@ mod join_oracle_tests {
             .evasion
             .or(scanner.hit)
             .filter(|m| m.contains(redacted) || m.contains("NATURAL"))
+    }
+
+    /// What the scanner says about a statement with redaction on, whatever the wording. Structural
+    /// rules (a wildcard as a value, a positional rename) name no column, so `evasion_for`'s filter
+    /// on the column name would hide them.
+    fn refusal_with_redaction(sql: &str) -> Option<String> {
+        let ast = Parser::parse_sql(&PostgreSqlDialect {}, sql)
+            .unwrap_or_else(|e| panic!("does not parse: {sql}: {e}"));
+        let mut scanner = SecurityScanner {
+            hit: None,
+            redacted: None,
+            redaction_on: true,
+            row_refs: std::collections::HashSet::new(),
+            evasion: None,
+            oversized: None,
+        };
+        let _ = ast[0].visit(&mut scanner);
+        scanner.evasion.or(scanner.hit)
+    }
+
+    /// `U&'\0070assword'` spells `password` without the letter p, and `UESCAPE` moves the escape
+    /// character, so a decoder is one more place to be wrong. Under redaction the literal form is
+    /// refused outright; with redaction off nothing changes.
+    #[test]
+    fn unicode_escaped_literals_are_refused_under_redaction() {
+        let refused = [
+            r"SELECT to_jsonb(s) ->> U&'\0070assword' FROM staff s",
+            r"SELECT jsonb_path_query(to_jsonb(s), U&'$.\0070assword') FROM staff s",
+            r"SELECT 1 FROM staff WHERE U&'\0041' = 'A'",
+        ];
+        let allowed = [
+            "SELECT 'hello' FROM staff",
+            r"SELECT E'\x41' FROM staff",
+            "SELECT $$text$$ FROM staff",
+            "SELECT N'abc' FROM staff",
+            "SELECT staff_id FROM staff WHERE first_name = 'Ada'",
+        ];
+        // UESCAPE does not parse at all (sqlparser stops at the clause), so it never reaches the
+        // scanner; it must stay refused by the parse error rather than become accepted by accident.
+        let uescape = "SELECT to_jsonb(s) ->> U&'!0070assword' UESCAPE '!' FROM staff s";
+        assert!(
+            validate_readonly(uescape).is_err(),
+            "UESCAPE form must be refused"
+        );
+        let leaked: Vec<_> = refused
+            .iter()
+            .filter(|s| refusal_with_redaction(s).is_none())
+            .collect();
+        assert!(
+            leaked.is_empty(),
+            "NOT REFUSED under redaction: {leaked:#?}"
+        );
+        let broken: Vec<_> = allowed
+            .iter()
+            .filter_map(|s| refusal_with_redaction(s).map(|m| (s, m)))
+            .collect();
+        assert!(broken.is_empty(), "REFUSED, MUST STILL WORK: {broken:#?}");
+    }
+
+    /// Redaction masks by KEY, so anything that carries a value out under a key of the caller's
+    /// choosing walks past it: a set operation takes its column names from the first branch, a whole
+    /// row flattened to text has no keys, `ORDER BY 3` sorts by a column never named. Found by
+    /// review of 0.1.10 against a live server, each returning the password column in the clear.
+    #[test]
+    fn positional_and_wildcard_routes_around_redaction_are_refused() {
+        let refused = [
+            "SELECT 0 AS a, 'x' AS b, 'y' AS c UNION ALL SELECT * FROM staff",
+            "SELECT * FROM staff UNION ALL SELECT 0, 'x', 'y'",
+            "VALUES (0,'x','y') UNION ALL SELECT * FROM staff",
+            "SELECT 0, 'x', 'y' UNION ALL TABLE staff",
+            "SELECT 0, 'x', 'y' UNION ALL (SELECT s.* FROM staff s)",
+            "SELECT max(c) FROM (SELECT 0 AS a, 'x' AS b, 'y' AS c UNION ALL SELECT * FROM staff) u",
+            "SELECT count(*) FROM (SELECT * FROM staff INTERSECT SELECT 1, 'Ada', 'guess') q",
+            "SELECT * FROM staff EXCEPT SELECT 1, 'Ada', 'guess'",
+            "SELECT (s.*)::text FROM staff s",
+            "SELECT CAST(s.* AS text) FROM staff s",
+            "SELECT z.* FROM staff s, LATERAL (VALUES (s.*)) z",
+            "SELECT * FROM staff s WHERE (s.*)::text LIKE '%a%'",
+            "SELECT * FROM staff WHERE (staff_id, first_name, 'guess') IN (SELECT * FROM staff)",
+            "SELECT 1 WHERE ROW(1, 'Ada', 'guess') = (SELECT * FROM staff LIMIT 1)",
+            "SELECT * FROM staff ORDER BY 3",
+            "SELECT * FROM staff ORDER BY 3 DESC, 1",
+            "SELECT s.* FROM staff s ORDER BY 3",
+            "SELECT DISTINCT ON (3) * FROM staff",
+            "SELECT DISTINCT ON (1, 3) s.* FROM staff s",
+        ];
+        let allowed = [
+            "SELECT * FROM staff",
+            "SELECT s.* FROM staff s",
+            "SELECT * FROM staff LIMIT 1",
+            "SELECT count(*) FROM staff",
+            "SELECT * FROM staff ORDER BY staff_id",
+            "SELECT staff_id, first_name FROM staff ORDER BY 2",
+            "SELECT first_name, count(*) FROM staff GROUP BY 1",
+            "SELECT staff_id FROM staff UNION ALL SELECT staff_id FROM staff",
+            "SELECT 1 FROM film WHERE EXISTS (SELECT * FROM staff WHERE staff_id = 1)",
+            "SELECT * FROM (SELECT * FROM staff) q",
+            "WITH w AS (SELECT * FROM staff) SELECT * FROM w",
+            "SELECT * FROM staff a JOIN film b ON true",
+            "SELECT 1 WHERE 1 IN (SELECT staff_id FROM staff)",
+            "SELECT DISTINCT * FROM staff",
+            "SELECT DISTINCT ON (staff_id) * FROM staff",
+            "SELECT DISTINCT ON (1) staff_id, first_name FROM staff",
+        ];
+        let leaked: Vec<_> = refused
+            .iter()
+            .filter(|s| refusal_with_redaction(s).is_none())
+            .collect();
+        assert!(
+            leaked.is_empty(),
+            "NOT REFUSED under redaction: {leaked:#?}"
+        );
+        let broken: Vec<_> = allowed
+            .iter()
+            .filter_map(|s| refusal_with_redaction(s).map(|m| (s, m)))
+            .collect();
+        assert!(broken.is_empty(), "REFUSED, MUST STILL WORK: {broken:#?}");
     }
 
     /// The bypass this closes. With `MCP_REDACT_COLUMNS=ssn` this returned 1000 for a value present

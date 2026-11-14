@@ -1,7 +1,7 @@
 # ── builder ──
 # Pinned, not floating: `rust:1-slim` moves, so the image could be built from a different compiler
 # and different dependencies than the binaries CI tested.
-FROM rust:1.99.1-slim AS builder
+FROM rust:1.99.1-slim-trixie AS builder
 WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
@@ -10,7 +10,7 @@ COPY src ./src
 RUN cargo build --locked --release
 
 # ── runtime: distroless, non-root, minimalna powierzchnia ──
-FROM gcr.io/distroless/cc-debian12:nonroot
+FROM gcr.io/distroless/cc-debian13:nonroot
 # Ownership marker the MCP registry checks on the IMAGE itself, not on our word for it: the value
 # must equal `name` in server.json, which in turn must equal the account the OIDC token comes from.
 # Without it the registry refuses the OCI package with "registry validation failed". Kept next to

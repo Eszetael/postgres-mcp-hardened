@@ -47,3 +47,19 @@ deny	SELECT stxdmcv FROM pg_statistic_ext_data	extended statistics keep their ow
 deny	SELECT count(*) FROM {{T}} JOIN (SELECT 'probe' AS {{COL}}) g USING ({{COL}})	round 0.1.8: an equality oracle needing NO privileges, unlike the reads that go underneath columns
 deny	SELECT count(*) FROM {{T}} LEFT JOIN q USING ({{COL}})	.
 deny	SELECT count(*) FROM {{T}} NATURAL JOIN q	the schema decides what a natural join joins on, and this validator has no schema
+deny-under-redaction	SELECT 0 AS a, 'x' AS b, 'y' AS c UNION ALL SELECT * FROM {{T}}	round 0.1.11: a set operation takes its column names from the first branch, so the redacted column came back under c
+deny-under-redaction	VALUES (0, 'x', 'y') UNION ALL SELECT * FROM {{T}}	the same with VALUES as the first branch
+deny-under-redaction	SELECT 0, 'x', 'y' UNION ALL TABLE {{T}}	TABLE t is SELECT * FROM t
+deny-under-redaction	SELECT count(*) FROM (SELECT * FROM {{T}} INTERSECT SELECT 1, 'a', 'guess') q	INTERSECT answers whether a value is in a column nobody named
+deny-under-redaction	SELECT (t.*)::text FROM {{T}} t LIMIT 1	a whole row as a value has no key to mask
+deny-under-redaction	SELECT CAST(t.* AS text) FROM {{T}} t LIMIT 1	the same through CAST
+deny-under-redaction	SELECT z.* FROM {{T}} t, LATERAL (VALUES (t.*)) z	the record rides inside VALUES under column3
+deny-under-redaction	SELECT * FROM {{T}} ORDER BY 3	ordering by a position names a column the statement never writes
+allow	SELECT 1 AS x FROM {{T}} WHERE EXISTS (SELECT * FROM {{T}})	EXISTS with a star reveals nothing and is how people write it
+deny-under-redaction	SELECT to_jsonb(t) ->> U&'\0070assword' FROM {{T}} t LIMIT 1	round 0.1.11: the name spelled with a unicode escape, never written out
+deny-under-redaction	SELECT to_jsonb(t) ->> U&'!0070assword' UESCAPE '!' FROM {{T}} t LIMIT 1	UESCAPE moves the escape character, so decoding is the wrong answer; this one dies as a parse error
+allow	SELECT E'\x41' AS x, $$text$$ AS y, 'plain' AS z FROM {{T}} LIMIT 1	other literal spellings keep working under redaction
+deny-under-redaction	SELECT DISTINCT ON (3) * FROM {{T}}	round 0.1.11: which row survives says something about a column nobody named
+deny-under-redaction	SELECT DISTINCT ON (1, 3) t.* FROM {{T}} t	same, several positions
+allow	SELECT DISTINCT * FROM {{T}}	plain DISTINCT names no position
+allow	SELECT DISTINCT ON (1) 1 AS x, 2 AS y FROM {{T}}	a position over a projection that names its columns reveals nothing

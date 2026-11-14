@@ -104,6 +104,16 @@ for sql in "COMMIT" "COMMIT WORK" "COMMIT TRANSACTION" "COMMIT AND CHAIN" \
   r=$(tool query "{\"sql\":\"$sql\"}" | body)
   case "$r" in ERROR:*) ok "transaction control refused: $sql";; *) no "TRANSACTION CONTROL ACCEPTED" "$sql -> $r";; esac
 done
+# A failing SHOW or EXPLAIN used to hand its connection back mid-transaction, and the next request
+# died on `db error` until idle_in_transaction_session_timeout (10 s) cleared it. Repeated, because
+# the pool holds more than one connection and the poisoned one is not always the next one drawn.
+for i in 1 2 3 4 5; do
+  for sql in "SHOW no_such_setting" "EXPLAIN SELECT * FROM no_such_table_xyz"; do
+    tool query "{\"sql\":\"$sql\"}" >/dev/null
+    r=$(tool query '{"sql":"SELECT 1 AS alive"}' | body)
+    case "$r" in *alive*) ok "a failed statement does not poison the pool: $sql";; *) no "FAILED $sql POISONED THE NEXT REQUEST" "$r";; esac
+  done
+done
 stop
 # The next section reuses this server, so put one back.
 start DATABASE_URL="$URL"
@@ -1318,6 +1328,11 @@ r=$(tool query '{"sql":"SELECT public.acc_hidden_ssn()"}' | body)
 case "$r" in *"cannot see inside"*) ok "a function the planner cannot see into is refused";; *) no "FUNCTION READ OUTSIDE THE SURFACE" "$r";; esac
 r=$(tool query '{"sql":"SELECT * FROM public.acc_definer_leak()"}' | body)
 case "$r" in *"cannot see inside"*) ok "a SECURITY DEFINER function is refused";; *) no "SECURITY DEFINER BYPASSED THE SURFACE" "$r";; esac
+r=$(tool query '{"sql":"SELECT * FROM LATERAL public.acc_definer_leak() z"}' | body)
+case "$r" in *"cannot see inside"*) ok "a SECURITY DEFINER function behind LATERAL is refused";; *) no "LATERAL BYPASSED THE SURFACE" "$r";; esac
+# ts_stat runs its argument as a query, so a table off the list was readable as lexemes.
+r=$(tool query "{\"sql\":\"SELECT * FROM ts_stat('select to_tsvector(''simple'', person) from salaries')\"}" | body)
+case "$r" in *"runs SQL passed as text"*) ok "a function that runs SQL from a string is refused";; *) no "ts_stat READ A TABLE OUTSIDE THE SURFACE" "$r";; esac
 r=$(tool query '{"sql":"SELECT upper(name) FROM customers LIMIT 1"}' | body)
 case "$r" in ERROR:*) no "a built-in function was refused" "$r";; *) ok "built-in functions still work";; esac
 # EXPLAIN skips the cost guard, and the surface check used to live only inside it — so the plan of a

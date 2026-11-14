@@ -550,9 +550,7 @@ pub(crate) fn cost_guard(sql: &str, max_cost: f64, db: Option<&str>) -> Result<(
     let mut client = pool
         .get()
         .map_err(|_| CostErr::QueryError(pool_error_detail(db)))?;
-    client
-        .batch_execute("DISCARD ALL")
-        .map_err(|e| CostErr::QueryError(e.to_string()))?;
+    crate::db::reset_session(&mut client).map_err(CostErr::QueryError)?;
     client
         .batch_execute(&format!(
             "SET statement_timeout='5s'; SET default_transaction_read_only=on;{}",

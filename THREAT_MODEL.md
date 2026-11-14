@@ -82,11 +82,11 @@ server checks each one rather than assuming it.
 
 | Control | Where | What defeats it |
 |---|---|---|
-| AST read-only validation | `validate.rs` | a construct the parser models differently than PostgreSQL executes it — this is the class that has been defeated before |
+| AST read-only validation | `validate.rs` | a construct the parser models differently than PostgreSQL executes it, or a second variant of a construct the rules were written for (`FROM LATERAL f()` is not the node `FROM f()` is, and `EXPLAIN (ANALYSE)` is not spelled `ANALYZE`). This is the class that has been defeated before. Since 0.1.11 the `TableFactor` match has no catch-all arm and a test checks every denied function at every call site |
 | Hidden-character refusal | `validate.rs` | nothing known, but it is a rule about *rendering*, and rendering is a moving target: it asks the standard library's Unicode tables rather than listing characters, because two earlier attempts each missed the next character along |
-| Deny-listed function families | `validate.rs` | a function that takes SQL as text and is not in a denied family (this is why `*_to_xml*` is denied wholesale) |
+| Deny-listed function families | `validate.rs` | a function that takes SQL as text and is not in a denied family (this is why `*_to_xml*` is denied wholesale). `ts_stat`, `ts_rewrite`, `crosstab*`, `connectby` and `xpath_table` are listed by name since 0.1.11. For extensions this is a list of names and will not be complete |
 | `BEGIN TRANSACTION READ ONLY` + rollback | `db.rs` | functions that write outside transactional control (`pg_import_system_collations` and relatives — hence the family denial above) |
-| Column redaction | `validate.rs`, `db.rs` | **name-based filtering, defeated four ways in review. Depth, not a boundary.** The boundary is the column privilege. |
+| Column redaction | `validate.rs`, `db.rs` | **name-based filtering, defeated four ways in review, and again in 0.1.11 through a `*` in a set operation, a whole row used as a value and `ORDER BY` by position. Depth, not a boundary.** The boundary is the column privilege. |
 | Role privileges | PostgreSQL | a `SECURITY DEFINER` function, which runs as its owner — the one thing that defeats even this, and the reason the surface allowlist refuses functions it cannot see inside |
 | Surface allowlist | `surface.rs`, the query plan | anything the plan does not name: a function body is opaque to the planner, so calls outside `pg_catalog` are refused while an allowlist is active |
 | Start-up gate | `posture.rs` | an operator setting `i-accept-the-risk` — recorded in the audit |
@@ -239,3 +239,13 @@ Reports: see `SECURITY.md`. An accepted report becomes a line in the corpus, cre
 
 - **2026-07-26** — first version, written after three adversarial rounds moved the design from
   "reject bad queries" to "hold fewer privileges, and prove it".
+- **2026-11-13** — round 0.1.11, our own audit of the published 0.1.10. Three bypasses of the main
+  control: the function deny-list was skipped by `FROM LATERAL f()`, because the parser gives that
+  construct a different node from `FROM f()`; two built-in functions outside the `*_to_xml` families
+  (`ts_stat`, `ts_rewrite`) run a query given as text; and `EXPLAIN (ANALYSE)` executed the
+  statement because only the American spelling was refused. Redaction could also be walked around
+  with a `*` in a set operation, a whole row used as a value and `ORDER BY` by position. A failed
+  `SHOW` or `EXPLAIN` left a pooled connection in an aborted transaction, and a host name beginning
+  with `fd` or containing four numbers was taken for a private address and excused from TLS. What
+  remains: the list of functions that run text as SQL is a list of names, so for extensions it
+  cannot be complete.
