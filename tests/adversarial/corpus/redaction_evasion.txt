@@ -56,3 +56,6 @@ deny-under-redaction	SELECT CAST(t.* AS text) FROM {{T}} t LIMIT 1	the same thro
 deny-under-redaction	SELECT z.* FROM {{T}} t, LATERAL (VALUES (t.*)) z	the record rides inside VALUES under column3
 deny-under-redaction	SELECT * FROM {{T}} ORDER BY 3	ordering by a position names a column the statement never writes
 allow	SELECT 1 AS x FROM {{T}} WHERE EXISTS (SELECT * FROM {{T}})	EXISTS with a star reveals nothing and is how people write it
+deny-under-redaction	SELECT to_jsonb(t) ->> U&'\0070assword' FROM {{T}} t LIMIT 1	round 0.1.11: the name spelled with a unicode escape, never written out
+deny-under-redaction	SELECT to_jsonb(t) ->> U&'!0070assword' UESCAPE '!' FROM {{T}} t LIMIT 1	UESCAPE moves the escape character, so decoding is the wrong answer; this one dies as a parse error
+allow	SELECT E'\x41' AS x, $$text$$ AS y, 'plain' AS z FROM {{T}} LIMIT 1	other literal spellings keep working under redaction

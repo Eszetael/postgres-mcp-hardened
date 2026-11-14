@@ -44,6 +44,9 @@ Also closed: a `*` in a subquery compared by position, `ORDER BY 3` over a `*`, 
 branch of a set operation. With redaction on, those shapes now ask you to name the columns.
 `SELECT *`, `SELECT t.*`, `count(*)` and `EXISTS (SELECT * ...)` work as before.
 
+With redaction on, a `U&'...'` literal is refused outright, because its escapes can spell a redacted
+column name (`U&'\0070assword'`) without the name appearing in the text. Other literal forms are unaffected.
+
 ### `TABLE x` skipped the raw-storage rules
 
 `SELECT 1 UNION ALL TABLE pg_largeobject` was allowed while `SELECT * FROM pg_largeobject` was

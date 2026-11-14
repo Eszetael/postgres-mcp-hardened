@@ -371,8 +371,8 @@ pub fn is_query_stmt(sql: &str) -> bool {
 }
 
 /// The text of a string literal, in every spelling that carries one, so the list of variants lives
-/// in one place. `U&'..'` is returned undecoded: its `\XXXX` escapes are not resolved, which is as far
-/// as this best-effort layer goes (see `unescape_sql_literal`).
+/// in one place. `U&'..'` is returned undecoded; the scanner refuses that spelling before it gets here
+/// when redaction is on, so the undecoded text is never matched against a column name.
 fn string_literal_text(v: &Value) -> Option<&str> {
     match v {
         Value::SingleQuotedString(s)
@@ -684,6 +684,16 @@ impl Visitor for SecurityScanner {
             // `Expr::Value` carries a `ValueWithSpan` from sqlparser 0.62; the literal itself
             // sits in `.value`. Matching through it changes nothing about which spellings count.
             Expr::Value(vs) => {
+                // `U&'\0070assword'` names `password` without ever spelling it, and decoding it
+                // would be one more escape grammar to get wrong (`UESCAPE` moves the escape
+                // character). Under redaction the form is refused instead of read.
+                if self.redaction_on && matches!(vs.value, Value::UnicodeStringLiteral(_)) {
+                    self.evasion = Some(
+                        "a `U&'..'` literal, whose escapes could spell a redacted column name"
+                            .into(),
+                    );
+                    return ControlFlow::Break(());
+                }
                 if let Some(s) = string_literal_text(&vs.value) {
                     if let Some(col) = redacted_name_inside(&unescape_sql_literal(s).to_lowercase())
                     {
@@ -2873,6 +2883,45 @@ mod join_oracle_tests {
         };
         let _ = ast[0].visit(&mut scanner);
         scanner.evasion.or(scanner.hit)
+    }
+
+    /// `U&'\0070assword'` spells `password` without the letter p, and `UESCAPE` moves the escape
+    /// character, so a decoder is one more place to be wrong. Under redaction the literal form is
+    /// refused outright; with redaction off nothing changes.
+    #[test]
+    fn unicode_escaped_literals_are_refused_under_redaction() {
+        let refused = [
+            r"SELECT to_jsonb(s) ->> U&'\0070assword' FROM staff s",
+            r"SELECT jsonb_path_query(to_jsonb(s), U&'$.\0070assword') FROM staff s",
+            r"SELECT 1 FROM staff WHERE U&'\0041' = 'A'",
+        ];
+        let allowed = [
+            "SELECT 'hello' FROM staff",
+            r"SELECT E'\x41' FROM staff",
+            "SELECT $$text$$ FROM staff",
+            "SELECT N'abc' FROM staff",
+            "SELECT staff_id FROM staff WHERE first_name = 'Ada'",
+        ];
+        // UESCAPE does not parse at all (sqlparser stops at the clause), so it never reaches the
+        // scanner; it must stay refused by the parse error rather than become accepted by accident.
+        let uescape = "SELECT to_jsonb(s) ->> U&'!0070assword' UESCAPE '!' FROM staff s";
+        assert!(
+            validate_readonly(uescape).is_err(),
+            "UESCAPE form must be refused"
+        );
+        let leaked: Vec<_> = refused
+            .iter()
+            .filter(|s| refusal_with_redaction(s).is_none())
+            .collect();
+        assert!(
+            leaked.is_empty(),
+            "NOT REFUSED under redaction: {leaked:#?}"
+        );
+        let broken: Vec<_> = allowed
+            .iter()
+            .filter_map(|s| refusal_with_redaction(s).map(|m| (s, m)))
+            .collect();
+        assert!(broken.is_empty(), "REFUSED, MUST STILL WORK: {broken:#?}");
     }
 
     /// Redaction masks by KEY, so anything that carries a value out under a key of the caller's
