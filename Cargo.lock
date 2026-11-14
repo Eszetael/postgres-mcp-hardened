@@ -1049,7 +1049,7 @@ dependencies = [
 
 [[package]]
 name = "postgres-mcp-hardened"
-version = "0.1.10"
+version = "0.1.11"
 dependencies = [
  "axum",
  "jsonwebtoken",

@@ -1,5 +1,74 @@
 # Changelog
 
+## 0.1.11 — 2026-11-14 — our own audit of the published 0.1.10
+
+These findings come from an audit of the released 0.1.10 binary by its maintainers, run against a
+live PostgreSQL 16, not from an outside report. Three of them are bypasses of the main read-only
+control. The rest is a connection that stayed broken after one bad statement, a TLS exemption that
+trusted a host name, and a supply chain that had been red for three weeks.
+
+What the three bypasses share: each rule was written for one variant of the syntax tree, and the same
+thing has a second variant in the grammar. The answer is a class, not an example. A test now takes
+ten denied functions and tries each at 28 places a call can stand, and the match over `FROM` items
+has no catch-all arm, so a variant added by a parser upgrade stops the build instead of passing.
+
+### `FROM LATERAL f()` skipped the whole function deny-list
+
+`SELECT * FROM LATERAL pg_read_file('/etc/hostname') x` returned the file, because the parser gives
+`FROM LATERAL f()` a different node from `FROM f()` and only the second had its name read. The same
+gap hid `dblink_exec`, `pg_sleep` and, with a surface allowlist, a `SECURITY DEFINER` function
+reading a schema the role was not allowed to see. All variants are read now, and the `PIVOT`-like
+forms that PostgreSQL does not have are refused instead of ignored.
+
+### `ts_stat` and `ts_rewrite` run a query given as text
+
+`SELECT * FROM ts_stat('select to_tsvector(''simple'', s::text) from staff s')` returned a redacted
+column as words, and with `pg_read_file(..)` inside it returned a server file. These two built-ins
+take SQL as a string, like the `query_to_*` family that was already denied, but under names nobody
+would put in a family. They are denied by name together with `crosstab*`, `connectby` and
+`xpath_table`. For extensions this stays a list of names and cannot be complete.
+`MCP_ALLOW_FUNCTIONS` remains the way out for an operator who accepts that.
+
+### `EXPLAIN (ANALYSE)` executed the statement
+
+PostgreSQL accepts the British spelling as the same option, the parser hands the name back as
+written, and the check compared against `analyze` only. A 50,000 by 50,000 cross join ran until
+`statement_timeout`, past the cost guard. Options are now an allowlist (`verbose`, `costs`,
+`settings`, `generic_plan`, `buffers`, `summary`, `memory`, `format`) and anything else is refused.
+
+### Redaction could be walked around by position and by whole row
+
+With `password` redacted, `SELECT 0 AS a, 'x' AS b, 'y' AS c UNION ALL SELECT * FROM staff` returned
+the passwords under the key `c`, and `SELECT (s.*)::text FROM staff s` returned them as one string.
+Also closed: a `*` in a subquery compared by position, `ORDER BY 3` over a `*`, and `TABLE staff` as a
+branch of a set operation. With redaction on, those shapes now ask you to name the columns.
+`SELECT *`, `SELECT t.*`, `count(*)` and `EXISTS (SELECT * ...)` work as before.
+
+### `TABLE x` skipped the raw-storage rules
+
+`SELECT 1 UNION ALL TABLE pg_largeobject` was allowed while `SELECT * FROM pg_largeobject` was
+refused. The parser keeps the name of `TABLE x` as plain strings, so the relation rules never ran.
+
+### One failed `SHOW` or `EXPLAIN` broke the next requests for ten seconds
+
+The connection went back to the pool inside an aborted transaction, and every request that drew it
+failed with `db error` until the idle timeout. `SHOW no_such_setting` followed by `SELECT 1` was
+enough. Every path now rolls back before the session is reset.
+
+### A host name could pass for a private address and skip TLS
+
+`fd-prod.example.com` was read as an IPv6 unique-local prefix, and `10.0.0.5.db.example.com` as an
+IPv4 address, so a connection string without `sslmode` fell back to `prefer`, which is plaintext.
+An address now has to parse as one; anything else is judged as a name.
+
+### Supply chain
+
+`rustls-webpki`, `webpki-roots` and `ctutils` are updated past four advisories that had turned CI red
+for every pull request. `crypto-bigint` (RUSTSEC-2026-0387) remains as a documented exception: it is
+reached only through the ECDSA code of `jsonwebtoken`, this server verifies RS256 only, and it holds
+no private key. The container image moves to distroless on Debian 13, which clears a `libssl3`
+finding in the old base that this binary does not load anyway.
+
 ## 0.1.10 — 2026-09-04 — the rest of the outside review
 
 0.1.8 and 0.1.9 closed the six bypasses an outside review found in a draft article. Three of its

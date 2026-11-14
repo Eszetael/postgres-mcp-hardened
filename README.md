@@ -721,15 +721,20 @@ defeated in review and are therefore described as depth rather than as boundarie
 
 - **Encrypted transport:** TLS to PostgreSQL via rustls (no OpenSSL in the image), certificate
   verification always on, private CAs via `MCP_SSLROOTCERT`.
-- **Read-only, two ways:** every statement is parsed with `sqlparser` and rejected unless it's a `SELECT`/`WITH`/`EXPLAIN`/`SHOW`; the DB session is additionally set `default_transaction_read_only = on`.
+- **Read-only, two ways:** every statement is parsed with `sqlparser` and rejected unless it's a `SELECT`/`WITH`/`EXPLAIN`/`SHOW`; the DB session is additionally set `default_transaction_read_only = on`. `EXPLAIN` accepts an allowlist of options (`verbose`, `costs`, `settings`, `generic_plan`, `buffers`, `summary`, `memory`, `format`); `ANALYZE`, its British spelling `ANALYSE` and any option not listed are refused, because they execute the statement.
 - **Anti-DoS:** enforced `statement_timeout`, auto-injected `LIMIT`, and an `EXPLAIN`-based cost guard that rejects expensive plans before they run.
 - **Sensitive columns — defence in depth, and honest about it:** `MCP_REDACT_COLUMNS` masks values
   at every depth and refuses to run a query that references those columns, including the ways round
   it that an adversarial panel actually found — renaming (`SELECT password AS pw`), wrapping
   (`md5(password)`), serialising the whole row (`row_to_json(t)`, `t::text`, `json_agg(t)`), and
   naming the column as a string rather than an identifier (`to_jsonb(t) ->> 'password'`,
-  `#>> '{password}'`, `$.password`), whole-row wildcards (`ROW(t.*)::text`) and positional renaming
-  (`(SELECT * FROM staff) AS x(c1, …, c9)`). It is still name-based filtering, and name-based
+  `#>> '{password}'`, `$.password`), whole-row wildcards (`ROW(t.*)::text`, `(t.*)::text`) and
+  positional renaming (`(SELECT * FROM staff) AS x(c1, …, c9)`), plus, from 0.1.11, a `*` inside
+  `UNION`/`INTERSECT`/`EXCEPT` (a set operation takes its column names from the first branch, so the
+  redacted column came back under another name), a `*` in a subquery compared by position, and
+  `ORDER BY <number>` or `GROUP BY <number>` together with a `*`. The price is that with redaction
+  switched on you name the columns in those shapes. `SELECT *`, `SELECT t.*`, `count(*)` and
+  `EXISTS (SELECT * ...)` keep working. It is still name-based filtering, and name-based
   filtering cannot be a boundary against the whole SQL language — four adversarial rounds each got
   past it through a shape nobody had listed.
 
@@ -824,7 +829,7 @@ defeated in review and are therefore described as depth rather than as boundarie
 - **Audit:** every tool decision is logged as a tamper-evident, hash-chained JSON line (no raw SQL).
 - **Supply chain:** dependency licences, sources and advisories enforced in CI (`cargo deny`,
   `cargo audit`); a CycloneDX SBOM is attached to every release.
-- **Runtime:** ships as a distroless, non-root container — **14.8 MB to download**, 41 MB on disk for `linux/amd64` at 0.1.6, built and smoke-tested in CI. Both numbers, because a single one is always the flattering one: `docker images` shows the second, your bandwidth pays the first.
+- **Runtime:** ships as a distroless, non-root container — **14.9 MB to download** (`docker save | gzip`), 38 MB on disk for `linux/amd64` at 0.1.11, built and smoke-tested in CI. Both numbers, because a single one is always the flattering one: `docker images` shows the second, your bandwidth pays the first.
 
 ## Footprint
 
@@ -837,8 +842,8 @@ Rust" claim rather than take it:
 | Resident memory, after 200 requests | 9.4 MB, and flat afterwards |
 | Median request latency | ~8 ms — including the `curl` process the measurement spawns, so the server's own share is lower |
 | Start to first validated statement | 5 ms — median of five `--validate` runs, 5 to 7 ms observed |
-| Binary | 9.2 MB (linux x86_64, 0.1.7 onward). Nothing to install alongside it — no Node, no Python, no shared library we ship. It is *not* statically linked: like any `-gnu` target it uses the system `libc`, `libm` and `libgcc_s`. |
-| Container image | 12.6 MB compressed, 31.8 MB unpacked (linux/amd64, 0.1.7), distroless, non-root |
+| Binary | 10.7 MB (linux x86_64, 0.1.11). Nothing to install alongside it — no Node, no Python, no shared library we ship. It is *not* statically linked: like any `-gnu` target it uses the system `libc`, `libm` and `libgcc_s`. |
+| Container image | 14.9 MB compressed (`docker save \| gzip`), 38.4 MB unpacked (linux/amd64, 0.1.11), distroless on Debian 13, non-root |
 
 Two lines here were wrong until 0.1.7. Idle memory said 5.2 MB and measures 7.7 — five starts under
 identical conditions landed within 0.1 MB of one another, so the old figure is not noise, it is a

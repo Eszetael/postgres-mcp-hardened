@@ -87,7 +87,11 @@ It masks matching columns at every depth of the result and refuses a query that 
 including by alias, inside a function, as a whole-row serialisation (`t::text`, `row_to_json(t)`,
 `json_agg(t)`) or under a name given as a string (`to_jsonb(t) ->> 'password'`, `#>> '{password}'`,
 `'$.password'`). Every one of those was a working bypass before an adversarial review, and each is
-covered by a check in `tests/acceptance.sh`.
+covered by a check in `tests/acceptance.sh`. 0.1.11 added the routes that move a column to a key of
+the caller's choosing: a `*` inside `UNION`/`INTERSECT`/`EXCEPT`, a whole row used as a value
+(`(t.*)::text`), a `*` in a subquery compared by position, and `ORDER BY <number>` over a `*`. Those
+are covered by unit tests and by `tests/adversarial/corpus/redaction_evasion.txt`. With redaction on,
+those shapes ask you to name the columns.
 
 It is still filtering by name, and SQL has more ways to name a value than any filter can enumerate.
 Treat it as defence in depth. The control that does not depend on our cleverness is the one the
