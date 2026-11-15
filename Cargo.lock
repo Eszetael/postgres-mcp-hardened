@@ -1057,7 +1057,7 @@ dependencies = [
  "postgres",
  "r2d2",
  "r2d2_postgres",
- "rand 0.8.8",
+ "rand 0.10.3",
  "rsa",
  "rustls",
  "rustls-native-certs",
