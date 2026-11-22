@@ -1020,8 +1020,8 @@ mint(){ # mint <scope> <aud> <iss> <exp_offset_s> [key] [alg]
   local hdr pay signing sig
   hdr=$(printf '{"alg":"%s","typ":"JWT"}' "$alg" | python3 -c "import sys,base64;print(base64.urlsafe_b64encode(sys.stdin.buffer.read()).decode().rstrip('='))")
   pay=$(python3 -c "
-import sys,base64,json,time
-print(base64.urlsafe_b64encode(json.dumps({'sub':'acc','exp':int(time.time())+int(sys.argv[1]),'aud':sys.argv[2],'iss':sys.argv[3],'scope':sys.argv[4]}).encode()).decode().rstrip('='))" "$off" "$aud" "$iss" "$scope")
+import sys,base64,json,time,os
+print(base64.urlsafe_b64encode(json.dumps({'sub':os.environ.get('SUB','acc'),'exp':int(time.time())+int(sys.argv[1]),'aud':sys.argv[2],'iss':sys.argv[3],'scope':sys.argv[4]}).encode()).decode().rstrip('='))" "$off" "$aud" "$iss" "$scope")
   signing="$hdr.$pay"
   sig=$(printf '%s' "$signing" | openssl dgst -sha256 -sign "$key" -binary | python3 -c "import sys,base64;print(base64.urlsafe_b64encode(sys.stdin.buffer.read()).decode().rstrip('='))")
   printf '%s.%s' "$signing" "$sig"
@@ -1061,6 +1061,22 @@ c=$(jcall "$NOSCOPE" "$RES")
 d=$(curl -s -m 15 -H content-type:application/json "http://127.0.0.1:$PORT/mcp" -d '{"jsonrpc":"2.0","id":1,"method":"server/discover"}')
 echo "$d" | grep -q 'protocolVersions' && ok "server/discover still answers without a token" || no "discovery probe broken" "$d"
 echo "$d" | grep -q 'securityPosture' && no "anonymous discovery leaks the security posture" "$d" || ok "and does not tell an anonymous caller how we are configured"
+# A session id is not a credential. It used to be looked up BEFORE authentication, so an anonymous
+# request kept somebody else's session alive and 404-versus-401 told it whether an id existed; and
+# any valid token could use any id. Now the id is only honoured for the identity that opened it.
+INIT='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"1"}}}'
+PING='{"jsonrpc":"2.0","id":2,"method":"ping"}'
+SID=$(curl -s -D - -o /dev/null -m 15 -H content-type:application/json -H "authorization: Bearer $GOOD" "http://127.0.0.1:$PORT/mcp" -d "$INIT" | tr -d '\r' | awk -F': ' 'tolower($1)=="mcp-session-id"{print $2}')
+scall(){ curl -s -o /dev/null -w '%{http_code}' -m 15 -X "${3:-POST}" -H content-type:application/json -H "mcp-session-id: $SID" \
+   ${1:+-H "authorization: Bearer $1"} "http://127.0.0.1:$PORT/mcp" ${2:+-d "$2"}; }
+[ -n "$SID" ] && ok "initialize under OAuth hands out a session id" || no "no session id" ""
+[ "$(scall "$GOOD" "$PING")" = 200 ] && ok "the identity that opened the session can use it" || no "owner refused" "$(scall "$GOOD" "$PING")"
+[ "$(scall "" "$PING")" = 401 ] && ok "an anonymous request with a live session id is 401, not a probe for the id" || no "anonymous request not 401" "$(scall "" "$PING")"
+OTHER=$(SUB=mallory mint "mcp:query mcp:read" mcp.pg https://idp 300)
+[ "$(scall "$OTHER" "$PING")" = 404 ] && ok "another valid identity presenting that id is told it is unknown" || no "session usable by another identity" "$(scall "$OTHER" "$PING")"
+[ "$(scall "$OTHER" "" DELETE)" = 404 ] && ok "and cannot end it" || no "another identity ended the session" "$(scall "$OTHER" "" DELETE)"
+[ "$(scall "$GOOD" "$PING")" = 200 ] && ok "which is still alive afterwards" || no "session lost" "$(scall "$GOOD" "$PING")"
+[ "$(scall "$GOOD" "" DELETE)" = 204 ] && ok "the owner can end it" || no "owner cannot end the session" "$(scall "$GOOD" "" DELETE)"
 stop
 rm -rf "$JWTDIR"
 

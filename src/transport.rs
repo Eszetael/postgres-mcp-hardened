@@ -176,18 +176,26 @@ pub(crate) async fn delete_session_handler(
     // Session teardown is a state change, so it goes through the same gate as everything else on
     // this surface. A session id travels through logs, proxies and crash reports; anyone who reads
     // one must not be able to end that client's session on an otherwise authenticated server.
-    if let Err((code, msg, _)) = enforce_auth(&headers, &json!({"method": "session/delete"})) {
-        METRICS.denied_auth.fetch_add(1, Ordering::Relaxed);
-        audit("http", "denied_auth", None);
-        return (
-            StatusCode::from_u16(code).unwrap_or(StatusCode::UNAUTHORIZED),
-            msg,
-        )
-            .into_response();
-    }
+    let who = match enforce_auth(&headers, &json!({"method": "session/delete"})) {
+        Ok(c) => c,
+        Err((code, msg, _)) => {
+            METRICS.denied_auth.fetch_add(1, Ordering::Relaxed);
+            audit("http", "denied_auth", None);
+            return (
+                StatusCode::from_u16(code).unwrap_or(StatusCode::UNAUTHORIZED),
+                msg,
+            )
+                .into_response();
+        }
+    };
     match headers.get("mcp-session-id").and_then(|v| v.to_str().ok()) {
         Some(sid) => {
-            if state.sessions.write().await.remove(sid).is_some() {
+            let mut known = state.sessions.write().await;
+            // Only the identity that opened a session may end it.
+            let mine = known
+                .get(sid)
+                .is_some_and(|sess| sess.owner.is_none() || sess.owner == who);
+            if mine && known.remove(sid).is_some() {
                 (StatusCode::NO_CONTENT, "").into_response()
             } else {
                 (StatusCode::NOT_FOUND, "unknown session").into_response()
@@ -284,26 +292,6 @@ pub(crate) async fn mcp_handler(
         hdrs.insert("Retry-After", HeaderValue::from_static("1"));
         return (StatusCode::TOO_MANY_REQUESTS, hdrs, Json(body)).into_response();
     }
-    // An unknown `Mcp-Session-Id` gets a 404 so the client knows to initialize again (Streamable
-    // HTTP). Accepting an invented id and echoing it back would let a client believe it holds a
-    // session the server has no record of.
-    // Carries the revision this session agreed on at `initialize`, so a request that arrives
-    // without the header is answered under the contract the client actually negotiated.
-    let mut session_rev: Option<protocol::Rev> = None;
-    if let Some(sid) = headers.get("mcp-session-id").and_then(|v| v.to_str().ok()) {
-        let mut known = state.sessions.write().await;
-        match known.get_mut(sid) {
-            Some(sess) => {
-                sess.last = uptime_secs(); // refresh so an active session does not expire
-                session_rev = Some(sess.rev);
-            }
-            None => {
-                let body = json!({ "jsonrpc": "2.0", "id": req.get("id").cloned().unwrap_or(Value::Null),
-                    "error": { "code": -32001, "message": "unknown or expired session — reinitialize" } });
-                return (StatusCode::NOT_FOUND, HeaderMap::new(), Json(body)).into_response();
-            }
-        }
-    }
     // Second DoS gate: how many of this client requests are IN FLIGHT. Rate limiting is not enough
     // when a single query runs until `statement_timeout` — without this one client took the whole pool.
     // Once the database pool is busy we tighten the per-client cap to 1 — an attacker then needs as
@@ -356,6 +344,31 @@ pub(crate) async fn mcp_handler(
             return (sc, hdrs, Json(body)).into_response();
         }
     };
+    let owner = caller.clone();
+    // Looked up only AFTER authentication. Before, an anonymous request refreshed somebody else's
+    // session and learned from 404-versus-401 whether an id existed.
+    // An unknown `Mcp-Session-Id` gets a 404 so the client knows to initialize again (Streamable
+    // HTTP). Accepting an invented id and echoing it back would let a client believe it holds a
+    // session the server has no record of.
+    // Carries the revision this session agreed on at `initialize`, so a request that arrives
+    // without the header is answered under the contract the client actually negotiated.
+    let mut session_rev: Option<protocol::Rev> = None;
+    if let Some(sid) = headers.get("mcp-session-id").and_then(|v| v.to_str().ok()) {
+        let mut known = state.sessions.write().await;
+        match known.get_mut(sid) {
+            // A session belongs to the identity that opened it. Presenting another valid token with
+            // someone else's id is answered like an unknown id, so the id alone is worth nothing.
+            Some(sess) if sess.owner.is_none() || sess.owner == owner => {
+                sess.last = uptime_secs(); // refresh so an active session does not expire
+                session_rev = Some(sess.rev);
+            }
+            _ => {
+                let body = json!({ "jsonrpc": "2.0", "id": req.get("id").cloned().unwrap_or(Value::Null),
+                    "error": { "code": -32001, "message": "unknown or expired session — reinitialize" } });
+                return (StatusCode::NOT_FOUND, HeaderMap::new(), Json(body)).into_response();
+            }
+        }
+    }
     // Batch: removed from the MCP 2025-06-18 spec. An explicit error rather than a 202 "accepted",
     // which would leave the client waiting for responses that are never coming.
     if req.is_array() {
@@ -581,6 +594,7 @@ pub(crate) async fn mcp_handler(
                     last: now,
                     rev: negotiated.unwrap_or(protocol::Rev::V20250618),
                     client: key.clone(),
+                    owner: owner.clone(),
                 },
             );
             new_id
@@ -612,6 +626,8 @@ pub(crate) struct Session {
     pub(crate) last: u64,
     pub(crate) rev: protocol::Rev,
     pub(crate) client: String,
+    /// The identity (`enforce_auth`'s caller) that opened it; `None` when the server has no auth.
+    pub(crate) owner: Option<String>,
 }
 
 /// Makes room for one more session without handing anybody else's away.
