@@ -166,7 +166,7 @@ pub(crate) async fn delete_session_handler(
     }
     let key = ratelimit::client_key(
         &peer.ip().to_string(),
-        headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()),
+        http::forwarded_for(&headers).as_deref(),
     );
     if !ratelimit::allow(&key) {
         METRICS.denied_rate.fetch_add(1, Ordering::Relaxed);
@@ -275,7 +275,7 @@ pub(crate) async fn mcp_handler(
     // bounce earlier. DB_SEM caps concurrency; this caps rate.
     let key = ratelimit::client_key(
         &peer.ip().to_string(),
-        headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()),
+        http::forwarded_for(&headers).as_deref(),
     );
     if let Err(rej) = pipeline::gate_rate(&key, "http") {
         let body =
@@ -450,11 +450,18 @@ pub(crate) async fn mcp_handler(
     // have succeeded, which is the opposite of what the backwards-compatibility clause is for.
     // Negotiation belongs in the body there; the header rule applies from the next request on.
     let is_initialize = req.get("method").and_then(|v| v.as_str()) == Some("initialize");
-    if let Some(asked) = headers
-        .get("mcp-protocol-version")
-        .filter(|_| !is_initialize)
-        .and_then(|v| v.to_str().ok())
-    {
+    // Repeated or non-text counts as a header we cannot parse. `to_str().ok()` used to turn a
+    // non-ASCII value into "absent", the downgrade the paragraph above says must not happen.
+    let proto_hdr = match http::single_header(&headers, "mcp-protocol-version") {
+        Ok(v) => v,
+        Err(()) => {
+            let mut body = protocol::unsupported_header_error("<repeated or unreadable>");
+            body["jsonrpc"] = Value::String("2.0".into());
+            body["id"] = req.get("id").cloned().unwrap_or(Value::Null);
+            return (StatusCode::BAD_REQUEST, HeaderMap::new(), Json(body)).into_response();
+        }
+    };
+    if let Some(asked) = proto_hdr.filter(|_| !is_initialize) {
         if protocol::Rev::parse(asked).is_none() {
             let mut body = protocol::unsupported_header_error(asked);
             body["jsonrpc"] = Value::String("2.0".into());
@@ -463,9 +470,7 @@ pub(crate) async fn mcp_handler(
         }
     }
     let rev_for_request = protocol::rev_from_meta(&body_params).unwrap_or_else(|| {
-        headers
-            .get("mcp-protocol-version")
-            .and_then(|v| v.to_str().ok())
+        proto_hdr
             .and_then(protocol::Rev::parse)
             .or(session_rev)
             .unwrap_or(protocol::Rev::V20250618)
@@ -477,12 +482,34 @@ pub(crate) async fn mcp_handler(
     // request than the one that runs — refusing the mismatch is what makes the header safe to
     // trust. The refusal is audited: it is a security event, not a parse hiccup.
     let body_method = req.get("method").and_then(|v| v.as_str()).unwrap_or("");
+    // A repeated or non-text `Mcp-Method`/`Mcp-Name` is refused outright: `get` would read the first
+    // line while a gateway may have authorised on another, so "they agree" would be answered about
+    // a header the gateway never saw.
+    let (hdr_method, hdr_name) = match (
+        http::single_header(&headers, "mcp-method"),
+        http::single_header(&headers, "mcp-name"),
+    ) {
+        (Ok(m), Ok(n)) => (m, n),
+        _ => {
+            let _who = set_caller(caller);
+            audit("http/header_mismatch", "refused", Some("repeated or unreadable Mcp-Method/Mcp-Name header"));
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "jsonrpc": "2.0",
+                    "id": req.get("id").cloned().unwrap_or(Value::Null),
+                    "error": { "code": -32600, "message": "Mcp-Method and Mcp-Name must each appear once" }
+                })),
+            )
+                .into_response();
+        }
+    };
     if let Err((code, msg)) = protocol::check_header_agreement(
         rev_for_request,
         body_method,
         protocol::body_target_name(body_method, &body_params).as_deref(),
-        headers.get("mcp-method").and_then(|v| v.to_str().ok()),
-        headers.get("mcp-name").and_then(|v| v.to_str().ok()),
+        hdr_method,
+        hdr_name,
     ) {
         let _who = set_caller(caller);
         audit("http/header_mismatch", "refused", Some(&msg));

@@ -73,6 +73,34 @@ pub(crate) fn render_metrics() -> String {
     buf
 }
 
+/// Every `X-Forwarded-For` line, joined in arrival order. `HeaderMap::get` returns only the FIRST
+/// line, and a proxy that appends its own line (HAProxy `option forwardfor`) leaves the client's
+/// line first, so the rate-limit key was whatever the client wrote. The last entry of the joined
+/// list is the one our proxy added. A line that is not valid text yields `None` (key = peer address).
+pub(crate) fn forwarded_for(headers: &HeaderMap) -> Option<String> {
+    let mut parts = Vec::new();
+    for v in headers.get_all("x-forwarded-for") {
+        parts.push(v.to_str().ok()?);
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join(", "))
+    }
+}
+
+/// The value of a header that must appear at most once. `Err` when it is repeated or is not text:
+/// `get` would silently read the first line while a gateway may have decided on another, which is
+/// the disagreement the `Mcp-*` header checks exist to prevent.
+pub(crate) fn single_header<'a>(headers: &'a HeaderMap, name: &str) -> Result<Option<&'a str>, ()> {
+    let mut it = headers.get_all(name).iter();
+    match (it.next(), it.next()) {
+        (None, _) => Ok(None),
+        (Some(v), None) => v.to_str().map(Some).map_err(|_| ()),
+        (Some(_), Some(_)) => Err(()),
+    }
+}
+
 /// Refuses browser-originated requests unless the operator named the origin.
 ///
 /// A page the user is merely visiting can make its browser POST to `http://localhost:8080/mcp`.
@@ -321,6 +349,38 @@ mod tests {
             );
         }
         h
+    }
+
+    #[test]
+    fn every_forwarded_for_line_counts_and_the_last_entry_wins() {
+        // HAProxy appends its own line; the client's line stays first.
+        let mut h = HeaderMap::new();
+        h.append("x-forwarded-for", "8.8.8.8".parse().unwrap());
+        h.append("x-forwarded-for", "203.0.113.99".parse().unwrap());
+        let xff = forwarded_for(&h);
+        assert_eq!(
+            ratelimit::client_key_with("10.0.0.1", xff.as_deref(), true),
+            "203.0.113.99"
+        );
+        let one = hdr(&[("x-forwarded-for", "9.9.9.9, 203.0.113.7")]);
+        assert_eq!(
+            ratelimit::client_key_with("10.0.0.1", forwarded_for(&one).as_deref(), true),
+            "203.0.113.7"
+        );
+        assert_eq!(forwarded_for(&HeaderMap::new()), None);
+    }
+
+    #[test]
+    fn a_header_that_must_be_single_is_refused_when_repeated_or_not_text() {
+        let mut h = HeaderMap::new();
+        h.append("mcp-name", "query".parse().unwrap());
+        assert_eq!(single_header(&h, "mcp-name"), Ok(Some("query")));
+        h.append("mcp-name", "list_tables".parse().unwrap());
+        assert!(single_header(&h, "mcp-name").is_err());
+        let mut b = HeaderMap::new();
+        b.insert("mcp-name", axum::http::HeaderValue::from_bytes(&[0xE9]).unwrap());
+        assert!(single_header(&b, "mcp-name").is_err());
+        assert_eq!(single_header(&HeaderMap::new(), "mcp-name"), Ok(None));
     }
 
     #[test]
