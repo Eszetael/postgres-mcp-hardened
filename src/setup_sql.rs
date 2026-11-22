@@ -391,7 +391,18 @@ fn render(
     ));
     s.push_str(&format!(
         "SELECT 'owns a relation (owners bypass column grants and RLS)' AS problem, c.relname\n \
-         FROM pg_class c WHERE c.relowner = '{0}'::regrole;\n",
+         FROM pg_class c WHERE c.relowner = (SELECT oid FROM pg_roles WHERE rolname = '{0}');\n",
+        quote_literal(&opts.role)
+    ));
+    // `REVOKE ... FROM role` cannot take away what PUBLIC holds, and on PostgreSQL 14 and older
+    // PUBLIC may CREATE in `public`. A role that can create objects there can plant a function that
+    // another role's search_path then finds first (CVE-2018-1058), and can switch its own
+    // `default_transaction_read_only` off. We do not revoke it for you: it changes every role.
+    s.push_str(&format!(
+        "SELECT 'can CREATE in a schema (inherited from PUBLIC on PostgreSQL 14 and older)' AS problem, nspname\n \
+         FROM pg_namespace WHERE has_schema_privilege('{0}', oid, 'CREATE')\n \
+         AND nspname NOT LIKE 'pg\\_%' AND nspname <> 'information_schema';\n\
+         --   if this returns `public`:  REVOKE CREATE ON SCHEMA public FROM PUBLIC;   (the default since 15; affects ALL roles)\n",
         quote_literal(&opts.role)
     ));
     if !opts.redact.is_empty() {
@@ -403,7 +414,8 @@ fn render(
     s.push_str("\n-- 8. Point the server at it, then confirm from the other side:\n");
     s.push_str(&format!(
         "--   DATABASE_URL=postgres://{}:...@host:5432/{} postgres-mcp-hardened\n",
-        opts.role, db_name
+        comment_safe(&opts.role),
+        comment_safe(db_name)
     ));
     s.push_str("--   the server prints what the role may do, and refuses a network listener if it may write.\n");
     s
@@ -431,6 +443,55 @@ mod tests {
 
     /// The whole point of the redaction section: the table-level REVOKE must precede the column GRANT,
     /// because the other order is silently a no-op.
+    #[test]
+    fn the_database_name_in_the_closing_comment_cannot_start_a_statement() {
+        let opts = Opts {
+            role: "Reader".into(),
+            schemas: vec!["public".into()],
+            tables: vec![],
+            redact: vec![],
+            database: None,
+            owner: "postgres".into(),
+        };
+        use injection_tests::outside_identifiers;
+        let benign = render(&opts, &opts.schemas.clone(), &[], "app", None);
+        let out = render(
+            &opts,
+            &opts.schemas.clone(),
+            &[],
+            "app\nALTER ROLE mcp_reader SUPERUSER;",
+            None,
+        );
+        // Same method as `a_catalogue_name_cannot_leave_a_comment`: outside quoted identifiers the
+        // hostile name must add no line.
+        assert_eq!(
+            outside_identifiers(&out).lines().count(),
+            outside_identifiers(&benign).lines().count(),
+            "the database name added a line:\n{out}"
+        );
+    }
+
+    #[test]
+    fn the_checks_ask_about_the_role_as_written_and_about_schema_create() {
+        let opts = Opts {
+            role: "Reader".into(),
+            schemas: vec!["public".into()],
+            tables: vec![],
+            redact: vec![],
+            database: None,
+            owner: "postgres".into(),
+        };
+        let out = render(&opts, &opts.schemas.clone(), &[], "db", None);
+        // `'Reader'::regrole` folds to `reader` and parses dots: it asks about a different role.
+        assert!(!out.contains("::regrole"), "{out}");
+        assert!(out.contains("rolname = 'Reader'"), "{out}");
+        // PUBLIC's CREATE on `public` (PostgreSQL 14 and older) is invisible to REVOKE FROM role.
+        assert!(
+            out.contains("has_schema_privilege('Reader', oid, 'CREATE')"),
+            "{out}"
+        );
+    }
+
     #[test]
     fn redaction_revokes_the_table_before_granting_columns() {
         let opts = Opts {
@@ -501,7 +562,7 @@ mod injection_tests {
     /// Removes every double-quoted span, so what remains is the text PostgreSQL would read as
     /// syntax rather than as a name. A newline inside `"..."` is part of an identifier and harmless;
     /// the same newline outside one starts a statement.
-    fn outside_identifiers(sql: &str) -> String {
+    pub(super) fn outside_identifiers(sql: &str) -> String {
         let mut out = String::new();
         let mut inside = false;
         for c in sql.chars() {
