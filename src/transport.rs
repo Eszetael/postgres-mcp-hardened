@@ -77,7 +77,13 @@ pub(crate) fn run_stdio() {
         // of them, and every record in the audit named the caller "-".
         let id = req.get("id").cloned().unwrap_or(Value::Null);
         let _scope = audit_log::set_caller(Some(pipeline::stdio_caller()));
+        // The same refusal HTTP gives while the start-up checks are still pending; stdio had none, so
+        // `MCP_REDACT_REQUIRE_REVOKE=1` guarded the network transport and not the one most people use.
+        let blocked = posture::serving_blocked();
         let mut resp = match pipeline::gate(&caller_key, "stdio") {
+            Ok(_) if blocked.is_some() => {
+                json!({"error": {"code": -32000, "message": blocked.unwrap_or_default()}})
+            }
             Ok(guards) => {
                 let r = handle_request(&req);
                 drop(guards);

@@ -39,7 +39,7 @@ fn quote_literal(value: &str) -> String {
 ///
 /// Escaped visibly rather than dropped: `feedback` from a stripped character is silence, and a name
 /// that contains a newline is worth seeing.
-fn comment_safe(text: &str) -> String {
+pub(crate) fn comment_safe(text: &str) -> String {
     text.chars()
         .map(|c| match c {
             '\n' => "\\n".to_string(),

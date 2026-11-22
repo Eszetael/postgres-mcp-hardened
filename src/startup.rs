@@ -29,77 +29,144 @@ pub(crate) fn spawn_redaction_verification() {
         return;
     }
     let strict = std::env::var("MCP_REDACT_REQUIRE_REVOKE").is_ok_and(|v| v == "1" || v == "true");
+    // Strict means "no query is answered until the database has been seen to enforce this". The flag
+    // is raised BEFORE the thread starts, so there is no window in which requests run unchecked, and
+    // it is lowered only by a verification that actually ran. It used to be the other way round: the
+    // check ran in the background, so even a successful one let queries through first.
+    if strict {
+        REDACTION_PENDING.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
     std::thread::spawn(move || {
-        // Per table, not per column: the fix has to be a table-level REVOKE followed by a GRANT of the
-        // columns that stay. A bare `REVOKE SELECT (password) ON staff` is silently a no-op while the
-        // role holds SELECT on the whole table — this server printed exactly that advice until an
-        // end-to-end test followed it and the value came straight back.
-        const SQL: &str = "SELECT current_user AS role, n.nspname AS schema, c.relname AS rel, \
-                    array_to_string(array_agg(a.attname ORDER BY a.attnum) \
-                                    FILTER (WHERE lower(a.attname) = ANY($1)), ', ') AS exposed, \
-                    array_to_string(array_agg(quote_ident(a.attname) ORDER BY a.attnum) \
-                                    FILTER (WHERE lower(a.attname) <> ALL($1)), ', ') AS keep \
-             FROM pg_attribute a \
-             JOIN pg_class c ON c.oid = a.attrelid \
-             JOIN pg_namespace n ON n.oid = c.relnamespace \
-             WHERE a.attnum > 0 AND NOT a.attisdropped \
-               AND c.relkind IN ('r', 'p', 'v', 'm', 'f') \
-               AND n.nspname NOT IN ('pg_catalog', 'information_schema') \
-               AND has_column_privilege(c.oid, a.attnum, 'SELECT') \
-             GROUP BY 1, 2, 3 \
-             HAVING count(*) FILTER (WHERE lower(a.attname) = ANY($1)) > 0 \
-             ORDER BY 2, 3 LIMIT 50";
-        let pats: Vec<String> = validate::redacted_column_list();
-        let mut exposed: Vec<String> = Vec::new();
-        for name in configured_databases() {
-            let Ok(v) = query_catalog(SQL, &[&pats], Some(&name)) else {
-                continue;
-            };
-            let empty = vec![];
-            for row in v.get("rows").and_then(|r| r.as_array()).unwrap_or(&empty) {
-                let get = |k: &str| {
-                    row.get(k)
-                        .and_then(|x| x.as_str())
-                        .unwrap_or("")
-                        .to_string()
-                };
-                let (role, schema, rel) = (get("role"), get("schema"), get("rel"));
-                let keep = get("keep");
-                exposed.push(format!(
-                    "  -- {}.{} in database {} exposes: {}\n  REVOKE SELECT ON {}.{} FROM {};\n  GRANT SELECT ({}) ON {}.{} TO {};",
-                    schema, rel, name, get("exposed"),
-                    schema, rel, role,
-                    if keep.is_empty() { "/* no other readable columns — do not re-grant */".into() } else { keep },
-                    schema, rel, role
-                ));
+        let mut told = false;
+        loop {
+            match verify_redaction_once() {
+                Verdict::Verified => {
+                    eprintln!(
+                        "MCP_REDACT_COLUMNS: verified against the database — the connected role cannot read \
+                         those columns anywhere. Redaction is enforced by PostgreSQL, not only by this server."
+                    );
+                    REDACTION_PENDING.store(false, std::sync::atomic::Ordering::SeqCst);
+                    return;
+                }
+                Verdict::Unknown(n) => {
+                    // A catalog query that FAILS says nothing about the privileges. It used to be
+                    // skipped, which left "nothing exposed" and printed "verified" for a database that
+                    // had not been reached at all.
+                    if !told {
+                        told = true;
+                        eprintln!(
+                            "MCP_REDACT_COLUMNS: could NOT verify against the database ({} database(s) \
+                             unreachable or the catalog query failed). Redaction is NOT confirmed; retrying.{}",
+                            n,
+                            if strict { " Serving is blocked until it is (MCP_REDACT_REQUIRE_REVOKE=1)." } else { "" }
+                        );
+                    }
+                    std::thread::sleep(std::time::Duration::from_secs(5));
+                }
+                Verdict::Exposed(exposed) => {
+                    eprintln!(
+                        "WARNING: MCP_REDACT_COLUMNS is NOT enforced by the database. The role can still read these \
+                         columns, so masking is cosmetic against a caller who writes SQL. Run:"
+                    );
+                    for line in &exposed {
+                        eprintln!("{}", line);
+                    }
+                    if strict {
+                        eprintln!(
+                            "MCP_REDACT_REQUIRE_REVOKE=1 — refusing to serve until those privileges are revoked."
+                        );
+                        std::process::exit(2);
+                    }
+                    eprintln!(
+                        "  -- note: with column-level grants PostgreSQL refuses `SELECT *` on that table, so \
+                         callers must name columns; describe_table lists them and marks the redacted one."
+                    );
+                    eprintln!(
+                        "(set MCP_REDACT_REQUIRE_REVOKE=1 to make this fatal instead of advisory)"
+                    );
+                    return;
+                }
             }
         }
-        if exposed.is_empty() {
-            eprintln!(
-                "MCP_REDACT_COLUMNS: verified against the database — the connected role cannot read \
-                 those columns anywhere. Redaction is enforced by PostgreSQL, not only by this server."
-            );
-            return;
-        }
-        eprintln!(
-            "WARNING: MCP_REDACT_COLUMNS is NOT enforced by the database. The role can still read these \
-             columns, so masking is cosmetic against a caller who writes SQL. Run:"
-        );
-        for line in &exposed {
-            eprintln!("{}", line);
-        }
-        if strict {
-            eprintln!(
-                "MCP_REDACT_REQUIRE_REVOKE=1 — refusing to serve until those privileges are revoked."
-            );
-            std::process::exit(2);
-        }
-        eprintln!(
-            "  -- note: with column-level grants PostgreSQL refuses `SELECT *` on that table, so \
-             callers must name columns; describe_table lists them and marks the redacted one."
-        );
-        eprintln!("(set MCP_REDACT_REQUIRE_REVOKE=1 to make this fatal instead of advisory)");
     });
+}
+
+/// Raised while `MCP_REDACT_REQUIRE_REVOKE=1` is waiting for a database verdict.
+static REDACTION_PENDING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn redaction_unverified() -> bool {
+    REDACTION_PENDING.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+enum Verdict {
+    Verified,
+    /// How many databases could not be asked.
+    Unknown(usize),
+    Exposed(Vec<String>),
+}
+
+fn verify_redaction_once() -> Verdict {
+    // Per table, not per column: the fix has to be a table-level REVOKE followed by a GRANT of the
+    // columns that stay. A bare `REVOKE SELECT (password) ON staff` is silently a no-op while the
+    // role holds SELECT on the whole table — this server printed exactly that advice until an
+    // end-to-end test followed it and the value came straight back.
+    //
+    // Names come back already quoted by the database (`quote_ident`): this text is meant to be pasted
+    // into a superuser's psql, and a table called `x"; DROP ...` must not turn the fix into the attack.
+    const SQL: &str =
+        "SELECT quote_ident(current_user) AS role, quote_ident(n.nspname) AS schema, \
+                quote_ident(c.relname) AS rel, \
+                array_to_string(array_agg(quote_ident(a.attname) ORDER BY a.attnum) \
+                                FILTER (WHERE lower(a.attname) = ANY($1)), ', ') AS exposed, \
+                array_to_string(array_agg(quote_ident(a.attname) ORDER BY a.attnum) \
+                                FILTER (WHERE lower(a.attname) <> ALL($1)), ', ') AS keep \
+         FROM pg_attribute a \
+         JOIN pg_class c ON c.oid = a.attrelid \
+         JOIN pg_namespace n ON n.oid = c.relnamespace \
+         WHERE a.attnum > 0 AND NOT a.attisdropped \
+           AND c.relkind IN ('r', 'p', 'v', 'm', 'f') \
+           AND n.nspname NOT IN ('pg_catalog', 'information_schema') \
+           AND has_column_privilege(c.oid, a.attnum, 'SELECT') \
+         GROUP BY 1, 2, 3 \
+         HAVING count(*) FILTER (WHERE lower(a.attname) = ANY($1)) > 0 \
+         ORDER BY 2, 3 LIMIT 50";
+    let pats: Vec<String> = validate::redacted_column_list();
+    let mut exposed: Vec<String> = Vec::new();
+    let mut failed = 0usize;
+    for name in configured_databases() {
+        let Ok(v) = query_catalog(SQL, &[&pats], Some(&name)) else {
+            failed += 1;
+            continue;
+        };
+        let empty = vec![];
+        for row in v.get("rows").and_then(|r| r.as_array()).unwrap_or(&empty) {
+            let get = |k: &str| {
+                row.get(k)
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("")
+                    .to_string()
+            };
+            let (role, schema, rel) = (get("role"), get("schema"), get("rel"));
+            let keep = get("keep");
+            // Everything inside a `--` comment goes through `comment_safe`: a newline in a table name
+            // would otherwise end the comment and start a statement of the attacker's choosing.
+            exposed.push(format!(
+                "  -- {}.{} in database {} exposes: {}\n  REVOKE SELECT ON {}.{} FROM {};\n  GRANT SELECT ({}) ON {}.{} TO {};",
+                setup_sql::comment_safe(&schema), setup_sql::comment_safe(&rel),
+                setup_sql::comment_safe(&name), setup_sql::comment_safe(&get("exposed")),
+                schema, rel, role,
+                if keep.is_empty() { "/* no other readable columns — do not re-grant */".into() } else { keep },
+                schema, rel, role
+            ));
+        }
+    }
+    if !exposed.is_empty() {
+        Verdict::Exposed(exposed)
+    } else if failed > 0 {
+        Verdict::Unknown(failed)
+    } else {
+        Verdict::Verified
+    }
 }
 
 /// Every environment variable this server reads. One list, so that a typo cannot pass for a setting.

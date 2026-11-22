@@ -348,6 +348,8 @@ pub(crate) fn enforce_start_policy(transport: &str, addr: &str) {
 pub(crate) fn serving_blocked() -> Option<&'static str> {
     if *PENDING.read().unwrap() {
         Some("the server has not yet been able to check what the database role is allowed to do, and does not serve queries until it has")
+    } else if crate::startup::redaction_unverified() {
+        Some("MCP_REDACT_REQUIRE_REVOKE=1 and the database has not yet been checked for redacted columns the role can still read, so no queries are served until it has")
     } else {
         None
     }
