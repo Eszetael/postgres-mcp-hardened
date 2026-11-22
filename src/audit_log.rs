@@ -120,12 +120,41 @@ pub(crate) fn resume_state_of(log: &str) -> Resume {
     .and_then(|p| std::fs::read_to_string(p).ok())
     .and_then(|c| serde_json::from_str::<Value>(&c).ok())
     .and_then(|v| {
-        Some((
+        let (seq, hash) = (
             v.get("seq")?.as_u64()?,
             v.get("hash")?.as_str()?.to_string(),
-        ))
+        );
+        let mac = v.get("mac").and_then(|m| m.as_str()).map(str::to_string);
+        Some((seq, hash, mac))
     });
-    match (&in_log, &hwm) {
+    // A mark that cannot be authenticated is no evidence either way: with a key set, one without a
+    // valid MAC was written by someone who did not have it. Say so, and do not trust its numbers.
+    let mut mark_anomaly: Option<String> = None;
+    let hwm = match (hwm, audit_key()) {
+        (Some((s, h, mac)), Some((k, _))) => {
+            if mac.as_deref() == Some(hwm_mac(&k, s, &h).as_str()) {
+                Some((s, h))
+            } else {
+                mark_anomaly = Some(
+                    "the high-water mark has no valid MAC under the configured key — it was \
+                     written without the key (or edited), so it cannot vouch for the log"
+                        .into(),
+                );
+                None
+            }
+        }
+        (Some((s, h, _)), None) => Some((s, h)),
+        (None, _) => None,
+    };
+    let mut r = resume_from(&in_log, &hwm);
+    if r.anomaly.is_none() {
+        r.anomaly = mark_anomaly;
+    }
+    r
+}
+
+fn resume_from(in_log: &Option<Option<(u64, String)>>, hwm: &Option<(u64, String)>) -> Resume {
+    match (in_log, hwm) {
         // First run: no log, no mark. Nothing to say.
         (None, None) => Resume {
             seq: 0,
@@ -144,7 +173,7 @@ pub(crate) fn resume_state_of(log: &str) -> Resume {
         },
         // A log we cannot parse. `last_entry_in_log` already said why, on stderr.
         (Some(None), _) => Resume {
-            seq: hwm.map(|(s, _)| s).unwrap_or(0),
+            seq: hwm.as_ref().map(|(s, _)| *s).unwrap_or(0),
             hash: "GENESIS".into(),
             anomaly: Some(
                 "the log exists but its last entry is unusable — chain state unknown".into(),
@@ -196,6 +225,12 @@ static RESUME: Lazy<Resume> = Lazy::new(|| {
     r
 });
 
+/// What the chain found out about itself at startup (truncation, a removed log, an unauthenticated
+/// mark), for the startup record: on stderr alone it vanishes with the terminal.
+pub(crate) fn startup_anomaly() -> Option<String> {
+    RESUME.anomaly.clone()
+}
+
 pub(crate) static AUDIT_PREV: Lazy<Mutex<String>> = Lazy::new(|| Mutex::new(RESUME.hash.clone()));
 
 /// Sequence number of the last entry. A gap reveals a deleted entry; comparison with the sidecar
@@ -203,11 +238,21 @@ pub(crate) static AUDIT_PREV: Lazy<Mutex<String>> = Lazy::new(|| Mutex::new(RESU
 pub(crate) static AUDIT_SEQ: Lazy<std::sync::atomic::AtomicU64> =
     Lazy::new(|| std::sync::atomic::AtomicU64::new(RESUME.seq));
 
+fn hwm_mac(key: &[u8], seq: u64, hash: &str) -> String {
+    hmac_sha256_hex(key.to_vec(), format!("hwm:{seq}:{hash}").as_bytes())
+}
+
 /// Records (seq, hash) beside the log. Best effort: a failure here must never lose an audit entry,
 /// but it is reported, because a silent failure would quietly disarm the truncation check.
 fn write_hwm(seq: u64, hash: &str) {
     let Some(p) = hwm_path() else { return };
-    let body = json!({ "seq": seq, "hash": hash }).to_string();
+    let mut mark = json!({ "seq": seq, "hash": hash });
+    // With a key the mark is authenticated: without it anyone who can write the log can write the
+    // mark too, and truncating the log then looks like a clean state.
+    if let Some((k, _)) = audit_key() {
+        mark["mac"] = Value::String(hwm_mac(&k, seq, hash));
+    }
+    let body = mark.to_string();
     if let Err(e) = std::fs::write(&p, body) {
         eprintln!(
             "AUDIT: could not update {} ({}) — truncation detection is degraded.",
@@ -273,6 +318,12 @@ pub(crate) fn audit_extra(
     // 3. Build the entry (without the chain fields). `caller` = `sub` from the token: without it the
     //    audit says WHAT happened but not WHO did it — with multiple tenants that is half of the
     //    accountability OWASP MCP08 asks for.
+    //
+    //    The chain lock is taken BEFORE the sequence number is drawn. Drawing it first let two threads
+    //    take 5 and 6 and then write 6 before 5 (the chain itself stayed valid), which the verifier
+    //    reported as "entries were removed", and a restart after a crash re-issued 6. A false
+    //    TAMPERED teaches the operator to ignore the real one.
+    let mut prev_guard = AUDIT_PREV.lock().unwrap_or_else(|p| p.into_inner());
     let seq = AUDIT_SEQ.fetch_add(1, Ordering::Relaxed) + 1;
     let key = audit_key();
     let mut entry = json!({
@@ -300,7 +351,6 @@ pub(crate) fn audit_extra(
     //    file access, but anyone who can write the file may delete entries and RECOMPUTE the chain from
     //    GENESIS — the result verifies as consistent. With the key held OFF the host (from a vault/KMS)
     //    that recomputation is impossible.
-    let mut prev_guard = AUDIT_PREV.lock().unwrap();
     let prev_hash = prev_guard.clone();
     let entry_str = serde_json::to_string(&entry).expect("serializacja entry");
     let payload = format!("{}{}", prev_hash, entry_str);
@@ -318,7 +368,8 @@ pub(crate) fn audit_extra(
     full_entry["prev"] = Value::String(prev_hash);
     full_entry["hash"] = Value::String(current_hash.clone());
 
-    // 6. Aktualizacja stanu globalnego
+    // 6. Aktualizacja stanu globalnego (the guard stays held through the append below, so the file
+    //    order is the sequence order)
     *prev_guard = current_hash;
 
     // 7. Output: stderr (stream) + the durable file (MCP_AUDIT_LOG) for tamper evidence across restarts.
@@ -371,11 +422,22 @@ pub(crate) fn verify_audit_file(
         }
     }
 
+    verify_audit_content(&content, &keys, expect_last)
+}
+
+/// The verification itself, with the key set passed in so a test can exercise keyed chains without
+/// touching the process environment (tests run in parallel threads of one process).
+pub(crate) fn verify_audit_content(
+    content: &str,
+    keys: &[(Vec<u8>, String)],
+    expect_last: Option<&str>,
+) -> Result<(String, String), String> {
     let mut prev = "GENESIS".to_string();
     let mut prev_seq: Option<u64> = None;
     let mut n = 0usize;
     let mut rotations = 0usize;
     let mut last_fp: Option<String> = None;
+    let mut unsigned = 0usize;
 
     for (i, line) in content.lines().enumerate() {
         if line.trim().is_empty() {
@@ -387,6 +449,17 @@ pub(crate) fn verify_audit_file(
         let obj = v
             .as_object()
             .ok_or_else(|| format!("line {}: not an object", ln))?;
+        // The hash covers the parsed object, and parsing keeps only the LAST of two equal keys, so
+        // `"caller":"alice", ... "caller":"bob"` verified while a reader taking the first value (grep,
+        // a SIEM parser) saw alice. The writer always emits sorted keys without spaces, so a line that
+        // does not reserialise to itself was not written by us.
+        if serde_json::to_string(&v).map_err(|e| format!("line {}: {}", ln, e))? != line.trim_end()
+        {
+            return Err(format!(
+                "line {}: not in the form this server writes (duplicate keys, reordered fields or extra whitespace)",
+                ln
+            ));
+        }
         let got_prev = obj.get("prev").and_then(|x| x.as_str()).unwrap_or("");
         let got_hash = obj.get("hash").and_then(|x| x.as_str()).unwrap_or("");
         if got_prev != prev {
@@ -408,6 +481,19 @@ pub(crate) fn verify_audit_file(
                 }
             }
             prev_seq = Some(seq);
+        }
+        // The log starts at 1. A file that starts anywhere else had its head cut off, or is what a
+        // restart wrote after the old file was deleted (it resumes from the high-water mark, with a
+        // fresh chain): either way entries are missing and a clean chain over the rest proves nothing.
+        if n == 0 {
+            if let Some(first) = obj.get("seq").and_then(|s| s.as_u64()) {
+                if first != 1 {
+                    return Err(format!(
+                        "line {}: the log starts at entry {}, not 1 — earlier entries are missing (rotated away, cut off, or the file was replaced)",
+                        ln, first
+                    ));
+                }
+            }
         }
 
         let mut entry = obj.clone();
@@ -434,6 +520,17 @@ pub(crate) fn verify_audit_file(
                 hmac_sha256_hex(k.clone(), payload.as_bytes())
             }
             None => {
+                // With a key in hand, an unsigned entry after a signed one is how the HMAC is walked
+                // around: drop the middle, strip `key_fp` from the entries after it, recompute them
+                // with plain SHA-256, and the old verifier still said "OK (HMAC-SHA256)". A log may
+                // begin unsigned (the key was introduced later); it may not go back to unsigned.
+                if last_fp.is_some() {
+                    return Err(format!(
+                        "line {}: unsigned entry after signed ones — the HMAC protection was stripped from here on",
+                        ln
+                    ));
+                }
+                unsigned += 1;
                 let mut h = Sha256::new();
                 h.update(payload.as_bytes());
                 hex(&h.finalize())
@@ -460,6 +557,22 @@ pub(crate) fn verify_audit_file(
             ));
         }
     }
+    // The operator gave us a key and expects a keyed log. If nothing in it is signed, the chain
+    // proves nothing against someone who can write the file, and saying "OK" would be a lie.
+    if !keys.is_empty() && n > 0 && last_fp.is_none() {
+        return Err(
+            "a key was provided but no entry is signed with it — the whole log is unkeyed SHA-256, \
+             which anyone with write access can recompute"
+                .into(),
+        );
+    }
+    let mode = if last_fp.is_none() {
+        "SHA-256, unkeyed".to_string()
+    } else if unsigned > 0 {
+        format!("HMAC-SHA256, {} leading entries unsigned", unsigned)
+    } else {
+        "HMAC-SHA256".to_string()
+    };
     let seq_info = prev_seq
         .map(|s| format!(", last seq {}", s))
         .unwrap_or_default();
@@ -470,9 +583,9 @@ pub(crate) fn verify_audit_file(
     };
     Ok((
         format!(
-            "{} entries{}{}\n  last hash: {}\n  STORE this hash off-host — without an external \
+            "[{}] {} entries{}{}\n  last hash: {}\n  STORE this hash off-host — without an external \
              anchor, truncating the tail of the log is undetectable",
-            n, seq_info, rot_info, prev
+            mode, n, seq_info, rot_info, prev
         ),
         prev,
     ))
@@ -482,8 +595,14 @@ pub(crate) fn verify_audit_file(
 /// (a path — more convenient for secrets mounted by an orchestrator).
 pub(crate) fn audit_key() -> Option<(Vec<u8>, String)> {
     static KEY: Lazy<Option<(Vec<u8>, String)>> = Lazy::new(|| {
-        let raw: Option<Vec<u8>> = if let Ok(k) = std::env::var("MCP_AUDIT_HMAC_KEY") {
-            (!k.is_empty()).then(|| k.into_bytes())
+        // An EMPTY `MCP_AUDIT_HMAC_KEY` counts as unset and falls through to the file: compose files
+        // expand `${VAR}` to "" when the variable is missing, and the old `if let Ok(k)` stopped
+        // there, silently running unkeyed with a perfectly good key file beside it.
+        let from_env = std::env::var("MCP_AUDIT_HMAC_KEY")
+            .ok()
+            .filter(|k| !k.is_empty());
+        let raw: Option<Vec<u8>> = if let Some(k) = from_env {
+            Some(k.into_bytes())
         } else if let Ok(p) = std::env::var("MCP_AUDIT_HMAC_KEY_FILE") {
             match std::fs::read(&p) {
                 // TRIM a trailing newline: `echo key > file`, editors and secret managers append `\n`, so
@@ -568,6 +687,9 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    /// Tests that point `MCP_AUDIT_LOG` at a file take this first; the variable is process-global.
+    static LOG_ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// Builds a well-formed chain, using the same hashing the writer uses, so a test cannot pass by
     /// agreeing with itself about a format the writer does not produce.
     fn chain(entries: &[Value]) -> String {
@@ -609,6 +731,137 @@ mod tests {
             std::env::temp_dir().join(format!("audit_test_{}_{}.log", name, std::process::id()));
         std::fs::write(&p, content).unwrap();
         p.to_string_lossy().into_owned()
+    }
+
+    fn keyed_chain(key: &[u8], entries: &[Value], sign: &dyn Fn(usize) -> bool) -> String {
+        let fp = key_fingerprint(key);
+        let mut prev = "GENESIS".to_string();
+        let mut out = String::new();
+        for (i, e) in entries.iter().enumerate() {
+            let mut e = e.clone();
+            let signed = sign(i);
+            if signed {
+                e["key_fp"] = json!(fp);
+            }
+            let body = serde_json::to_string(&e).unwrap();
+            let payload = format!("{}{}", prev, body);
+            let hash = if signed {
+                hmac_sha256_hex(key.to_vec(), payload.as_bytes())
+            } else {
+                let mut h = Sha256::new();
+                h.update(payload.as_bytes());
+                hex(&h.finalize())
+            };
+            let mut full = e.as_object().unwrap().clone();
+            full.insert("prev".into(), json!(prev));
+            full.insert("hash".into(), json!(hash));
+            out.push_str(&serde_json::to_string(&Value::Object(full)).unwrap());
+            out.push('\n');
+            prev = hash;
+        }
+        out
+    }
+
+    fn keys_of(key: &[u8]) -> Vec<(Vec<u8>, String)> {
+        vec![(key.to_vec(), key_fingerprint(key))]
+    }
+
+    /// The bypass: with the key in hand the verifier took any entry WITHOUT `key_fp` as plain SHA-256,
+    /// so cutting entries out and recomputing the tail unsigned still said "OK (HMAC-SHA256)".
+    #[test]
+    fn stripping_the_signature_from_the_tail_is_caught_when_a_key_is_given() {
+        let key = b"audit-key-for-test".to_vec();
+        let es: Vec<Value> = (1..=5).map(|i| entry(i, "query")).collect();
+        let honest = keyed_chain(&key, &es, &|_| true);
+        verify_audit_content(&honest, &keys_of(&key), None).expect("an honest keyed log verifies");
+
+        // forged: entries 1-2 signed, 3-5 recomputed with no key_fp at all
+        let forged = keyed_chain(&key, &es, &|i| i < 2);
+        let err = verify_audit_content(&forged, &keys_of(&key), None).unwrap_err();
+        assert!(err.contains("unsigned entry after signed"), "{err}");
+
+        // wholly unsigned log presented against a key
+        let none = keyed_chain(&key, &es, &|_| false);
+        let err = verify_audit_content(&none, &keys_of(&key), None).unwrap_err();
+        assert!(err.contains("no entry is signed"), "{err}");
+    }
+
+    #[test]
+    fn a_log_that_began_unsigned_and_gained_a_key_still_verifies_and_says_so() {
+        let key = b"audit-key-for-test".to_vec();
+        let es: Vec<Value> = (1..=4).map(|i| entry(i, "query")).collect();
+        let mixed = keyed_chain(&key, &es, &|i| i >= 2);
+        let (summary, _) = verify_audit_content(&mixed, &keys_of(&key), None).unwrap();
+        assert!(
+            summary.starts_with("[HMAC-SHA256, 2 leading entries unsigned]"),
+            "{summary}"
+        );
+        let plain = keyed_chain(&key, &es, &|_| false);
+        let (summary, _) = verify_audit_content(&plain, &[], None).unwrap();
+        assert!(summary.starts_with("[SHA-256, unkeyed]"), "{summary}");
+    }
+
+    #[test]
+    fn a_log_that_does_not_start_at_one_is_refused() {
+        let es: Vec<Value> = (7..=9).map(|i| entry(i, "query")).collect();
+        let err = verify_audit_content(&chain(&es), &[], None).unwrap_err();
+        assert!(err.contains("starts at entry 7"), "{err}");
+    }
+
+    #[test]
+    fn a_duplicated_key_does_not_hide_behind_the_last_value() {
+        let es: Vec<Value> = (1..=2).map(|i| entry(i, "query")).collect();
+        let good = chain(&es);
+        let first = good.lines().next().unwrap().to_string();
+        let doctored = good.replacen(
+            "\"caller\":\"-\"",
+            "\"caller\":\"alice\",\"caller\":\"-\"",
+            1,
+        );
+        assert_ne!(first, doctored.lines().next().unwrap());
+        let err = verify_audit_content(&doctored, &[], None).unwrap_err();
+        assert!(err.contains("not in the form this server writes"), "{err}");
+    }
+
+    /// Entries written from many threads must verify: the sequence number used to be drawn before the
+    /// chain lock, so two threads could write 6 then 5.
+    #[test]
+    fn concurrent_writers_produce_a_log_that_verifies() {
+        let dir = std::env::temp_dir().join(format!("seq-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("a.log");
+        std::fs::remove_file(&log).ok();
+        let _g = LOG_ENV.lock().unwrap_or_else(|p| p.into_inner());
+        std::env::set_var("MCP_AUDIT_LOG", &log);
+        let hs: Vec<_> = (0..8)
+            .map(|_| {
+                std::thread::spawn(|| {
+                    for _ in 0..100 {
+                        audit_extra("t", "allowed", None, serde_json::Map::new());
+                    }
+                })
+            })
+            .collect();
+        for h in hs {
+            h.join().unwrap();
+        }
+        std::env::remove_var("MCP_AUDIT_LOG");
+        let body = std::fs::read_to_string(&log).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+        let seqs: Vec<u64> = body
+            .lines()
+            .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+            .filter_map(|v| v["seq"].as_u64())
+            .collect();
+        assert!(
+            seqs.len() >= 800,
+            "only {} entries reached the file",
+            seqs.len()
+        );
+        assert!(
+            seqs.windows(2).all(|w| w[1] == w[0] + 1),
+            "sequence out of order in the file"
+        );
     }
 
     #[test]
@@ -733,7 +986,6 @@ mod tests {
             rew.anomaly
         );
 
-        std::env::remove_var("MCP_AUDIT_LOG");
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -773,12 +1025,11 @@ mod tests {
             out.push('\n');
             prev = hash;
         }
-        let p = write("rotated", &out);
-        std::env::set_var("MCP_AUDIT_HMAC_KEYS_OLD", "previous-audit-key");
-        let r = verify_audit_file(&p, None);
-        std::env::remove_var("MCP_AUDIT_HMAC_KEYS_OLD");
-        r.expect("a log written under a rotated-out key must still verify");
-        std::fs::remove_file(p).ok();
+        // The key set goes in as an argument: setting `MCP_AUDIT_HMAC_KEYS_OLD` made every other
+        // verification test in the process see a key for a moment, and an unsigned log then (rightly)
+        // failed for having none of its entries signed.
+        verify_audit_content(&out, &[(old_key, fp)], None)
+            .expect("a log written under a rotated-out key must still verify");
     }
 
     /// The log records a fingerprint, not the statement. README says so; this is what makes it true.

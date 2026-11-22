@@ -484,7 +484,7 @@ pub(crate) fn report(db: Option<&str>) -> Value {
             fact: "the audit goes to stderr only, so it does not survive the process".into(),
             fix: Some("set MCP_AUDIT_LOG to a file".into()),
         });
-    } else if !env_set("MCP_AUDIT_HMAC_KEY") && !env_set("MCP_AUDIT_HMAC_KEY_FILE") {
+    } else if crate::audit_log::audit_key().is_none() {
         findings.push(Finding {
             id: "audit.unkeyed",
             severity: Severity::Note,

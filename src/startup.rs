@@ -428,6 +428,9 @@ pub(crate) fn audit_startup(transport: &str) {
         json!(&hmac_sha256_hex(b"mcp-config-fingerprint".to_vec(), canonical.as_bytes())[..16]),
     );
     extra.insert("config".into(), Value::Object(snapshot));
+    if let Some(a) = audit_log::startup_anomaly() {
+        extra.insert("chain_anomaly".into(), json!(a));
+    }
     audit_extra("server", "startup", None, extra);
 }
 
@@ -469,7 +472,11 @@ pub(crate) fn preflight_config() {
     // audit HMAC key: configured but unreadable = a silent downgrade to weaker protection
     if let Ok(p) = std::env::var("MCP_AUDIT_HMAC_KEY_FILE") {
         match std::fs::read(&p) {
-            Ok(b) if b.is_empty() => fatal.push(format!("MCP_AUDIT_HMAC_KEY_FILE {} is empty", p)),
+            // Trimmed like `audit_key` trims it: a file holding only "\n" passed the length check
+            // and then became NO key, the silent downgrade this check exists to prevent.
+            Ok(b) if b.iter().all(|c| matches!(c, b'\n' | b'\r')) => {
+                fatal.push(format!("MCP_AUDIT_HMAC_KEY_FILE {} is empty", p))
+            }
             Ok(_) => {}
             Err(e) => fatal.push(format!("MCP_AUDIT_HMAC_KEY_FILE {}: {}", p, e)),
         }

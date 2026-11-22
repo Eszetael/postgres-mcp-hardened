@@ -202,15 +202,10 @@ pub(crate) async fn main() {
             .map(|s| s.as_str());
         match verify_audit_file(path, expect) {
             Ok((summary, _last)) => {
-                say(format!(
-                    "OK ({}): {}",
-                    if audit_key().is_some() {
-                        "HMAC-SHA256"
-                    } else {
-                        "SHA-256, unkeyed"
-                    },
-                    summary
-                ));
+                // The mode comes from the entries themselves (the summary starts with it), not from
+                // whether a key is configured: a key in the environment proves nothing about how
+                // the file was signed.
+                say(format!("OK {}", summary));
             }
             Err(e) => {
                 say_with_status(format!("TAMPERED: {}", e), 1);
