@@ -245,7 +245,7 @@ fn config_snapshot() -> serde_json::Map<String, Value> {
                 "sha256:{}",
                 &hmac_sha256_hex(b"mcp-config-fingerprint".to_vec(), raw.as_bytes())[..8]
             )
-        } else if raw.contains("://") || raw.contains("password=") {
+        } else if raw.contains("://") || raw.to_ascii_lowercase().contains("password") {
             // The test for a connection string was "does it contain ://", which is one of the two
             // spellings libpq accepts and this server supports. The other, `host=… password=… `,
             // went into the audit log verbatim.
@@ -261,41 +261,157 @@ fn config_snapshot() -> serde_json::Map<String, Value> {
 }
 
 /// Removes the password from a connection string, keeping the shape an operator recognises.
+///
+/// Two parsers instead of cutting on characters, because both spellings libpq accepts have more
+/// edge cases than a substring test can hold: a URL password may contain an unencoded `@` and can
+/// also arrive as `?password=` or `?sslpassword=` in any letter case; the keyword form allows spaces
+/// around `=` and quoted values with spaces. Each of those went into the audit log in clear text.
+/// `;` separates several connection strings (`MCP_DATABASE_URLS`) unless it sits inside quotes.
 fn strip_password(url: &str) -> String {
-    // libpq accepts two spellings and this server supports both. Only the URL form was being
-    // redacted, so `host=... password=secret dbname=...` went into the audit log — and into whatever
-    // collects it — in clear text, under a comment promising the opposite.
-    if !url.contains("://") && url.contains("password=") {
-        let mut out = String::with_capacity(url.len());
-        for (i, tok) in url.split_whitespace().enumerate() {
-            if i > 0 {
-                out.push(' ');
+    split_unquoted(url, ';')
+        .iter()
+        .map(|part| {
+            if part.contains("://") {
+                strip_url_password(part)
+            } else {
+                strip_keyword_password(part)
             }
-            match tok.split_once('=') {
-                Some((k, _)) if k.eq_ignore_ascii_case("password") => out.push_str("password=***"),
-                _ => out.push_str(tok),
+        })
+        .collect::<Vec<_>>()
+        .join(";")
+}
+
+fn is_secret_key(k: &str) -> bool {
+    k.eq_ignore_ascii_case("password") || k.eq_ignore_ascii_case("sslpassword")
+}
+
+/// Splits on `sep` outside single quotes (libpq quoting, `\'` escapes a quote).
+fn split_unquoted(s: &str, sep: char) -> Vec<&str> {
+    let (mut out, mut start, mut quoted, mut esc) = (Vec::new(), 0, false, false);
+    for (i, c) in s.char_indices() {
+        match c {
+            _ if esc => esc = false,
+            '\\' if quoted => esc = true,
+            '\'' => quoted = !quoted,
+            c if c == sep && !quoted => {
+                out.push(&s[start..i]);
+                start = i + c.len_utf8();
             }
+            _ => {}
         }
-        return out;
     }
-    let mut out = String::with_capacity(url.len());
-    for part in url.split(';') {
-        if !out.is_empty() {
-            out.push(';');
+    out.push(&s[start..]);
+    out
+}
+
+/// `scheme://user:pw@host/db?password=x#f`: credentials are everything up to the LAST `@` of the
+/// authority (a `/`, `?` or `#` ends it), and the query is scanned for secret parameters.
+fn strip_url_password(part: &str) -> String {
+    let Some(s) = part.find("://") else {
+        return part.to_string();
+    };
+    let head = &part[..s + 3];
+    let rest = &part[s + 3..];
+    let auth_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let (auth, tail) = rest.split_at(auth_end);
+    let mut out = String::from(head);
+    match auth.rfind('@') {
+        Some(at) => {
+            let user = auth[..at].split(':').next().unwrap_or("");
+            out.push_str(user);
+            out.push_str(":***");
+            out.push_str(&auth[at..]);
         }
-        match (part.find("://"), part.find('@')) {
-            (Some(s), Some(at)) if at > s => {
-                let creds = &part[s + 3..at];
-                let user = creds.split(':').next().unwrap_or("");
-                out.push_str(&part[..s + 3]);
-                out.push_str(user);
-                out.push_str(":***");
-                out.push_str(&part[at..]);
-            }
-            _ => out.push_str(part),
+        None => out.push_str(auth),
+    }
+    match tail.find('?') {
+        Some(q) => {
+            out.push_str(&tail[..=q]);
+            let query = &tail[q + 1..];
+            let (query, frag) = match query.find('#') {
+                Some(h) => query.split_at(h),
+                None => (query, ""),
+            };
+            let masked: Vec<String> = query
+                .split('&')
+                .map(|kv| match kv.split_once('=') {
+                    Some((k, _)) if is_secret_key(k) => format!("{k}=***"),
+                    _ => kv.to_string(),
+                })
+                .collect();
+            out.push_str(&masked.join("&"));
+            out.push_str(frag);
         }
+        None => out.push_str(tail),
     }
     out
+}
+
+/// `key = value key2='quoted value'`: libpq's tokenizer, so `password = x` and `password='a b'`
+/// are both caught. Keeps every other pair as written.
+fn strip_keyword_password(part: &str) -> String {
+    let b: Vec<char> = part.chars().collect();
+    let (mut i, mut pairs) = (0, Vec::new());
+    while i < b.len() {
+        while i < b.len() && b[i].is_whitespace() {
+            i += 1;
+        }
+        if i >= b.len() {
+            break;
+        }
+        let start = i;
+        while i < b.len() && b[i] != '=' && !b[i].is_whitespace() {
+            i += 1;
+        }
+        let key: String = b[start..i].iter().collect();
+        let mut j = i;
+        while j < b.len() && b[j].is_whitespace() {
+            j += 1;
+        }
+        if j >= b.len() || b[j] != '=' {
+            // not a key=value pair: keep the word and move on
+            pairs.push((key.clone(), part_of(&b, start, i)));
+            continue;
+        }
+        j += 1;
+        while j < b.len() && b[j].is_whitespace() {
+            j += 1;
+        }
+        if j < b.len() && b[j] == '\'' {
+            j += 1;
+            while j < b.len() && b[j] != '\'' {
+                if b[j] == '\\' {
+                    j += 1;
+                }
+                j += 1;
+            }
+            j += 1;
+        } else {
+            while j < b.len() && !b[j].is_whitespace() {
+                if b[j] == '\\' {
+                    j += 1;
+                }
+                j += 1;
+            }
+        }
+        i = j.min(b.len());
+        pairs.push((key, part_of(&b, start, i)));
+    }
+    pairs
+        .into_iter()
+        .map(|(k, text)| {
+            if is_secret_key(&k) {
+                format!("{k}=***")
+            } else {
+                text
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn part_of(b: &[char], from: usize, to: usize) -> String {
+    b[from..to].iter().collect()
 }
 
 /// Opens the chain with what this process is, before it serves anything.
@@ -584,6 +700,42 @@ pub(crate) fn preflight_config() {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn no_spelling_of_a_connection_string_leaves_a_password_in_the_log() {
+        // Seven shapes found by the 0.1.12 audit; each put SEKRET into the audit record.
+        for url in [
+            "postgres://u:SEKRET@127.0.0.1:1/db",
+            "postgres://u@127.0.0.1:1/db?password=SEKRET",
+            "postgres://u:pa@SEKRET@127.0.0.1:1/db",
+            "host=127.0.0.1 port=1 user=u password='a SEKRET' dbname=db",
+            "host=127.0.0.1 port=1 user=u password = SEKRET dbname=db",
+            "postgres://u@127.0.0.1:1/db?sslpassword=SEKRET",
+            "postgres://u:x@127.0.0.1:1/db?PassWord=SEKRET",
+            "a=host=h password=SEKRET;b=postgres://u:p@h/d",
+            "host=h password='a;SEKRET' user=u",
+            "postgres://u:SEKRET@h/d?sslmode=require&password=SEKRET#x",
+        ] {
+            let out = strip_password(url);
+            assert!(!out.contains("SEKRET"), "{url} -> {out}");
+        }
+    }
+
+    #[test]
+    fn stripping_a_password_keeps_the_parts_an_operator_needs() {
+        assert_eq!(
+            strip_password("postgres://app:SEKRET@db.example.com:5432/shop?sslmode=require"),
+            "postgres://app:***@db.example.com:5432/shop?sslmode=require"
+        );
+        assert_eq!(
+            strip_password("postgres://u:pa@SEKRET@h/d"),
+            "postgres://u:***@h/d"
+        );
+        assert_eq!(
+            strip_password("host=h port=5432 user=u password = SEKRET dbname=d"),
+            "host=h port=5432 user=u password=*** dbname=d"
+        );
+    }
     use super::*;
 
     fn classify(names: &[&str]) -> (Vec<String>, Vec<String>) {
