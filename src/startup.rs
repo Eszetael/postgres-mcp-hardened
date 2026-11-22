@@ -700,6 +700,23 @@ pub(crate) fn preflight_config() {
         }
     }
 
+    // A short shared token is a guessing target twice over: on the wire, and through the audit log,
+    // which records an 8-hex fingerprint of it (`bearer:<fp>`) computed with a key anyone can read in
+    // the source, so a weak token can be tested offline against any copy of the log. Warn rather than
+    // refuse: existing deployments keep working, and the operator is told what the number costs.
+    for var in ["MCP_BEARER_TOKEN", "MCP_METRICS_TOKEN"] {
+        if let Ok(t) = std::env::var(var) {
+            if !t.trim().is_empty() && t.trim().len() < 24 {
+                eprintln!(
+                    "WARNING: {} is {} characters. Use at least 24 random ones (`openssl rand -base64 32`): \
+                     a short token is easy to guess, and its fingerprint appears in the audit log.",
+                    var,
+                    t.trim().len()
+                );
+            }
+        }
+    }
+
     // Booleans and small integers: a value nobody parses is a setting nobody applied.
     for var in [
         "MCP_TRUST_PROXY",
