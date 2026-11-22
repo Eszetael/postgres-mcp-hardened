@@ -378,7 +378,10 @@ mod tests {
         h.append("mcp-name", "list_tables".parse().unwrap());
         assert!(single_header(&h, "mcp-name").is_err());
         let mut b = HeaderMap::new();
-        b.insert("mcp-name", axum::http::HeaderValue::from_bytes(&[0xE9]).unwrap());
+        b.insert(
+            "mcp-name",
+            axum::http::HeaderValue::from_bytes(&[0xE9]).unwrap(),
+        );
         assert!(single_header(&b, "mcp-name").is_err());
         assert_eq!(single_header(&HeaderMap::new(), "mcp-name"), Ok(None));
     }
