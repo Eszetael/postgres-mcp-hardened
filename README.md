@@ -1,47 +1,37 @@
 # postgres-mcp-hardened
 
-> ### 🚧 Version 0.1.10 — the rest of an outside review, and a fix that was too blunt
+> ### 🚧 Version 0.1.11: our own audit of the published 0.1.10
 >
 > Published: binaries for five platforms with checksums, Sigstore signatures and build provenance;
-> `.mcpb` bundles for one-click install; an image on `ghcr.io` for amd64 and arm64; a package on npm;
-> and an entry in the official MCP registry.
+> `.mcpb` bundles for one-click install; an image on `ghcr.io` for amd64 and arm64; a package on npm,
+> now published from GitHub Actions through npm trusted publishing, with no long-lived token; and an
+> entry in the official MCP registry.
 >
-> **0.1.8 and 0.1.9 closed six bypasses that four independent reviewers found in 0.1.7, none of them
-> found by us.** Two days of our own adversarial work had come back mostly clean the day before.
-> Passing the tests you thought to write is not the same as looking. The one that mattered most needs
-> no privileges at all: with a column redacted, a join on it through `USING` answered whether a given
-> value was present, which is a complete equality oracle against the least-privilege reader this
-> project tells you to configure.
+> **0.1.11 closes three bypasses of the main read-only control, found by us in the released 0.1.10.**
+> `SELECT * FROM LATERAL pg_read_file('/etc/hostname') x` returned the file, because the parser gives
+> `FROM LATERAL f()` a different node from `FROM f()` and only one of them had its name checked.
+> `ts_stat` and `ts_rewrite` run a query given as text, and through them a redacted column came back
+> as words. And with a column redacted, `UNION ALL SELECT *` or `(s.*)::text` returned it by position
+> or inside a whole row. If you run 0.1.10 or older, upgrade.
 >
-> **0.1.10 closes the three findings that were left open.** With `MCP_ALLOW_SCHEMAS=public`,
-> `SELECT * FROM secret.salaries` was refused while `describe_table` handed over every column, type
-> and default of that same table. An ordinary connection string carrying no `sslmode` used the
-> driver's `prefer`, which sends everything in the clear whenever the server declines TLS, and anyone
-> on the wire can make it decline. And `MCP_SSLROOTCERT` added a private certificate authority to 242
-> public ones instead of replacing them, so an operator who believed they had pinned trust to their
-> own issuer had not.
+> **What the three share is the lesson of this release.** Each rule was written for one variant of
+> the syntax tree, and the grammar had a second. A test now tries eleven denied functions at 28
+> places a call can stand, and the match over `FROM` items has no catch-all arm, so a new variant
+> brought in by a parser upgrade stops the build instead of passing.
 >
-> **The first version of that TLS fix was wrong in a way worth reading about.** It asked "is this
-> loopback" and demanded TLS from everything else, which took down six PostgreSQL version jobs, the
-> conformance run, the container check and the adversarial corpus in a single push. All of them reach
-> the database the way ordinary deployments do: `postgres://user:pass@postgres:5432/db`, a service
-> name on a private network. Docker Compose and Kubernetes are not the public internet, and a server
-> that demands TLS from a container on a bridge network is a server people switch off entirely. The
-> question is now whether somebody untrusted can sit on the wire, not whether the address is loopback,
-> and a real socket to a PostgreSQL reachable only by service name is in the test suite, because a
-> rule about networks should be tested over a network.
+> Also fixed: `EXPLAIN (ANALYSE)`, in the British spelling, executed the statement; one failed `SHOW`
+> left a pooled connection broken for ten seconds; host names such as `fd-prod.example.com` passed
+> for private addresses and skipped TLS; and CI had been red for three weeks on dependency advisories.
 >
-> A resource limit is documented and **not** solved, in [`THREAT_MODEL.md`](THREAT_MODEL.md): 49
-> bytes of SQL make PostgreSQL fold a constant into 5.9 GB of backend memory during planning, and a
-> five second `statement_timeout` does not stop it. The obvious shapes are refused; the general
-> problem is upstream of anything this server can do.
+> A resource limit is still documented and **not** solved, in [`THREAT_MODEL.md`](THREAT_MODEL.md):
+> 49 bytes of SQL make PostgreSQL fold a constant into 5.9 GB of backend memory during planning.
 >
 > Every change here was reproduced against a running server before being fixed, and each is in
 > [`CHANGELOG.md`](CHANGELOG.md) with the query.
 >
 > Everything here is 0.1.x because nobody outside this project has run it against their own data.
 
-**The official Postgres MCP server was deprecated in 2024 and still gets 573k downloads a month. Its entire defence is one database-level read-only transaction — and that alone does not stop every write. This is a maintained Rust replacement with defence in depth.**
+**The official Postgres MCP server was deprecated in 2024 and still gets 650k downloads a month. Its entire defence is one database-level read-only transaction — and that alone does not stop every write. This is a maintained Rust replacement with defence in depth.**
 
 A drop-in [Model Context Protocol](https://modelcontextprotocol.io) server that lets an AI agent query PostgreSQL — **read-only, enforced at the database level**, with real SQL validation, timeouts, cost limits, OAuth 2.1, and an audit trail. Speaks **Streamable HTTP** and stdio, and negotiates the MCP revision: `2026-07-28` (current, and the default since upstream released it on 2026-08-03), `2025-11-25`, and `2025-06-18` — what most shipping clients still speak today. A client asks for what it knows; it is not negotiated down.
 
