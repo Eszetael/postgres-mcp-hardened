@@ -882,6 +882,8 @@ Reproduce it with `tests/soak.sh` rather than believing the paragraph.
 | `MCP_RATE_RPM_STDIO` | the same limit for stdio (default 600/min): an agent exploring a schema legitimately makes dozens of calls a minute, but a runaway loop against a production database is still what a DBA fears most |
 | `MCP_CLIENT_ID` | a name for this client in the audit log over stdio, e.g. `claude-desktop@ada-laptop`; without it the identity falls back to the operating system's user and process |
 | `MCP_RATE_BURST` | burst allowance for that limit (default `MCP_RATE_RPM / 4`, min 5) |
+| `MCP_MAX_CONNECTIONS` | TCP connections held open at once over HTTP (default 1024); past it, new ones wait in the kernel backlog |
+| `MCP_CONN_TIMEOUT_SECS` | seconds a connection may sit idle, or take to get its first response byte after starting a request, before it is closed (default 120). Stops slow-connection attacks that the request rate limit never sees |
 | `MCP_METRICS_TOKEN` | token required on `/metrics`. Without it, `/metrics` follows whatever the server itself requires: open when the server has no authentication, the bearer token when one is set, and closed when OAuth is configured (a JWT is the wrong shape for a scraper — set this instead) |
 | `MCP_REDACT_REQUIRE_REVOKE` | `1` to refuse to serve while the database still lets the role read a redacted column — turns the setting above from advisory into a guarantee |
 | `MCP_STRUCTURED_CONTENT` | `1` to also return MCP `structuredContent`; off by default because a client that ignores it pays for every result twice. The provenance marker travels inside the object, but the delimiter escaping that protects the text block does not apply — a client that pastes structured output straight into a prompt loses that layer |

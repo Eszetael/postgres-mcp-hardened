@@ -13,6 +13,7 @@ use serde_json::{json, Value};
 mod audit_log;
 mod auth;
 mod cli;
+mod conn_limit;
 mod db;
 mod fuzz;
 mod http;

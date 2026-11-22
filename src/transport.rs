@@ -139,9 +139,15 @@ pub(crate) async fn run_http() {
     };
     eprintln!("MCP HTTP listening on http://{}", addr);
     // ConnectInfo: the rate limiter needs the peer address (headers are client-controlled, so untrusted).
+    // The listener caps open connections and closes ones that stall (see `conn_limit`).
+    let listener = conn_limit::Limited::new(
+        listener,
+        conn_limit::max_connections(),
+        conn_limit::timeout(),
+    );
     if let Err(e) = axum::serve(
         listener,
-        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        app.into_make_service_with_connect_info::<conn_limit::Peer>(),
     )
     .await
     {
@@ -153,7 +159,7 @@ pub(crate) async fn run_http() {
 /// `DELETE /mcp` — explicit session termination (Streamable HTTP). Without it a client had no way
 /// to clean up and the entry lingered until the TTL expired; the specification provides for this.
 pub(crate) async fn delete_session_handler(
-    ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
+    ConnectInfo(peer): ConnectInfo<conn_limit::Peer>,
     headers: HeaderMap,
     State(state): State<AppState>,
 ) -> impl IntoResponse {
@@ -261,7 +267,7 @@ pub(crate) async fn root_handler(headers: HeaderMap) -> impl IntoResponse {
 }
 
 pub(crate) async fn mcp_handler(
-    ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
+    ConnectInfo(peer): ConnectInfo<conn_limit::Peer>,
     headers: HeaderMap,
     State(state): State<AppState>,
     Json(req): Json<serde_json::Value>,
@@ -676,6 +682,7 @@ mod tests {
             last,
             rev: protocol::Rev::V20250618,
             client: client.into(),
+            owner: None,
         }
     }
 

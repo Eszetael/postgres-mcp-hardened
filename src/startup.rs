@@ -137,6 +137,8 @@ pub(crate) const KNOWN_VARS: &[&str] = &[
     "MCP_BEARER_TOKEN",
     "MCP_DATABASE_URLS",
     "MCP_FUZZ_VERBOSE",
+    "MCP_MAX_CONNECTIONS",
+    "MCP_CONN_TIMEOUT_SECS",
     "MCP_MAX_COST",
     "MCP_MAX_INFLIGHT_PER_CLIENT",
     "MCP_METRICS_TOKEN",
@@ -449,6 +451,8 @@ pub(crate) fn preflight_config() {
         ("MCP_RATE_BURST", true),
         ("MCP_MAX_INFLIGHT_PER_CLIENT", true),
         ("MCP_MAX_COST", false),
+        ("MCP_MAX_CONNECTIONS", false),
+        ("MCP_CONN_TIMEOUT_SECS", false),
     ] {
         if let Ok(v) = std::env::var(var) {
             match v.trim().parse::<f64>() {
