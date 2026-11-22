@@ -293,9 +293,9 @@ pub(crate) async fn mcp_handler(
     if let Some(sid) = headers.get("mcp-session-id").and_then(|v| v.to_str().ok()) {
         let mut known = state.sessions.write().await;
         match known.get_mut(sid) {
-            Some((last, rev)) => {
-                *last = uptime_secs(); // refresh so an active session does not expire
-                session_rev = Some(*rev);
+            Some(sess) => {
+                sess.last = uptime_secs(); // refresh so an active session does not expire
+                session_rev = Some(sess.rev);
             }
             None => {
                 let body = json!({ "jsonrpc": "2.0", "id": req.get("id").cloned().unwrap_or(Value::Null),
@@ -492,7 +492,11 @@ pub(crate) async fn mcp_handler(
         (Ok(m), Ok(n)) => (m, n),
         _ => {
             let _who = set_caller(caller);
-            audit("http/header_mismatch", "refused", Some("repeated or unreadable Mcp-Method/Mcp-Name header"));
+            audit(
+                "http/header_mismatch",
+                "refused",
+                Some("repeated or unreadable Mcp-Method/Mcp-Name header"),
+            );
             return (
                 StatusCode::BAD_REQUEST,
                 Json(json!({
@@ -570,15 +574,14 @@ pub(crate) async fn mcp_handler(
             let new_id = Uuid::new_v4().to_string();
             let now = uptime_secs();
             let mut s = state.sessions.write().await;
-            if s.len() >= MAX_SESSIONS {
-                s.retain(|_, (last, _)| now.saturating_sub(*last) < SESSION_IDLE_SECS);
-                if s.len() >= MAX_SESSIONS {
-                    s.clear(); // still full = someone is inflating it; start clean rather than grow
-                }
-            }
+            make_room(&mut s, &key, now);
             s.insert(
                 new_id.clone(),
-                (now, negotiated.unwrap_or(protocol::Rev::V20250618)),
+                Session {
+                    last: now,
+                    rev: negotiated.unwrap_or(protocol::Rev::V20250618),
+                    client: key.clone(),
+                },
             );
             new_id
         } else {
@@ -587,7 +590,7 @@ pub(crate) async fn mcp_handler(
             // to change with it — otherwise the session would keep answering under the old one.
             if let Some(rev) = negotiated {
                 if let Some(entry) = state.sessions.write().await.get_mut(&sid) {
-                    entry.1 = rev;
+                    entry.rev = rev;
                 }
             }
             sid
@@ -601,4 +604,94 @@ pub(crate) async fn mcp_handler(
     }
 
     (StatusCode::OK, resp_headers, Json(resp)).into_response()
+}
+
+/// One session as the server remembers it. `client` is the rate-limit key that created it, so a
+/// single address cannot hold the whole table.
+pub(crate) struct Session {
+    pub(crate) last: u64,
+    pub(crate) rev: protocol::Rev,
+    pub(crate) client: String,
+}
+
+/// Makes room for one more session without handing anybody else's away.
+///
+/// The map used to `clear()` when it was full of live sessions, so whoever could call `initialize`
+/// 10 000 times logged every other client out (their next request got a 404). `ratelimit.rs` had the
+/// same `clear()` and was fixed in 0.1.8; this copy was left. Now: idle sessions go first, then the
+/// creating client's own oldest above its cap, then the oldest quarter of all, which is the end
+/// farthest from whoever is hammering right now.
+pub(crate) fn make_room(
+    s: &mut std::collections::HashMap<String, Session>,
+    client: &str,
+    now: u64,
+) {
+    if s.len() >= MAX_SESSIONS {
+        s.retain(|_, v| now.saturating_sub(v.last) < SESSION_IDLE_SECS);
+    }
+    let mut mine: Vec<(String, u64)> = s
+        .iter()
+        .filter(|(_, v)| v.client == client)
+        .map(|(k, v)| (k.clone(), v.last))
+        .collect();
+    if mine.len() >= MAX_SESSIONS_PER_CLIENT {
+        mine.sort_by_key(|(_, last)| *last);
+        let excess = mine.len() + 1 - MAX_SESSIONS_PER_CLIENT;
+        for (k, _) in mine.into_iter().take(excess) {
+            s.remove(&k);
+        }
+    }
+    if s.len() >= MAX_SESSIONS {
+        let mut ages: Vec<(String, u64)> = s.iter().map(|(k, v)| (k.clone(), v.last)).collect();
+        ages.sort_by_key(|(_, last)| *last);
+        for (k, _) in ages.into_iter().take(MAX_SESSIONS / 4) {
+            s.remove(&k);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn sess(last: u64, client: &str) -> Session {
+        Session {
+            last,
+            rev: protocol::Rev::V20250618,
+            client: client.into(),
+        }
+    }
+
+    #[test]
+    fn a_full_table_drops_the_oldest_quarter_and_keeps_the_newest() {
+        let mut m = HashMap::new();
+        for i in 0..MAX_SESSIONS {
+            m.insert(
+                format!("s{i}"),
+                sess(100_000 + (i * 3000 / MAX_SESSIONS) as u64, &format!("c{i}")),
+            );
+        }
+        // all still within the idle window, so only the quarter rule can make room
+        make_room(&mut m, "attacker", 100_000 + 3000);
+        assert_eq!(m.len(), MAX_SESSIONS - MAX_SESSIONS / 4);
+        assert!(!m.contains_key("s0"));
+        assert!(m.contains_key(&format!("s{}", MAX_SESSIONS - 1)));
+    }
+
+    #[test]
+    fn one_client_cannot_hold_more_than_its_share() {
+        let mut m = HashMap::new();
+        for i in 0..MAX_SESSIONS_PER_CLIENT {
+            m.insert(format!("a{i}"), sess(i as u64, "a"));
+        }
+        m.insert("victim".into(), sess(0, "b"));
+        make_room(&mut m, "a", 1000);
+        assert!(!m.contains_key("a0"), "its own oldest goes");
+        assert!(m.contains_key("victim"), "someone else's session stays");
+        assert_eq!(
+            m.values().filter(|v| v.client == "a").count(),
+            MAX_SESSIONS_PER_CLIENT - 1
+        );
+    }
 }

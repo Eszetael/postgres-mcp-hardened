@@ -65,11 +65,13 @@ pub(crate) struct AppState {
     /// server has no other way to establish the version, and names the session negotiated at
     /// `initialize` as exactly that other way. Without it a client that omits the header would be
     /// served an older contract than the one it agreed to.
-    sessions: Arc<tokio::sync::RwLock<std::collections::HashMap<String, (u64, protocol::Rev)>>>,
+    sessions: Arc<tokio::sync::RwLock<std::collections::HashMap<String, transport::Session>>>,
 }
 
 /// How many sessions we keep, and for how long while idle.
 pub(crate) const MAX_SESSIONS: usize = 10_000;
+/// One client key may hold this many; its oldest is dropped for a new one (see `transport::make_room`).
+pub(crate) const MAX_SESSIONS_PER_CLIENT: usize = 64;
 pub(crate) const SESSION_IDLE_SECS: u64 = 3_600;
 
 pub(crate) static PROC_START: Lazy<std::time::Instant> = Lazy::new(std::time::Instant::now);
