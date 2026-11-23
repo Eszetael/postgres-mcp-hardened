@@ -653,9 +653,20 @@ pub(crate) fn cost_guard(sql: &str, max_cost: f64, db: Option<&str>) -> Result<(
                 .iter()
                 .filter(|f| {
                     f.starts_with("pg_")
+                        // Existence and privilege oracles. `to_regclass('secret.salaries')` is NULL or
+                        // a name, `has_table_privilege` is true or false, and `col_description` reads
+                        // the comment of a column the caller may not know exists: each answers a
+                        // question about a relation outside the surface. Families again, not a list.
+                        || f.starts_with("to_reg")
+                        || (f.starts_with("has_") && f.ends_with("_privilege"))
                         || matches!(
                             f.as_str(),
-                            "current_setting" | "inet_server_addr" | "inet_server_port"
+                            "current_setting"
+                                | "inet_server_addr"
+                                | "inet_server_port"
+                                | "col_description"
+                                | "obj_description"
+                                | "shobj_description"
                         )
                 })
                 .collect();

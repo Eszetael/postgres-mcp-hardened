@@ -677,6 +677,26 @@ impl Visitor for SecurityScanner {
         // false comfort: `SELECT password AS pw` renames it, `SELECT md5(password)` leaks it a
         // character at a time. Refusing the reference closes both, and masking the value in the
         // output still covers `SELECT *`, where the column is never named.
+        // `'secret.salaries'::regclass` answers "does this relation exist, and in which schema" with
+        // an error or a value, and `to_regclass` and friends do the same in function form (refused in
+        // `cost_guard`). While a surface allowlist is configured and the catalogue is not opened,
+        // that is a way to ask about relations the caller was told are not there.
+        if crate::surface::active() && !crate::surface::catalog_allowed() {
+            let cast_to = match expr {
+                Expr::Cast { data_type, .. } => Some(data_type),
+                Expr::TypedString(ts) => Some(&ts.data_type),
+                _ => None,
+            };
+            if cast_to.is_some_and(is_reg_type) {
+                self.hit = Some(
+                    "a cast to a reg* type looks a name up in the catalogue; while a surface \
+                     allowlist is configured the catalogue is out of reach (MCP_ALLOW_CATALOG=1 \
+                     opens it)"
+                        .into(),
+                );
+                return ControlFlow::Break(());
+            }
+        }
         match expr {
             Expr::Identifier(id) => {
                 if is_redacted(&id.value.to_lowercase()) {
@@ -2899,6 +2919,34 @@ mod join_oracle_tests {
             .filter(|m| m.contains(redacted) || m.contains("NATURAL"))
     }
 
+    /// Existence oracle through a cast: `'secret.salaries'::regclass` resolves a name in the
+    /// catalogue. The rule applies only while a surface is configured (environment), so the unit test
+    /// pins the recogniser and the live suite pins the refusal.
+    #[test]
+    fn a_cast_to_an_object_identifier_type_is_recognised_in_every_spelling() {
+        for (sql, want) in [
+            ("SELECT 'a.b'::regclass", true),
+            ("SELECT 'a'::regtype", true),
+            ("SELECT regclass 'a'", true),
+            ("SELECT CAST('a' AS regproc)", true),
+            ("SELECT 'a'::regnamespace", true),
+            ("SELECT 1::int", false),
+            ("SELECT 'a'::text", false),
+        ] {
+            let ast = Parser::parse_sql(&PostgreSqlDialect {}, sql).expect("parses");
+            let mut found = false;
+            let _ = sqlparser::ast::visit_expressions(&ast, |e| {
+                match e {
+                    Expr::Cast { data_type, .. } => found |= is_reg_type(data_type),
+                    Expr::TypedString(ts) => found |= is_reg_type(&ts.data_type),
+                    _ => {}
+                }
+                ControlFlow::<()>::Continue(())
+            });
+            assert_eq!(found, want, "{sql}");
+        }
+    }
+
     /// What the scanner says about a statement with redaction on, whatever the wording. Structural
     /// rules (a wildcard as a value, a positional rename) name no column, so `evasion_for`'s filter
     /// on the column name would hide them.
@@ -3154,5 +3202,20 @@ mod folded_constant_tests {
         assert!(!e.contains("non-read-only"), "{e}");
         assert!(e.contains("planning"), "{e}");
         assert!(v("DROP TABLE t").unwrap_err().contains("non-read-only"));
+    }
+}
+
+/// `regclass`, `regtype`, `regproc`, ... : the object-identifier aliases whose input function resolves
+/// a name through the catalogue.
+fn is_reg_type(dt: &sqlparser::ast::DataType) -> bool {
+    use sqlparser::ast::DataType;
+    match dt {
+        DataType::Regclass => true,
+        DataType::Custom(name, _) => name
+            .0
+            .last()
+            .and_then(|p| p.as_ident())
+            .is_some_and(|i| i.value.to_lowercase().starts_with("reg")),
+        _ => false,
     }
 }
