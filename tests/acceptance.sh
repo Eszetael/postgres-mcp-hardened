@@ -1528,7 +1528,8 @@ for q in "SELECT * FROM pg_hba_file_rules" "SELECT * FROM pg_show_all_file_setti
   case "$r" in ERROR:*) ok "refused: $q";; *) no "server configuration readable through: $q" "$r";; esac
 done
 stop
-start DATABASE_URL="$URL" MCP_ALLOW_SCHEMAS=public
+# rate limit off: this server answers about forty cases in a row
+start DATABASE_URL="$URL" MCP_ALLOW_SCHEMAS=public MCP_RATE_RPM=0
 for q in "SHOW ALL" "SELECT to_regclass('secret.t')" "SELECT 'secret.t'::regclass" "SELECT has_table_privilege('secret.t','select')" "SELECT col_description('customers'::regclass,1)" \
          "SELECT '{secret.t}'::regclass[]" "SELECT ARRAY['secret.t']::regclass[]" "SELECT CAST(ARRAY['secret.t'] AS regclass[])" "SELECT regclass('secret.t')" "SELECT regclassin('secret.t')" "SELECT 'secret'::pg_catalog.regnamespace" "SELECT pg_relation_size('secret.t')" "SELECT currval('secret.t')"; do
   r=$(tool query "{\"sql\":\"$q\"}" | body)

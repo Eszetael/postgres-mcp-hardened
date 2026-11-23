@@ -149,7 +149,10 @@ test and a case in `tests/acceptance.sh`:
   operators are unaffected, also when another schema defines the same symbol for other operand types
 (tested with `citext` and `hstore` installed, and with `=`, `@>` and `~~` defined that way). An
   operator reached through an operator class (sorting or grouping a user-defined type) is not
-  checked.
+  checked. The fuzzer then found that a comment glued to an operator (`1 ###/**/ 1`) reached the
+  check as an operator named `###/**/`, while PostgreSQL ran `###`: the parser here reads an
+  operator and a comment written without a space between them as one token. Such a statement is
+  now refused with a message asking for the space.
 - **A password with `/`, `?`, `#` or `;` reached the audit log.** PostgreSQL's driver takes the
   credentials up to the first `@` of the whole string, so `postgres://u:Zm9v/YmFy+cXV4@host/db`
   connects, and the masker, which stopped at `/`, wrote it out. Of the 37 spellings in the review,
