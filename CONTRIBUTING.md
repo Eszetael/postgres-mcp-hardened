@@ -32,6 +32,11 @@ Add the attack to the `MUST_REJECT` corpus in `src/validate.rs` *and* to the fuz
 failure mode we care most about: ask what happens if the input is renamed, cast, wrapped in a
 function, nested one level deeper, or written with different whitespace.
 
+## Releases
+
+Tags publish through `.github/workflows/release.yml`. npm publishes by trusted publishing (the
+workflow's OIDC identity), so there is no npm token to rotate, and none to leak.
+
 ## Claims in the documentation
 
 Every behavioural claim in `README.md`, `SECURITY.md` and `COMPLIANCE_OWASP_MCP_TOP10.md` should be

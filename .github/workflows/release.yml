@@ -295,8 +295,6 @@ jobs:
         # irreversible (unpublish is a 72-hour window and a broken promise to anyone who installed).
         if: ${{ !contains(github.ref, '-rc') }}
         run: cd npm && npm publish --provenance --access public
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
       - name: Rehearsal — show what would be published
         if: ${{ contains(github.ref, '-rc') }}
