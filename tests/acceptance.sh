@@ -1076,6 +1076,11 @@ OTHER=$(SUB=mallory mint "mcp:query mcp:read" mcp.pg https://idp 300)
 [ "$(scall "$OTHER" "$PING")" = 404 ] && ok "another valid identity presenting that id is told it is unknown" || no "session usable by another identity" "$(scall "$OTHER" "$PING")"
 [ "$(scall "$OTHER" "" DELETE)" = 404 ] && ok "and cannot end it" || no "another identity ended the session" "$(scall "$OTHER" "" DELETE)"
 [ "$(scall "$GOOD" "$PING")" = 200 ] && ok "which is still alive afterwards" || no "session lost" "$(scall "$GOOD" "$PING")"
+# R6 (0.1.12 review): the per-client cap counted the address, so another identity on it pushed the
+# session out with 70 calls to initialize. `last` has one-second resolution, hence the pause.
+sleep 1.5
+for _ in $(seq 1 70); do curl -s -o /dev/null -m 15 -H content-type:application/json -H "authorization: Bearer $OTHER" "http://127.0.0.1:$PORT/mcp" -d "$INIT"; done
+[ "$(scall "$GOOD" "$PING")" = 200 ] && ok "70 sessions opened by another identity on the same address leave this one alive" || no "another identity evicted the session" "$(scall "$GOOD" "$PING")"
 [ "$(scall "$GOOD" "" DELETE)" = 204 ] && ok "the owner can end it" || no "owner cannot end the session" "$(scall "$GOOD" "" DELETE)"
 stop
 rm -rf "$JWTDIR"

@@ -600,7 +600,7 @@ pub(crate) async fn mcp_handler(
             let new_id = Uuid::new_v4().to_string();
             let now = uptime_secs();
             let mut s = state.sessions.write().await;
-            make_room(&mut s, &key, now);
+            make_room(&mut s, &key, owner.as_deref(), now);
             s.insert(
                 new_id.clone(),
                 Session {
@@ -650,9 +650,14 @@ pub(crate) struct Session {
 /// same `clear()` and was fixed in 0.1.8; this copy was left. Now: idle sessions go first, then the
 /// creating client's own oldest above its cap, then the oldest quarter of all, which is the end
 /// farthest from whoever is hammering right now.
+///
+/// The per-client cap counts sessions of one identity from one client key. Counting by client key
+/// alone (R6 of the 0.1.12 review) let bob, on the same address as alice, push her session out
+/// with 70 calls to `initialize`; with the owner in the key he only rotates his own.
 pub(crate) fn make_room(
     s: &mut std::collections::HashMap<String, Session>,
     client: &str,
+    owner: Option<&str>,
     now: u64,
 ) {
     if s.len() >= MAX_SESSIONS {
@@ -660,7 +665,7 @@ pub(crate) fn make_room(
     }
     let mut mine: Vec<(String, u64)> = s
         .iter()
-        .filter(|(_, v)| v.client == client)
+        .filter(|(_, v)| v.client == client && v.owner.as_deref() == owner)
         .map(|(k, v)| (k.clone(), v.last))
         .collect();
     if mine.len() >= MAX_SESSIONS_PER_CLIENT {
@@ -703,7 +708,7 @@ mod tests {
             );
         }
         // all still within the idle window, so only the quarter rule can make room
-        make_room(&mut m, "attacker", 100_000 + 3000);
+        make_room(&mut m, "attacker", None, 100_000 + 3000);
         assert_eq!(m.len(), MAX_SESSIONS - MAX_SESSIONS / 4);
         assert!(!m.contains_key("s0"));
         assert!(m.contains_key(&format!("s{}", MAX_SESSIONS - 1)));
@@ -716,12 +721,48 @@ mod tests {
             m.insert(format!("a{i}"), sess(i as u64, "a"));
         }
         m.insert("victim".into(), sess(0, "b"));
-        make_room(&mut m, "a", 1000);
+        make_room(&mut m, "a", None, 1000);
         assert!(!m.contains_key("a0"), "its own oldest goes");
         assert!(m.contains_key("victim"), "someone else's session stays");
         assert_eq!(
             m.values().filter(|v| v.client == "a").count(),
             MAX_SESSIONS_PER_CLIENT - 1
+        );
+    }
+
+    /// R6 of the 0.1.12 review: two identities behind one address do not share the cap.
+    #[test]
+    fn another_identity_on_the_same_address_cannot_push_a_session_out() {
+        let mut m = HashMap::new();
+        let mut alice = sess(0, "10.0.0.1");
+        alice.owner = Some("alice".into());
+        m.insert("alice".to_string(), alice);
+        for i in 0..(MAX_SESSIONS_PER_CLIENT + 10) {
+            make_room(&mut m, "10.0.0.1", Some("bob"), 10 + i as u64);
+            let mut bob = sess(10 + i as u64, "10.0.0.1");
+            bob.owner = Some("bob".into());
+            m.insert(format!("bob{i}"), bob);
+        }
+        assert!(
+            m.contains_key("alice"),
+            "alice's session must survive bob's initialize calls"
+        );
+        assert_eq!(
+            m.values()
+                .filter(|v| v.owner.as_deref() == Some("bob"))
+                .count(),
+            MAX_SESSIONS_PER_CLIENT
+        );
+        // and alice's own calls still rotate alice's own sessions
+        for i in 0..MAX_SESSIONS_PER_CLIENT {
+            make_room(&mut m, "10.0.0.1", Some("alice"), 1000 + i as u64);
+            let mut a = sess(1000 + i as u64, "10.0.0.1");
+            a.owner = Some("alice".into());
+            m.insert(format!("alice{i}"), a);
+        }
+        assert!(
+            !m.contains_key("alice"),
+            "her own oldest goes when she exceeds her cap"
         );
     }
 }
