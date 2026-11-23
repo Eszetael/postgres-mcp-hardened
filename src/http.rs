@@ -287,7 +287,7 @@ pub(crate) async fn oauth_protected_resource_handler() -> impl axum::response::I
     Json(json!({
         "resource": base.trim_end_matches('/'),
         "authorization_servers": auth_servers,
-        "scopes_supported": ["mcp:query"],
+        "scopes_supported": ["mcp:read", "mcp:query", "mcp:admin"],
         "bearer_methods_supported": ["header"]
     }))
 }
