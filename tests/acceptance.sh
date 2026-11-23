@@ -1482,6 +1482,30 @@ for u in "postgres://u@127.0.0.1:1/db?password=SEKRET" "postgres://u:pa@SEKRET@1
   [ "$n" = 0 ] && ok "connection string shape $i leaves no password in the audit or stderr" || no "password leaked (shape $i)" "$u"
   rm -f "$PL" /tmp/acc_pw_${i}_$$.err
 done
+# R1/R12 (0.1.12 review): the driver takes the credentials up to the FIRST `@`, past `/`, `?` and `#`;
+# `;` is part of a DATABASE_URL password; parameter names are percent-decoded
+i=0
+for u in "postgres://u:SE/KRET@127.0.0.1:1/db" "postgres://u:SE?KRET@127.0.0.1:1/db" "postgres://u:SE#KRET@127.0.0.1:1/db" "postgres://u:SE;KRET@127.0.0.1:1/db" "postgres://127.0.0.1:1/db?password=SE;KRET" "postgres://127.0.0.1:1/db?pass%77ord=SEKRET" "postgres://127.0.0.1:1/db?password%3DSEKRET" "postgres://127.0.0.1:1/db?x=1?password=SEKRET" "host=127.0.0.1 port=1 password=SE;KRET" "host=127.0.0.1 port=1 password='SE\\\\' user=SEKRET"; do
+  i=$((i+1)); PL=/tmp/acc_pw2_${i}_$$.log; rm -f "$PL"
+  env DATABASE_URL="$u" MCP_AUDIT_LOG="$PL" MCP_ADDR=127.0.0.1:$((PORT+60+i)) timeout 3 "$BIN" >/tmp/acc_pw2_${i}_$$.err 2>&1
+  n=$(cat "$PL" /tmp/acc_pw2_${i}_$$.err 2>/dev/null | grep -c KRET)
+  [ "$n" = 0 ] && ok "review shape $i leaves no password in the audit or stderr" || no "password leaked (review shape $i)" "$u"
+  rm -f "$PL" /tmp/acc_pw2_${i}_$$.err
+done
+PL=/tmp/acc_pw3_$$.log; rm -f "$PL"
+env MCP_DATABASE_URLS="a=postgres://u:pa;SEKRET@127.0.0.1:1/db" MCP_AUDIT_LOG="$PL" MCP_ADDR=127.0.0.1:$((PORT+75)) timeout 3 "$BIN" >/tmp/acc_pw3_$$.err 2>&1
+n=$(cat "$PL" /tmp/acc_pw3_$$.err 2>/dev/null | grep -c SEKRET)
+[ "$n" = 0 ] && ok "a ';' inside a password in MCP_DATABASE_URLS is not echoed in the error" || no "MCP_DATABASE_URLS error echoed a password fragment" "$(cat /tmp/acc_pw3_$$.err | head -3)"
+rm -f "$PL" /tmp/acc_pw3_$$.err
+# the base64 password of the review connects, and the startup record still hides it
+docker exec acc_pg psql -U postgres -qc "CREATE ROLE acc_b64 LOGIN PASSWORD 'Zm9v/YmFy+cXV4'; GRANT CONNECT ON DATABASE postgres TO acc_b64;" >/dev/null
+PL=/tmp/acc_pw4_$$.log; rm -f "$PL"
+start DATABASE_URL="postgres://acc_b64:Zm9v/YmFy+cXV4@127.0.0.1:$PGPORT_ACC/postgres" MCP_AUDIT_LOG="$PL"
+r=$(tool query '{"sql":"SELECT current_user"}')
+stop
+n=$(grep -c 'YmFy' "$PL" 2>/dev/null)
+case "$r" in *acc_b64*) [ "$n" = 0 ] && ok "a password with '/' connects and stays out of the audit log" || no "password with '/' in the audit log" "$(grep -o '"DATABASE_URL":"[^"]*"' "$PL")";; *) no "password with '/' did not connect" "$r";; esac
+rm -f "$PL" "$PL.hwm"
 # G6: with the key given, stripping `key_fp` and recomputing the tail is no longer "OK (HMAC-SHA256)"
 FL=/tmp/acc_forge_$$.log; rm -f "$FL" "$FL.hwm"
 start DATABASE_URL="$URL" MCP_AUDIT_LOG="$FL" MCP_AUDIT_HMAC_KEY=forge_key

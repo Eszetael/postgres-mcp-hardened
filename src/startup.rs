@@ -318,7 +318,7 @@ fn config_snapshot() -> serde_json::Map<String, Value> {
             // The test for a connection string was "does it contain ://", which is one of the two
             // spellings libpq accepts and this server supports. The other, `host=… password=… `,
             // went into the audit log verbatim.
-            strip_password(&raw)
+            strip_password(&raw, *name == "MCP_DATABASE_URLS")
         } else if raw.len() > 120 {
             format!("<{} bytes>", raw.len())
         } else {
@@ -335,23 +335,104 @@ fn config_snapshot() -> serde_json::Map<String, Value> {
 /// edge cases than a substring test can hold: a URL password may contain an unencoded `@` and can
 /// also arrive as `?password=` or `?sslpassword=` in any letter case; the keyword form allows spaces
 /// around `=` and quoted values with spaces. Each of those went into the audit log in clear text.
-/// `;` separates several connection strings (`MCP_DATABASE_URLS`) unless it sits inside quotes.
-fn strip_password(url: &str) -> String {
+/// `;` separates connection strings only in `MCP_DATABASE_URLS` (`multi`); in `DATABASE_URL` it is
+/// an ordinary character of a password and splitting there left the rest of the password behind.
+/// Where the masker and the driver could disagree, the masker hides more, never less.
+pub(crate) fn strip_password(url: &str, multi: bool) -> String {
+    // The driver reads the URL form only after these two prefixes; anything else is the keyword
+    // form, even with a `://` inside a password.
+    let one = |part: &str| {
+        let t = part.trim_start();
+        if t.starts_with("postgres://") || t.starts_with("postgresql://") {
+            strip_url_password(part)
+        } else {
+            strip_keyword_password(part)
+        }
+    };
+    if !multi {
+        return one(url);
+    }
     split_unquoted(url, ';')
         .iter()
-        .map(|part| {
-            if part.contains("://") {
-                strip_url_password(part)
-            } else {
-                strip_keyword_password(part)
-            }
+        .map(|part| match part.split_once('=') {
+            // `name=url`, the way the pool reads it (db.rs)
+            Some((name, rest)) if !name.contains("://") => format!("{name}={}", one(rest)),
+            _ => one(part),
         })
         .collect::<Vec<_>>()
         .join(";")
 }
 
+/// Parameter names libpq and the driver know. A pair with any other name is hidden with its value:
+/// it is not something either would connect with, and the most likely source of a name nobody
+/// knows is a password that contained `&` or a space and spilled into the next pair.
+const CONN_KEYS: &[&str] = &[
+    "host",
+    "hostaddr",
+    "port",
+    "user",
+    "dbname",
+    "options",
+    "application_name",
+    "fallback_application_name",
+    "client_encoding",
+    "connect_timeout",
+    "tcp_user_timeout",
+    "keepalives",
+    "keepalives_idle",
+    "keepalives_interval",
+    "keepalives_retries",
+    "sslmode",
+    "sslnegotiation",
+    "sslcert",
+    "sslkey",
+    "sslrootcert",
+    "sslcrl",
+    "sslcrldir",
+    "sslsni",
+    "sslcompression",
+    "requiressl",
+    "ssl_min_protocol_version",
+    "ssl_max_protocol_version",
+    "gssencmode",
+    "krbsrvname",
+    "gsslib",
+    "gssdelegation",
+    "require_auth",
+    "channel_binding",
+    "target_session_attrs",
+    "load_balance_hosts",
+    "service",
+    "passfile",
+    "replication",
+];
+
+fn is_conn_key(k: &str) -> bool {
+    CONN_KEYS.contains(&k)
+}
+
 fn is_secret_key(k: &str) -> bool {
-    k.eq_ignore_ascii_case("password") || k.eq_ignore_ascii_case("sslpassword")
+    k.to_ascii_lowercase().contains("password")
+}
+
+/// The driver percent-decodes parameter names (`?pass%77ord=` is `password`), so the comparison
+/// has to look at the decoded text. Invalid UTF-8 decodes lossily, which only widens the match.
+fn percent_decoded(s: &str) -> String {
+    let b = s.as_bytes();
+    let hex = |c: u8| (c as char).to_digit(16).map(|d| d as u8);
+    let (mut out, mut i) = (Vec::with_capacity(b.len()), 0);
+    while i < b.len() {
+        if b[i] == b'%' && i + 2 < b.len() {
+            if let (Some(h), Some(l)) = (hex(b[i + 1]), hex(b[i + 2])) {
+                out.push(h << 4 | l);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// Splits on `sep` outside single quotes (libpq quoting, `\'` escapes a quote).
@@ -373,51 +454,127 @@ fn split_unquoted(s: &str, sep: char) -> Vec<&str> {
     out
 }
 
-/// `scheme://user:pw@host/db?password=x#f`: credentials are everything up to the LAST `@` of the
-/// authority (a `/`, `?` or `#` ends it), and the query is scanned for secret parameters.
+/// `scheme://user:pw@host/db?password=x`. The driver (tokio-postgres, like libpq) takes the
+/// credentials up to the FIRST `@` anywhere in the rest of the string, without stopping at `/`,
+/// `?` or `#`, so a password such as `Zm9v/YmFy` connects fine. Cutting the authority at `/`
+/// left that password in the log. The string is therefore read twice, splitting the credentials at
+/// the first `@` (what the driver does) and at the last one (an `@` inside the password), and
+/// whatever either reading calls secret is hidden. Hiding more than the driver uses is the safe
+/// direction; hiding less is the bug this replaces.
 fn strip_url_password(part: &str) -> String {
     let Some(s) = part.find("://") else {
         return part.to_string();
     };
     let head = &part[..s + 3];
     let rest = &part[s + 3..];
-    let auth_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
-    let (auth, tail) = rest.split_at(auth_end);
+    let mut hidden: Vec<(usize, usize)> = Vec::new();
+    let ats = [None, rest.find('@'), rest.rfind('@')];
+    for at in ats {
+        // The reading without credentials only matters for the query when there is an `@`.
+        let query_only = at.is_none() && ats[1].is_some();
+        hide_in_url(rest, at, query_only, &mut hidden);
+    }
+    hidden.sort_unstable();
+    let mut merged: Vec<(usize, usize)> = Vec::new();
+    for (from, to) in hidden {
+        match merged.last_mut() {
+            Some(last) if from <= last.1 => last.1 = last.1.max(to),
+            _ => merged.push((from, to)),
+        }
+    }
     let mut out = String::from(head);
-    match auth.rfind('@') {
-        Some(at) => {
-            let user = auth[..at].split(':').next().unwrap_or("");
-            out.push_str(user);
-            out.push_str(":***");
-            out.push_str(&auth[at..]);
-        }
-        None => out.push_str(auth),
+    let mut pos = 0;
+    for (from, to) in merged {
+        out.push_str(&rest[pos..from]);
+        out.push_str("***");
+        pos = to;
     }
-    match tail.find('?') {
-        Some(q) => {
-            out.push_str(&tail[..=q]);
-            let query = &tail[q + 1..];
-            let (query, frag) = match query.find('#') {
-                Some(h) => query.split_at(h),
-                None => (query, ""),
-            };
-            let masked: Vec<String> = query
-                .split('&')
-                .map(|kv| match kv.split_once('=') {
-                    Some((k, _)) if is_secret_key(k) => format!("{k}=***"),
-                    _ => kv.to_string(),
-                })
-                .collect();
-            out.push_str(&masked.join("&"));
-            out.push_str(frag);
-        }
-        None => out.push_str(tail),
-    }
+    out.push_str(&rest[pos..]);
     out
 }
 
+/// Marks the secret byte ranges of `rest` (the URL after `scheme://`) under one reading of where
+/// the credentials end.
+fn hide_in_url(rest: &str, at: Option<usize>, query_only: bool, hidden: &mut Vec<(usize, usize)>) {
+    let syntax = ['/', '?', '#', '&', '=', '@'];
+    let tail_start = match at {
+        Some(at) => {
+            let creds = &rest[..at];
+            match creds.find(':') {
+                // A "user" that holds URL syntax is the driver's sloppy reading of something
+                // else (`h/db?password=x&a=b@c`): it is not a name an operator needs.
+                Some(c)
+                    if !creds[..c].contains(syntax)
+                        && !is_secret_key(&percent_decoded(&creds[..c])) =>
+                {
+                    hidden.push((c + 1, at))
+                }
+                None if !creds.contains(syntax) && !is_secret_key(&percent_decoded(creds)) => {}
+                _ => hidden.push((0, at)),
+            }
+            at + 1
+        }
+        None => 0,
+    };
+    let tail = &rest[tail_start..];
+    let (hostpath, query) = match tail.find('?') {
+        Some(q) => (&tail[..q], Some((tail_start + q + 1, &tail[q + 1..]))),
+        None => (tail, None),
+    };
+    let authority_end = hostpath.find('/').unwrap_or(hostpath.len());
+    // Without an `@` a `user:password` pair reads as `host:port`; a port that is not a number is
+    // not a port, so it is hidden rather than guessed at.
+    let mut off = tail_start;
+    for chunk in hostpath[..authority_end].split(',') {
+        if query_only {
+            break;
+        }
+        let port = if chunk.starts_with('[') {
+            chunk.find("]:").map(|i| i + 2)
+        } else {
+            chunk.find(':').map(|i| i + 1)
+        };
+        if let Some(i) = port {
+            if !chunk[i..].bytes().all(|c| c.is_ascii_digit()) {
+                hidden.push((off + i, off + chunk.len()));
+            }
+        }
+        off += chunk.len() + 1;
+    }
+    if !query_only && is_secret_key(&percent_decoded(&hostpath[authority_end..])) {
+        hidden.push((tail_start + authority_end, tail_start + hostpath.len()));
+    }
+    let Some((mut off, query)) = query else {
+        return;
+    };
+    for kv in query.split('&') {
+        let decoded = percent_decoded(kv);
+        let key = kv.split_once('=').map(|(k, _)| k);
+        let plain_key = key.is_some_and(|k| {
+            let k = percent_decoded(k);
+            is_conn_key(&k)
+                || k.eq_ignore_ascii_case("password")
+                || k.eq_ignore_ascii_case("sslpassword")
+        });
+        match key {
+            // a known name keeps its name; a secret one loses its value
+            Some(k) if plain_key && is_secret_key(&decoded) => {
+                hidden.push((off + k.len() + 1, off + kv.len()))
+            }
+            Some(_) if plain_key => {}
+            // anything else, including a name that carries more than a name (`password%3Dx`), goes
+            _ if kv.is_empty() => {}
+            _ => hidden.push((off, off + kv.len())),
+        }
+        off += kv.len() + 1;
+    }
+}
+
 /// `key = value key2='quoted value'`: libpq's tokenizer, so `password = x` and `password='a b'`
-/// are both caught. Keeps every other pair as written.
+/// are both caught. Keeps every other pair as written. A word that is not a `key=value` pair is
+/// hidden (libpq rejects it, and it is most often the second half of an unquoted password with a
+/// space). A password value with a backslash or an unterminated quote hides everything after it:
+/// that is where two tokenizers can disagree about where the value ends.
 fn strip_keyword_password(part: &str) -> String {
     let b: Vec<char> = part.chars().collect();
     let (mut i, mut pairs) = (0, Vec::new());
@@ -438,43 +595,54 @@ fn strip_keyword_password(part: &str) -> String {
             j += 1;
         }
         if j >= b.len() || b[j] != '=' {
-            // not a key=value pair: keep the word and move on
-            pairs.push((key.clone(), part_of(&b, start, i)));
+            // not a key=value pair: libpq refuses it, and it may be a piece of a password
+            pairs.push(("***".to_string(), "***".to_string()));
             continue;
         }
         j += 1;
         while j < b.len() && b[j].is_whitespace() {
             j += 1;
         }
+        let value_start = j;
+        let mut unsure = false;
         if j < b.len() && b[j] == '\'' {
             j += 1;
             while j < b.len() && b[j] != '\'' {
                 if b[j] == '\\' {
+                    unsure = true;
                     j += 1;
                 }
                 j += 1;
             }
+            unsure |= j >= b.len();
             j += 1;
         } else {
             while j < b.len() && !b[j].is_whitespace() {
                 if b[j] == '\\' {
+                    unsure = true;
                     j += 1;
                 }
                 j += 1;
             }
         }
         i = j.min(b.len());
-        pairs.push((key, part_of(&b, start, i)));
+        if is_secret_key(&key) {
+            pairs.push((key.clone(), format!("{key}=***")));
+            if unsure || part_of(&b, value_start, i).contains('\'') {
+                if i < b.len() {
+                    pairs.push(("***".to_string(), "***".to_string()));
+                }
+                break;
+            }
+        } else if is_conn_key(&key) {
+            pairs.push((key, part_of(&b, start, i)));
+        } else {
+            pairs.push(("***".to_string(), "***".to_string()));
+        }
     }
     pairs
         .into_iter()
-        .map(|(k, text)| {
-            if is_secret_key(&k) {
-                format!("{k}=***")
-            } else {
-                text
-            }
-        })
+        .map(|(_, text)| text)
         .collect::<Vec<_>>()
         .join(" ")
 }
@@ -811,23 +979,149 @@ mod tests {
             "host=h password='a;SEKRET' user=u",
             "postgres://u:SEKRET@h/d?sslmode=require&password=SEKRET#x",
         ] {
-            let out = strip_password(url);
+            let out = strip_password(url, url.starts_with("a="));
             assert!(!out.contains("SEKRET"), "{url} -> {out}");
         }
+    }
+
+    /// The 37 spellings of the 0.1.12 review (`/tmp/rev0112/pw/cases.txt`): slash, `?`, `#` and `;`
+    /// inside a URL password, `;` in a keyword password, percent-encoded parameter names, and the
+    /// shapes the driver reads differently from a URL parser.
+    const REVIEW_CASES: &[&str] = &[
+        "postgres://u:SEKRET@127.0.0.1:1/db",
+        "postgres://u:SE@KRET@127.0.0.1:1/db",
+        "postgres://u:SE%40KRET@127.0.0.1:1/db",
+        "postgres://u:SE:KRET@127.0.0.1:1/db",
+        "postgres://u:SE;KRET@127.0.0.1:1/db",
+        "postgres://u:SE/KRET@127.0.0.1:1/db",
+        "postgres://u:SE?KRET@127.0.0.1:1/db",
+        "postgres://u:SE#KRET@127.0.0.1:1/db",
+        "postgres://u:SE'KRET@127.0.0.1:1/db",
+        "postgres://127.0.0.1:1/db?password=SEKRET",
+        "postgres://127.0.0.1:1/db?PASSWORD=SEKRET",
+        "postgres://127.0.0.1:1/db?sslpassword=SEKRET",
+        "postgres://127.0.0.1:1/db?user=u&password=SEKRET&x=1",
+        "postgres://127.0.0.1:1/db?password=SE;KRET",
+        "postgres://127.0.0.1:1/db?pass%77ord=SEKRET",
+        "postgres://127.0.0.1:1/db?password%3DSEKRET",
+        "postgres://127.0.0.1:1/db?x=1?password=SEKRET",
+        "postgres://127.0.0.1:1/db#x?password=SEKRET",
+        "postgres://u:SEKRET@[::1]:1/db",
+        "postgres://[::1]:1/db?password=SEKRET",
+        "postgresql://u:SEKRET@127.0.0.1:1",
+        "postgres://u:SEKRET@127.0.0.1:1?password=SEKRET2",
+        "host=127.0.0.1 port=1 password=SEKRET",
+        "host=127.0.0.1 port=1 password = SEKRET",
+        "host=127.0.0.1 port=1 password='SE KRET'",
+        r"host=127.0.0.1 port=1 password='SE\'KRET'",
+        r"host=127.0.0.1 port=1 password='SE\\' user=SEKRET",
+        r"host=127.0.0.1 port=1 password=SE\ KRET",
+        "host=127.0.0.1\tport=1\tpassword=SEKRET",
+        "host=127.0.0.1 port=1 password=SE;KRET",
+        "host=127.0.0.1 port=1 password='SE;KRET'",
+        "host=127.0.0.1 port=1 password=SE'KRET",
+        "host=127.0.0.1 port=1 password='SEKRET",
+        "host=127.0.0.1 port=1 password=",
+        "host=127.0.0.1 port=1 sslpassword=SEKRET",
+        "host=127.0.0.1 port=1 PassWord=SEKRET",
+        "password=SEKRET host=127.0.0.1",
+    ];
+
+    #[test]
+    fn every_spelling_from_the_review_is_masked() {
+        for url in REVIEW_CASES {
+            let out = strip_password(url, false);
+            assert!(!out.contains("KRET"), "{url} -> {out}");
+        }
+        // `;` splits only the multi-connection variable, and each half is masked there too.
+        let multi = strip_password(
+            "prod=postgres://u:SEKRET@h/d;dev=host=h password=SE;KRET",
+            true,
+        );
+        assert!(!multi.contains("KRET"), "{multi}");
+        assert_eq!(
+            strip_password("prod=postgres://u:p@h1/d;dev=postgres://v:q@h2/e", true),
+            "prod=postgres://u:***@h1/d;dev=postgres://v:***@h2/e"
+        );
+        // An ordinary URL keeps everything but the password.
+        assert_eq!(
+            strip_password(
+                "postgres://app:Zm9v/YmFy+cXV4@db:5432/shop?sslmode=require",
+                false
+            ),
+            "postgres://app:***@db:5432/shop?sslmode=require"
+        );
+    }
+
+    /// Whatever the driver itself accepts must lose the password the driver would use. Passwords
+    /// are built from the characters that broke the earlier maskers, around a marker that must
+    /// never survive.
+    #[test]
+    fn what_the_driver_accepts_loses_the_password_the_driver_reads() {
+        let alphabet: Vec<char> = "/?#@:;&='\\ %+,[]aZ09".chars().collect();
+        let mut seed: u64 = 0x2026_1124;
+        let mut next = |n: usize| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % n as u64) as usize
+        };
+        let shapes: &[fn(&str) -> String] = &[
+            |p| format!("postgres://u:{p}@127.0.0.1:1/db"),
+            |p| format!("postgresql://u:{p}@[::1]:1/db?sslmode=disable"),
+            |p| format!("postgres://u@127.0.0.1:1/db?password={p}"),
+            |p| format!("postgres://127.0.0.1:1/db?x=1&PassWord={p}&y=2"),
+            |p| format!("host=127.0.0.1 port=1 password={p}"),
+            |p| format!("host=127.0.0.1 password='{p}' user=u"),
+            |p| format!("password = {p} host=h"),
+        ];
+        let mut accepted = 0;
+        for _ in 0..20_000 {
+            let mut pw = String::new();
+            for _ in 0..next(5) {
+                pw.push(alphabet[next(alphabet.len())]);
+            }
+            pw.push_str("KRET");
+            for _ in 0..next(5) {
+                pw.push(alphabet[next(alphabet.len())]);
+            }
+            let s = shapes[next(shapes.len())](&pw);
+            let out = strip_password(&s, false);
+            if let Ok(cfg) = s.parse::<postgres::Config>() {
+                if let Some(real) = cfg.get_password() {
+                    let real = String::from_utf8_lossy(real);
+                    if real.len() >= 4 {
+                        accepted += 1;
+                        assert!(
+                            !out.contains(real.as_ref()),
+                            "{s} -> {out} (password {real})"
+                        );
+                    }
+                }
+            }
+            assert!(!out.contains("KRET"), "{s} -> {out}");
+        }
+        assert!(
+            accepted > 1000,
+            "only {accepted} strings were accepted by the driver"
+        );
     }
 
     #[test]
     fn stripping_a_password_keeps_the_parts_an_operator_needs() {
         assert_eq!(
-            strip_password("postgres://app:SEKRET@db.example.com:5432/shop?sslmode=require"),
+            strip_password(
+                "postgres://app:SEKRET@db.example.com:5432/shop?sslmode=require",
+                false
+            ),
             "postgres://app:***@db.example.com:5432/shop?sslmode=require"
         );
         assert_eq!(
-            strip_password("postgres://u:pa@SEKRET@h/d"),
+            strip_password("postgres://u:pa@SEKRET@h/d", false),
             "postgres://u:***@h/d"
         );
         assert_eq!(
-            strip_password("host=h port=5432 user=u password = SEKRET dbname=d"),
+            strip_password("host=h port=5432 user=u password = SEKRET dbname=d", false),
             "host=h port=5432 user=u password=*** dbname=d"
         );
     }
