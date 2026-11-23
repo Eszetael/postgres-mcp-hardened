@@ -1553,6 +1553,16 @@ grep -q 'chain_anomaly' "$DL" && ok "a removed log is recorded in the new chain'
 out=$(env MCP_AUDIT_HMAC_KEY=g9_key "$BIN" --verify-audit "$DL" 2>&1)
 case "$out" in TAMPERED*"not 1"*) ok "and a log that does not start at entry 1 is refused";; *) no "log with its head missing verified" "$out";; esac
 rm -f "$DL" "$DL.hwm"
+# R5 (0.1.12 review): with a key, cutting the tail AND deleting the mark is still noticed
+HL=/tmp/acc_r5_$$.log; rm -f "$HL" "$HL.hwm"
+start DATABASE_URL="$URL" MCP_AUDIT_LOG="$HL" MCP_AUDIT_HMAC_KEY=r5_key
+tool query '{"sql":"SELECT 1"}' >/dev/null; tool query '{"sql":"SELECT 2"}' >/dev/null
+stop
+head -n -1 "$HL" > "$HL.short" && mv "$HL.short" "$HL"; rm -f "$HL.hwm"
+start DATABASE_URL="$URL" MCP_AUDIT_LOG="$HL" MCP_AUDIT_HMAC_KEY=r5_key
+stop
+grep '"decision":"startup"' "$HL" | tail -1 | grep -q 'mark is missing although the log is keyed' && ok "a keyed log whose mark was deleted is reported in the startup record" || no "deleting the mark hid a truncation" "$(grep '"decision":"startup"' "$HL" | tail -1 | head -c 300)"
+rm -f "$HL" "$HL.hwm"
 # G14: strict redaction + a database that cannot be asked = nothing served, and no "verified"
 r=$(env DATABASE_URL="postgres://x:y@127.0.0.1:1/x" MCP_REDACT_COLUMNS=email MCP_REDACT_REQUIRE_REVOKE=1 MCP_RATE_RPM=0 MCP_ADDR=127.0.0.1:$((PORT+41)) timeout 8 "$BIN" 2>&1 >/dev/null | grep -c 'verified against the database')
 [ "$r" = 0 ] && ok "an unreachable database is never reported as 'verified'" || no "claimed verification without reaching the database" "$r"

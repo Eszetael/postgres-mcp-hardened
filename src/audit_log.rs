@@ -31,9 +31,10 @@ fn hwm_path_of(log: &str) -> String {
     format!("{}.hwm", log)
 }
 
-/// Last entry recorded in the log itself: `(seq, hash)`.
+/// Last entry recorded in the log itself: `(seq, hash, signed)`, where `signed` says the entry
+/// carries `key_fp`, i.e. it was written with an HMAC key.
 /// `None` = the file does not exist. `Some(None)` = it exists but its last line is unusable.
-fn last_entry_of(path: &str) -> Option<Option<(u64, String)>> {
+fn last_entry_of(path: &str) -> Option<Option<(u64, String, bool)>> {
     let path = path.to_string();
     if !std::path::Path::new(&path).exists() {
         return None; // genuinely a first run — silence is correct here
@@ -58,8 +59,9 @@ fn last_entry_of(path: &str) -> Option<Option<(u64, String)>> {
         Ok(v) => {
             let seq = v.get("seq").and_then(|s| s.as_u64());
             let hash = v.get("hash").and_then(|h| h.as_str()).map(String::from);
+            let signed = v.get("key_fp").is_some();
             match (seq, hash) {
-                (Some(s), Some(h)) => Some(Some((s, h))),
+                (Some(s), Some(h)) => Some(Some((s, h, signed))),
                 _ => {
                     eprintln!(
                         "AUDIT: last line of {} has no seq/hash — chain state unknown.",
@@ -107,11 +109,20 @@ pub(crate) fn resume_state() -> Resume {
 ///
 /// Ten wariant nie dotyka niczego globalnego, więc test może liczyć wpisy, które sam zapisał.
 pub(crate) fn resume_state_of(log: &str) -> Resume {
-    let in_log = if log.is_empty() {
+    let keys: Vec<(Vec<u8>, String)> = audit_key().into_iter().collect();
+    resume_state_with(log, &keys)
+}
+
+/// [`resume_state_of`] with the key set passed in, so a test can exercise a keyed log without the
+/// process-wide key.
+pub(crate) fn resume_state_with(log: &str, keys: &[(Vec<u8>, String)]) -> Resume {
+    let last = if log.is_empty() {
         None
     } else {
         last_entry_of(log)
     };
+    let signed_log = matches!(last, Some(Some((_, _, true))));
+    let in_log = last.map(|o| o.map(|(s, h, _)| (s, h)));
     let hwm = (if log.is_empty() {
         None
     } else {
@@ -130,9 +141,9 @@ pub(crate) fn resume_state_of(log: &str) -> Resume {
     // A mark that cannot be authenticated is no evidence either way: with a key set, one without a
     // valid MAC was written by someone who did not have it. Say so, and do not trust its numbers.
     let mut mark_anomaly: Option<String> = None;
-    let hwm = match (hwm, audit_key()) {
+    let hwm = match (hwm, keys.first()) {
         (Some((s, h, mac)), Some((k, _))) => {
-            if mac.as_deref() == Some(hwm_mac(&k, s, &h).as_str()) {
+            if mac.as_deref() == Some(hwm_mac(k, s, &h).as_str()) {
                 Some((s, h))
             } else {
                 mark_anomaly = Some(
@@ -142,6 +153,17 @@ pub(crate) fn resume_state_of(log: &str) -> Resume {
                 );
                 None
             }
+        }
+        // R5 of the 0.1.12 review: deleting the mark of a keyed log made a truncated log look like
+        // an upgrade from a build without marks. A keyed log always has a mark beside it, so its
+        // absence is itself the finding.
+        (None, Some(_)) if signed_log => {
+            mark_anomaly = Some(
+                "the high-water mark is missing although the log is keyed (its last entry carries \
+                 key_fp): entries may have been cut from the end and the mark deleted to hide it"
+                    .into(),
+            );
+            None
         }
         (Some((s, h, _)), None) => Some((s, h)),
         (None, _) => None,
@@ -929,6 +951,50 @@ mod tests {
             "{err}"
         );
         std::fs::remove_file(p).ok();
+    }
+
+    /// R5 of the 0.1.12 review: with a key, cutting the tail and deleting the mark passed as an
+    /// upgrade from a build without marks.
+    #[test]
+    fn a_keyed_log_without_its_mark_is_an_anomaly() {
+        let dir = std::env::temp_dir().join(format!("hwm-r5-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("audit.jsonl");
+        let path = log.to_str().unwrap().to_string();
+        let key = b"r5-key".to_vec();
+        let keys = vec![(key.clone(), key_fingerprint(&key))];
+        let c = keyed_chain(
+            &key,
+            &[entry(1, "query"), entry(2, "query"), entry(3, "query")],
+            &|_| true,
+        );
+        let lines: Vec<&str> = c.lines().collect();
+        let last: Value = serde_json::from_str(lines[2]).unwrap();
+        let (s3, h3) = (
+            last["seq"].as_u64().unwrap(),
+            last["hash"].as_str().unwrap().to_string(),
+        );
+        std::fs::write(&log, &c).unwrap();
+        std::fs::write(
+            hwm_path_of(&path),
+            json!({"seq": s3, "hash": h3, "mac": hwm_mac(&key, s3, &h3)}).to_string(),
+        )
+        .unwrap();
+        assert!(
+            resume_state_with(&path, &keys).anomaly.is_none(),
+            "intact keyed log"
+        );
+        // cut the tail, delete the mark
+        std::fs::write(&log, format!("{}\n{}\n", lines[0], lines[1])).unwrap();
+        std::fs::remove_file(hwm_path_of(&path)).unwrap();
+        let a = resume_state_with(&path, &keys)
+            .anomaly
+            .expect("must be reported");
+        assert!(a.contains("missing although the log is keyed"), "{a}");
+        // an unkeyed log without a mark is still an upgrade, not an alarm
+        std::fs::write(&log, chain(&[entry(1, "query")])).unwrap();
+        assert!(resume_state_with(&path, &[]).anomaly.is_none());
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// The truncation detector must FIRE, not merely exist. The previous mechanism had a docstring
