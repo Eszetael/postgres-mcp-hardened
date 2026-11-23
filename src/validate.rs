@@ -458,9 +458,16 @@ impl SecurityScanner {
                     return ControlFlow::Break(());
                 }
                 let lowered = table.to_lowercase();
-                if matches!(classify_function(&lowered), FnVerdict::SideEffect) {
-                    self.hit = Some(format!("side-effect function: {}", lowered));
-                    return ControlFlow::Break(());
+                match classify_function(&lowered) {
+                    FnVerdict::SideEffect => {
+                        self.hit = Some(format!("side-effect function: {}", lowered));
+                        return ControlFlow::Break(());
+                    }
+                    FnVerdict::ServerConfig => {
+                        self.hit = Some(server_config_refusal(&lowered));
+                        return ControlFlow::Break(());
+                    }
+                    _ => {}
                 }
                 ControlFlow::Continue(())
             }
@@ -871,9 +878,16 @@ impl Visitor for SecurityScanner {
             return ControlFlow::Break(());
         }
         if let Some(n) = last_part_name(name) {
-            if matches!(classify_function(&n), FnVerdict::SideEffect) {
-                self.hit = Some(format!("side-effect function: {}", n));
-                return ControlFlow::Break(());
+            match classify_function(&n) {
+                FnVerdict::SideEffect => {
+                    self.hit = Some(format!("side-effect function: {}", n));
+                    return ControlFlow::Break(());
+                }
+                FnVerdict::ServerConfig => {
+                    self.hit = Some(server_config_refusal(&n));
+                    return ControlFlow::Break(());
+                }
+                _ => {}
             }
         }
         ControlFlow::Continue(())
@@ -1060,6 +1074,8 @@ pub enum FnVerdict {
     RawStorage,
     /// Runs SQL it was handed as text, so nothing in the statement shows what it will read.
     SqlAsText,
+    /// Server configuration or statement history, refused like the `SHOW` it duplicates.
+    ServerConfig,
 }
 
 /// Relations that ARE the storage, rather than a view of it.
@@ -1441,6 +1457,9 @@ pub fn classify_function(name: &str) -> FnVerdict {
     if SQL_AS_TEXT_FUNCS.contains(&name) {
         return FnVerdict::SqlAsText;
     }
+    if SERVER_CONFIG_NAMES.contains(&name) {
+        return FnVerdict::ServerConfig;
+    }
     if SIDE_EFFECT_FUNCS.contains(&name)
         || EXTENSION_WRITE_FUNCS.contains(&name)
         || DENY_FAMILIES.iter().any(|p| name.starts_with(p))
@@ -1454,12 +1473,20 @@ pub fn classify_function(name: &str) -> FnVerdict {
     FnVerdict::Allowed
 }
 
+fn server_config_refusal(name: &str) -> String {
+    format!(
+        "{name} reads server configuration or the server's statement history, which SHOW and \
+         pg_file_settings refuse too"
+    )
+}
+
 /// Rejection message — distinguishes "this writes" from "we do not know this catalog function", so the
 /// operator can tell a real control from a gap in our knowledge (and how to close it).
 fn function_rejection(name: &str) -> Option<String> {
     match classify_function(name) {
         FnVerdict::Allowed => None,
         FnVerdict::SideEffect => Some(format!("side-effect function: {}", name)),
+        FnVerdict::ServerConfig => Some(server_config_refusal(name)),
         FnVerdict::RawStorage => Some(format!(
             "raw-storage function: {} — it returns pages or tuples as bytes, which column controls \
              (redaction, projection) cannot inspect",
@@ -1848,24 +1875,6 @@ const DENY_FAMILIES: &[&str] = &[
     "pg_rotate_", // konfiguracja/logi serwera
     "pg_ls_",
     "pg_file_",
-    // Server configuration in its other spellings. `pg_file_settings` was refused while
-    // `pg_show_all_file_settings()` (the function behind it) and the views `pg_hba_file_rules` and
-    // `pg_ident_file_mappings` went through: one fact, three doors, one closed.
-    "pg_show_all_file_settings",
-    "pg_hba_file_",
-    "pg_ident_file_",
-    // The view and the function of the extension are the same data: the text of every statement the
-    // server ran, literals included, so a redacted value typed into somebody's WHERE clause comes
-    // back out. `top_queries` reads it through the server's own connection instead.
-    "pg_stat_statements",
-    // `pg_replication_slots` was refused through the `pg_replication_` family while the function
-    // behind it, `pg_get_replication_slots()`, was not; `pg_config` lists the build's install paths
-    // and was open as a view while the function was refused. Found by walking every catalogue view
-    // against the function it is built on (0.1.12), so the pairs agree.
-    "pg_get_replication_slots",
-    "pg_config",
-    // closes connections held by this session's foreign servers: a side effect
-    "postgres_fdw_disconnect",
     "pg_write_",
     "pg_logdir_", // server filesystem
     "gin_clean_",
@@ -1893,7 +1902,32 @@ const SAFE_DESPITE_FAMILY: &[&str] = &["lo_get", "lo_get_fragment"];
 
 /// Known built-in PostgreSQL functions with side effects (they write, mutate the session, cause DoS
 /// or do I/O) even though they may appear syntactically inside a SELECT. Explicit, fail-closed list.
+/// Server configuration and statement history, by full name. Exact names rather than families
+/// (R14 of the 0.1.12 review): the prefixes `pg_config` and `pg_stat_statements` also refused a
+/// user's own `public.pg_configs`, and told them it was a "side-effect function".
+///
+/// `pg_file_settings` was refused (the `pg_file_` family) while `pg_show_all_file_settings()`, the
+/// function behind it, and the views `pg_hba_file_rules` and `pg_ident_file_mappings` went through.
+/// `pg_stat_statements` (view and function) is the text of every statement the server ran,
+/// literals included, so a redacted value typed into somebody's WHERE clause comes back out;
+/// `top_queries` reads it through the server's own connection instead. `pg_replication_slots` was
+/// refused through the `pg_replication_` family while `pg_get_replication_slots()` was not;
+/// `pg_config` lists the build's install paths and was open as a view while the function was
+/// refused. Found by walking every catalogue view against the function it is built on (0.1.12).
+const SERVER_CONFIG_NAMES: &[&str] = &[
+    "pg_show_all_file_settings",
+    "pg_hba_file_rules",
+    "pg_ident_file_mappings",
+    "pg_stat_statements",
+    "pg_stat_statements_info",
+    "pg_get_replication_slots",
+    "pg_config",
+];
+
 const SIDE_EFFECT_FUNCS: &[&str] = &[
+    // closes connections held by this session's foreign servers: a side effect
+    "postgres_fdw_disconnect",
+    "postgres_fdw_disconnect_all",
     // sequences (writes)
     "setval",
     "nextval",
@@ -2512,6 +2546,11 @@ mod adversarial {
 
     // Attack vectors: EVERY one must return Err(ValidationError)
     const MUST_REJECT: &[&str] = &[
+        // R14: the exact names stay refused, in any schema (an extension lives where it was created)
+        r#"SELECT * FROM public.pg_stat_statements"#,
+        r#"SELECT * FROM pg_config"#,
+        r#"SELECT * FROM pg_hba_file_rules()"#,
+        r#"SELECT postgres_fdw_disconnect_all()"#,
         // R11 of the 0.1.12 review: every spelling of the literal
         r#"SELECT current_setting(E'data_directory')"#,
         r#"SELECT current_setting(E'data\x5fdirectory')"#,
@@ -2700,6 +2739,9 @@ mod adversarial {
 
     // Legitimate reads: EVERY one must return Ok(())
     const MUST_ALLOW: &[&str] = &[
+        // R14: a user's table whose name merely starts like a refused catalogue object
+        r#"SELECT * FROM public.pg_configs"#,
+        r#"SELECT * FROM pg_stat_statements_archive"#,
         r#"SELECT current_setting(E'search_path')"#,
         r#"SELECT current_setting($$statement_timeout$$)"#,
         // a user's type named reg-something, and reg* casts without a surface (R8, 0.1.12 review)

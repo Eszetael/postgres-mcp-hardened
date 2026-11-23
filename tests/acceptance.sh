@@ -1483,6 +1483,12 @@ c=$(curl -s -o /dev/null -w '%{http_code}' -m 10 -H content-type:application/jso
 # F2/F4: existence and privilege oracles, and current_setting, answer what SHOW refuses
 r=$(tool query '{"sql":"SELECT current_setting('"'"'data_directory'"'"')"}' | body)
 case "$r" in ERROR:*) ok "current_setting('data_directory') is refused like SHOW";; *) no "current_setting leaked the data directory" "$r";; esac
+# R14 (0.1.12 review): a user's table named like a refused catalogue object is not refused
+docker exec acc_pg psql -U postgres -qc "CREATE TABLE IF NOT EXISTS public.pg_configs(k text); INSERT INTO public.pg_configs VALUES ('a');" >/dev/null 2>&1
+r=$(tool query '{"sql":"SELECT k FROM public.pg_configs"}' | body)
+case "$r" in ERROR:*) no "a user table named pg_configs was refused" "$r";; *) ok "a user table named pg_configs is readable";; esac
+r=$(tool query '{"sql":"SELECT * FROM pg_config"}' | body)
+case "$r" in ERROR:*configuration*) ok "pg_config is refused as server configuration, not as a side-effect function";; *) no "pg_config not refused with the right reason" "$r";; esac
 for q in "SELECT * FROM pg_hba_file_rules" "SELECT * FROM pg_show_all_file_settings()" "SELECT * FROM pg_stat_statements" "SELECT * FROM pg_ident_file_mappings" \
          "SELECT current_setting(E'data_directory')" "SELECT current_setting(\$\$data_directory\$\$)" "SELECT current_setting(U&'data_directory')" "SELECT current_setting('data_directory'::text)" "SELECT current_setting(('data_directory'))" "SELECT current_setting('data_' || 'directory')"; do
   r=$(tool query "{\"sql\":\"$q\"}" | body)
