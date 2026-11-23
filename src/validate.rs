@@ -575,8 +575,26 @@ impl SecurityScanner {
                     | JoinOperator::RightSemi(c)
                     | JoinOperator::Anti(c)
                     | JoinOperator::LeftAnti(c)
-                    | JoinOperator::RightAnti(c) => c,
-                    _ => continue,
+                    | JoinOperator::RightAnti(c)
+                    | JoinOperator::CrossJoin(c)
+                    | JoinOperator::StraightJoin(c) => c,
+                    // Joins PostgreSQL does not have. No `_` arm, and refused rather than skipped: the
+                    // old `_ => continue` meant a join kind added by a parser upgrade was waved
+                    // through the very check that reads join constraints, so the upgrade has to stop
+                    // the build here and an unwritten rule must refuse, not pass.
+                    JoinOperator::CrossApply
+                    | JoinOperator::OuterApply
+                    | JoinOperator::AsOf { .. }
+                    | JoinOperator::ArrayJoin
+                    | JoinOperator::LeftArrayJoin
+                    | JoinOperator::InnerArrayJoin => {
+                        self.evasion = Some(
+                            "a join kind PostgreSQL does not have, refused because no rule here \
+                             was written for it while redaction is configured"
+                                .into(),
+                        );
+                        return ControlFlow::Break(());
+                    }
                 };
                 match constraint {
                     JoinConstraint::Using(cols) => {
@@ -863,7 +881,9 @@ impl Visitor for SecurityScanner {
             | TableFactor::JsonTable { .. }
             | TableFactor::XmlTable { .. } => ControlFlow::Continue(()),
             TableFactor::Pivot { .. } => refuse_unwritten_factor(self, "PIVOT"),
-            TableFactor::Unpivot { .. } => refuse_unwritten_factor(self, "UNPIVOT"),
+            TableFactor::Unpivot { .. } | TableFactor::UnpivotExpr { .. } => {
+                refuse_unwritten_factor(self, "UNPIVOT")
+            }
             TableFactor::MatchRecognize { .. } => refuse_unwritten_factor(self, "MATCH_RECOGNIZE"),
             TableFactor::OpenJsonTable { .. } => refuse_unwritten_factor(self, "OPENJSON"),
             TableFactor::SemanticView { .. } => refuse_unwritten_factor(self, "SEMANTIC_VIEW"),
