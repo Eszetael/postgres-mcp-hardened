@@ -1432,6 +1432,18 @@ case "$out" in
   OK*) ok "a chain spanning a key rotation verifies with both keys" ;;
   *)   no "key rotation orphaned the history" "$out" ;;
 esac
+# R13 (0.1.12 review): neither a new log, nor the rotation itself, is reported as tampering
+grep '"decision":"startup"' "$RL" | head -1 | grep -q chain_anomaly && no "a brand-new log was reported as an anomaly" "$(head -c 300 "$RL")" || ok "a brand-new log starts without a chain anomaly"
+grep '"decision":"startup"' "$RL" | tail -1 | grep -q chain_anomaly && no "a key rotation was reported as tampering" "$(grep '"decision":"startup"' "$RL" | tail -1 | head -c 300)" || ok "a key rotation (old key in MCP_AUDIT_HMAC_KEYS_OLD) is not reported as tampering"
+NL=/tmp/acc_r13_$$.log; rm -f "$NL" "$NL.hwm"
+start DATABASE_URL="$URL" MCP_AUDIT_LOG="$NL"
+tool query '{"sql":"SELECT 1"}' >/dev/null
+stop
+start DATABASE_URL="$URL" MCP_AUDIT_LOG="$NL" MCP_AUDIT_HMAC_KEY=r13_key
+stop
+last=$(grep '"decision":"startup"' "$NL" | tail -1)
+case "$last" in *chain_anomaly*) no "configuring a key on an existing log was reported as tampering" "$(echo "$last" | head -c 300)";; *chain_note*) ok "configuring a key on an existing log is a note, not an anomaly";; *) no "key introduction left no note" "$(echo "$last" | head -c 300)";; esac
+rm -f "$NL" "$NL.hwm"
 # Without the retired key the old entries must NOT silently pass: they are unverifiable, and the
 # message has to say which key is missing rather than "tampered".
 out=$(env MCP_AUDIT_HMAC_KEY=rot_new "$BIN" --verify-audit "$RL" 2>&1)

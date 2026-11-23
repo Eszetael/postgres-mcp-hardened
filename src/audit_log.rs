@@ -53,7 +53,10 @@ fn last_entry_of(path: &str) -> Option<Option<(u64, String, bool)>> {
     };
     let last = content.lines().rev().find(|l| !l.trim().is_empty());
     let Some(last) = last else {
-        return Some(None); // present but empty
+        // Present but empty: the start-up check creates the file before the chain is read, so on
+        // a first run this is what a new log looks like. A log emptied after entries were written
+        // still has its mark beside it, and the comparison with the mark reports that.
+        return None;
     };
     match serde_json::from_str::<Value>(last) {
         Ok(v) => {
@@ -90,6 +93,8 @@ pub(crate) struct Resume {
     pub seq: u64,
     pub hash: String,
     pub anomaly: Option<String>,
+    /// Worth saying, not a sign of tampering (a key configured for the first time).
+    pub note: Option<String>,
 }
 
 pub(crate) fn resume_state() -> Resume {
@@ -109,8 +114,46 @@ pub(crate) fn resume_state() -> Resume {
 ///
 /// Ten wariant nie dotyka niczego globalnego, więc test może liczyć wpisy, które sam zapisał.
 pub(crate) fn resume_state_of(log: &str) -> Resume {
-    let keys: Vec<(Vec<u8>, String)> = audit_key().into_iter().collect();
-    resume_state_with(log, &keys)
+    resume_state_with(log, &key_set())
+}
+
+/// The current key first, then the retired ones from `MCP_AUDIT_HMAC_KEYS_OLD`: what the verifier
+/// accepts, and what a mark written before a rotation was signed with.
+pub(crate) fn key_set() -> Vec<(Vec<u8>, String)> {
+    let mut keys: Vec<(Vec<u8>, String)> = Vec::new();
+    if let Some(k) = audit_key() {
+        keys.push(k);
+    }
+    if let Ok(olds) = std::env::var("MCP_AUDIT_HMAC_KEYS_OLD") {
+        for k in olds.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
+            let b = k.as_bytes().to_vec();
+            let fp = key_fingerprint(&b);
+            keys.push((b, fp));
+        }
+    }
+    keys
+}
+
+/// Whether this log was written with a key by a build that signs its mark (0.1.12 and later): a
+/// startup record carrying both `key_fp` and such a version. A mark without a MAC beside such a log
+/// was not written by us; beside an older or unkeyed log it is what an upgrade looks like.
+fn written_with_signed_marks(log: &str) -> bool {
+    let Ok(content) = std::fs::read_to_string(log) else {
+        return false;
+    };
+    content
+        .lines()
+        .filter(|l| l.contains("\"decision\":\"startup\"") && l.contains("\"key_fp\""))
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .filter_map(|v| {
+            v.get("version")
+                .and_then(|x| x.as_str())
+                .map(str::to_string)
+        })
+        .any(|ver| {
+            let n: Vec<u64> = ver.split('.').filter_map(|p| p.parse().ok()).collect();
+            n.len() == 3 && (n[0], n[1], n[2]) >= (0, 1, 12)
+        })
 }
 
 /// [`resume_state_of`] with the key set passed in, so a test can exercise a keyed log without the
@@ -141,9 +184,22 @@ pub(crate) fn resume_state_with(log: &str, keys: &[(Vec<u8>, String)]) -> Resume
     // A mark that cannot be authenticated is no evidence either way: with a key set, one without a
     // valid MAC was written by someone who did not have it. Say so, and do not trust its numbers.
     let mut mark_anomaly: Option<String> = None;
-    let hwm = match (hwm, keys.first()) {
-        (Some((s, h, mac)), Some((k, _))) => {
-            if mac.as_deref() == Some(hwm_mac(k, s, &h).as_str()) {
+    let mut note: Option<String> = None;
+    let hwm = match (hwm, keys.is_empty()) {
+        (Some((s, h, mac)), false) => {
+            let valid = mac
+                .as_deref()
+                .is_some_and(|m| keys.iter().any(|(k, _)| m == hwm_mac(k, s, &h).as_str()));
+            if valid {
+                Some((s, h))
+            } else if mac.is_none() && !written_with_signed_marks(log) {
+                // R13 of the 0.1.12 review: introducing a key on an existing log, or upgrading a
+                // keyed log from a build that did not sign its mark, was reported as tampering.
+                note = Some(
+                    "the high-water mark carries no MAC because it was written without a key (or \
+                     by a build before 0.1.12); from now on it is signed"
+                        .into(),
+                );
                 Some((s, h))
             } else {
                 mark_anomaly = Some(
@@ -157,7 +213,7 @@ pub(crate) fn resume_state_with(log: &str, keys: &[(Vec<u8>, String)]) -> Resume
         // R5 of the 0.1.12 review: deleting the mark of a keyed log made a truncated log look like
         // an upgrade from a build without marks. A keyed log always has a mark beside it, so its
         // absence is itself the finding.
-        (None, Some(_)) if signed_log => {
+        (None, false) if signed_log => {
             mark_anomaly = Some(
                 "the high-water mark is missing although the log is keyed (its last entry carries \
                  key_fp): entries may have been cut from the end and the mark deleted to hide it"
@@ -165,12 +221,15 @@ pub(crate) fn resume_state_with(log: &str, keys: &[(Vec<u8>, String)]) -> Resume
             );
             None
         }
-        (Some((s, h, _)), None) => Some((s, h)),
+        (Some((s, h, _)), true) => Some((s, h)),
         (None, _) => None,
     };
     let mut r = resume_from(&in_log, &hwm);
     if r.anomaly.is_none() {
         r.anomaly = mark_anomaly;
+    }
+    if r.anomaly.is_none() {
+        r.note = note;
     }
     r
 }
@@ -181,12 +240,14 @@ fn resume_from(in_log: &Option<Option<(u64, String)>>, hwm: &Option<(u64, String
         (None, None) => Resume {
             seq: 0,
             hash: "GENESIS".into(),
+            note: None,
             anomaly: None,
         },
         // A mark but no log at all — the log was removed.
         (None, Some((s, _))) => Resume {
             seq: *s,
             hash: "GENESIS".into(),
+            note: None,
             anomaly: Some(format!(
                 "the log is gone but the high-water mark says {} entries were written — the trail \
                  has been removed or moved",
@@ -197,6 +258,7 @@ fn resume_from(in_log: &Option<Option<(u64, String)>>, hwm: &Option<(u64, String
         (Some(None), _) => Resume {
             seq: hwm.as_ref().map(|(s, _)| *s).unwrap_or(0),
             hash: "GENESIS".into(),
+            note: None,
             anomaly: Some(
                 "the log exists but its last entry is unusable — chain state unknown".into(),
             ),
@@ -205,6 +267,7 @@ fn resume_from(in_log: &Option<Option<(u64, String)>>, hwm: &Option<(u64, String
         (Some(Some((s, h))), None) => Resume {
             seq: *s,
             hash: h.clone(),
+            note: None,
             anomaly: None,
         },
         // Both present — this is the comparison that makes truncation visible.
@@ -230,6 +293,7 @@ fn resume_from(in_log: &Option<Option<(u64, String)>>, hwm: &Option<(u64, String
             Resume {
                 seq: *s_log.max(s_hwm),
                 hash: h_log.clone(),
+                note: None,
                 anomaly,
             }
         }
@@ -244,6 +308,9 @@ static RESUME: Lazy<Resume> = Lazy::new(|| {
     if let Some(a) = &r.anomaly {
         eprintln!("AUDIT: {}", a);
     }
+    if let Some(n) = &r.note {
+        eprintln!("AUDIT: note: {}", n);
+    }
     r
 });
 
@@ -251,6 +318,11 @@ static RESUME: Lazy<Resume> = Lazy::new(|| {
 /// mark), for the startup record: on stderr alone it vanishes with the terminal.
 pub(crate) fn startup_anomaly() -> Option<String> {
     RESUME.anomaly.clone()
+}
+
+/// What the chain noticed at startup that is not an anomaly (a key configured for the first time).
+pub(crate) fn startup_note() -> Option<String> {
+    RESUME.note.clone()
 }
 
 pub(crate) static AUDIT_PREV: Lazy<Mutex<String>> = Lazy::new(|| Mutex::new(RESUME.hash.clone()));
@@ -432,18 +504,7 @@ pub(crate) fn verify_audit_file(
 
     // Key set: the current one plus (optionally) previous ones, comma-separated. A log that survived a
     // ROTATION must verify end to end — otherwise every rotation looks like sabotage.
-    let mut keys: Vec<(Vec<u8>, String)> = Vec::new();
-    if let Some(k) = audit_key() {
-        keys.push(k);
-    }
-    if let Ok(olds) = std::env::var("MCP_AUDIT_HMAC_KEYS_OLD") {
-        for k in olds.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
-            let b = k.as_bytes().to_vec();
-            let fp = key_fingerprint(&b);
-            keys.push((b, fp));
-        }
-    }
-
+    let keys = key_set();
     verify_audit_content(&content, &keys, expect_last)
 }
 
@@ -994,6 +1055,75 @@ mod tests {
         // an unkeyed log without a mark is still an upgrade, not an alarm
         std::fs::write(&log, chain(&[entry(1, "query")])).unwrap();
         assert!(resume_state_with(&path, &[]).anomaly.is_none());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// R13 of the 0.1.12 review: false alarms at key introduction, at rotation and on a new log.
+    #[test]
+    fn a_new_key_a_rotation_and_a_new_log_are_not_tampering() {
+        let dir = std::env::temp_dir().join(format!("hwm-r13-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("audit.jsonl");
+        let path = log.to_str().unwrap().to_string();
+        let mark = |seq: u64, hash: &str, key: Option<&[u8]>| {
+            let mut m = json!({"seq": seq, "hash": hash});
+            if let Some(k) = key {
+                m["mac"] = json!(hwm_mac(k, seq, hash));
+            }
+            std::fs::write(hwm_path_of(&path), m.to_string()).unwrap();
+        };
+        let last = |c: &str| {
+            let v: Value = serde_json::from_str(c.lines().last().unwrap()).unwrap();
+            (
+                v["seq"].as_u64().unwrap(),
+                v["hash"].as_str().unwrap().to_string(),
+            )
+        };
+        let (k1, k2) = (b"r13-old".to_vec(), b"r13-new".to_vec());
+        let keyset = |ks: &[&Vec<u8>]| -> Vec<(Vec<u8>, String)> {
+            ks.iter()
+                .map(|k| ((*k).clone(), key_fingerprint(k)))
+                .collect()
+        };
+
+        // 1. an unkeyed log and its unkeyed mark, then a key is configured: a note, not an anomaly
+        let c = chain(&[entry(1, "query"), entry(2, "query")]);
+        std::fs::write(&log, &c).unwrap();
+        let (s, h) = last(&c);
+        mark(s, &h, None);
+        let r = resume_state_with(&path, &keyset(&[&k1]));
+        assert!(r.anomaly.is_none(), "{:?}", r.anomaly);
+        assert!(r.note.is_some());
+
+        // 2. rotation: the mark is signed with the retired key, which is offered as old
+        let c = keyed_chain(&k1, &[entry(1, "query"), entry(2, "query")], &|_| true);
+        std::fs::write(&log, &c).unwrap();
+        let (s, h) = last(&c);
+        mark(s, &h, Some(&k1));
+        let r = resume_state_with(&path, &keyset(&[&k2, &k1]));
+        assert!(r.anomaly.is_none(), "{:?}", r.anomaly);
+        // without the retired key it cannot be vouched for
+        assert!(resume_state_with(&path, &keyset(&[&k2])).anomaly.is_some());
+
+        // 3. a log keyed by a build that signs its mark, beside an unsigned mark: still an anomaly
+        let mut start = entry(1, "server");
+        start["decision"] = json!("startup");
+        start["version"] = json!("0.1.12");
+        let c = keyed_chain(&k1, &[start, entry(2, "query")], &|_| true);
+        std::fs::write(&log, &c).unwrap();
+        let (s, h) = last(&c);
+        mark(s, &h, None);
+        let a = resume_state_with(&path, &keyset(&[&k1]))
+            .anomaly
+            .expect("forged mark");
+        assert!(a.contains("no valid MAC"), "{a}");
+
+        // 4. the empty file the start-up check creates is a first run; emptied after use it is not
+        std::fs::write(&log, "").unwrap();
+        std::fs::remove_file(hwm_path_of(&path)).unwrap();
+        assert!(resume_state_with(&path, &[]).anomaly.is_none());
+        mark(5, "abc", None);
+        assert!(resume_state_with(&path, &[]).anomaly.is_some());
         std::fs::remove_dir_all(&dir).ok();
     }
 

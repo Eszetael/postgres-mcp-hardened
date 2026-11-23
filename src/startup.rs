@@ -685,6 +685,9 @@ pub(crate) fn audit_startup(transport: &str) {
     if let Some(a) = audit_log::startup_anomaly() {
         extra.insert("chain_anomaly".into(), json!(a));
     }
+    if let Some(n) = audit_log::startup_note() {
+        extra.insert("chain_note".into(), json!(n));
+    }
     audit_extra("server", "startup", None, extra);
 }
 
