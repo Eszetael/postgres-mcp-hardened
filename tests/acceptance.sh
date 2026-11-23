@@ -1445,6 +1445,139 @@ case "$err" in
 esac
 rm -f "$RL" "$RL.hwm"
 
+section "Found by the 0.1.12 audit of 0.1.11 (each of these was open)"
+# G1: a proxy that appends its OWN X-Forwarded-For line (HAProxy `option forwardfor`) leaves the
+# client's line first. The limiter read only the first line, so the client chose its own bucket.
+start DATABASE_URL="$URL" MCP_TRUST_PROXY=1 MCP_RATE_RPM=8 MCP_RATE_BURST=2
+codes=""
+for i in 1 2 3 4 5 6; do
+  codes="$codes $(curl -s -o /dev/null -w '%{http_code}' -m 10 -H content-type:application/json -H "X-Forwarded-For: 8.8.8.$i" -H "X-Forwarded-For: 203.0.113.99" "http://127.0.0.1:$PORT/mcp" -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}')"
+done
+case "$codes" in *429*) ok "two X-Forwarded-For lines do not give the client its own rate-limit bucket";; *) no "client-chosen rate-limit key" "$codes";; esac
+stop
+# G21: a repeated Mcp-Name is refused, not read from its first line.
+start DATABASE_URL="$URL"
+c=$(curl -s -o /dev/null -w '%{http_code}' -m 10 -H content-type:application/json -H "MCP-Protocol-Version: 2026-07-28" -H "Mcp-Method: tools/call" -H "Mcp-Name: query" -H "Mcp-Name: list_tables" "http://127.0.0.1:$PORT/mcp" -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"query","arguments":{"sql":"SELECT 1"}}}')
+[ "$c" = 400 ] && ok "a repeated Mcp-Name header is refused" || no "repeated Mcp-Name accepted" "HTTP $c"
+# F2/F4: existence and privilege oracles, and current_setting, answer what SHOW refuses
+r=$(tool query '{"sql":"SELECT current_setting('"'"'data_directory'"'"')"}' | body)
+case "$r" in ERROR:*) ok "current_setting('data_directory') is refused like SHOW";; *) no "current_setting leaked the data directory" "$r";; esac
+for q in "SELECT * FROM pg_hba_file_rules" "SELECT * FROM pg_show_all_file_settings()" "SELECT * FROM pg_stat_statements" "SELECT * FROM pg_ident_file_mappings"; do
+  r=$(tool query "{\"sql\":\"$q\"}" | body)
+  case "$r" in ERROR:*) ok "refused: $q";; *) no "server configuration readable through: $q" "$r";; esac
+done
+stop
+start DATABASE_URL="$URL" MCP_ALLOW_SCHEMAS=public
+for q in "SELECT to_regclass('secret.t')" "SELECT 'secret.t'::regclass" "SELECT has_table_privilege('secret.t','select')" "SELECT col_description('customers'::regclass,1)"; do
+  r=$(tool query "{\"sql\":\"$q\"}" | body)
+  case "$r" in ERROR:*) ok "surface: refused $q";; *) no "surface leaks existence through: $q" "$r";; esac
+done
+stop
+# G5/G16: the password in the connection string never reaches the audit record or stderr
+i=0
+for u in "postgres://u@127.0.0.1:1/db?password=SEKRET" "postgres://u:pa@SEKRET@127.0.0.1:1/db" "host=127.0.0.1 port=1 user=u password='a SEKRET' dbname=db" "host=127.0.0.1 port=1 user=u password = SEKRET dbname=db" "postgres://u@127.0.0.1:1/db?sslpassword=SEKRET" "postgres://u:x@127.0.0.1:1/db?PassWord=SEKRET"; do
+  i=$((i+1)); PL=/tmp/acc_pw_${i}_$$.log; rm -f "$PL"
+  env DATABASE_URL="$u" MCP_AUDIT_LOG="$PL" MCP_ADDR=127.0.0.1:$((PORT+30+i)) timeout 3 "$BIN" >/tmp/acc_pw_${i}_$$.err 2>&1
+  n=$(cat "$PL" /tmp/acc_pw_${i}_$$.err 2>/dev/null | grep -c SEKRET)
+  [ "$n" = 0 ] && ok "connection string shape $i leaves no password in the audit or stderr" || no "password leaked (shape $i)" "$u"
+  rm -f "$PL" /tmp/acc_pw_${i}_$$.err
+done
+# G6: with the key given, stripping `key_fp` and recomputing the tail is no longer "OK (HMAC-SHA256)"
+FL=/tmp/acc_forge_$$.log; rm -f "$FL" "$FL.hwm"
+start DATABASE_URL="$URL" MCP_AUDIT_LOG="$FL" MCP_AUDIT_HMAC_KEY=forge_key
+tool query '{"sql":"SELECT 1"}' >/dev/null; tool query '{"sql":"SELECT 2"}' >/dev/null; tool query '{"sql":"SELECT 3"}' >/dev/null
+stop
+out=$(env MCP_AUDIT_HMAC_KEY=forge_key "$BIN" --verify-audit "$FL" 2>&1)
+case "$out" in "OK [HMAC-SHA256]"*) ok "an honest keyed log verifies and says HMAC-SHA256";; *) no "keyed log did not verify as keyed" "$out";; esac
+python3 - "$FL" <<'PY3'
+import json, sys, hashlib
+lines = [json.loads(l) for l in open(sys.argv[1]).read().splitlines()]
+keep = lines[:2] + lines[3:]            # cut one entry out of the middle
+prev = keep[1]["hash"]; out = keep[:2]
+for i, e in enumerate(keep[2:], start=3):
+    e = dict(e); e.pop("key_fp", None); e.pop("prev", None); e.pop("hash", None)
+    e["seq"] = i
+    body = json.dumps(e, sort_keys=True, separators=(",", ":"))
+    h = hashlib.sha256((prev + body).encode()).hexdigest()
+    e["prev"] = prev; e["hash"] = h; prev = h
+    out.append(e)
+open(sys.argv[1], "w").write("\n".join(json.dumps(e, sort_keys=True, separators=(",", ":")) for e in out) + "\n")
+PY3
+out=$(env MCP_AUDIT_HMAC_KEY=forge_key "$BIN" --verify-audit "$FL" 2>&1)
+case "$out" in TAMPERED*) ok "stripping the signature from the tail is caught when the key is given";; *) no "UNSIGNED TAIL VERIFIED AS HMAC" "$out";; esac
+rm -f "$FL" "$FL.hwm"
+# G8: an empty MCP_AUDIT_HMAC_KEY (compose expands a missing ${VAR} to "") must not hide the key file
+KF=/tmp/acc_keyfile_$$; printf 'key-from-file\n' > "$KF"
+GL=/tmp/acc_g8_$$.log; rm -f "$GL" "$GL.hwm"
+start DATABASE_URL="$URL" MCP_AUDIT_LOG="$GL" MCP_AUDIT_HMAC_KEY= MCP_AUDIT_HMAC_KEY_FILE="$KF"
+tool query '{"sql":"SELECT 1"}' >/dev/null
+stop
+grep -q '"key_fp"' "$GL" && ok "an empty MCP_AUDIT_HMAC_KEY falls through to MCP_AUDIT_HMAC_KEY_FILE" || no "empty key variable silently disabled the keyed chain" "$(head -c 200 "$GL")"
+printf '\n' > "$KF"
+r=$(env DATABASE_URL="$URL" MCP_AUDIT_HMAC_KEY_FILE="$KF" MCP_ADDR=127.0.0.1:$((PORT+40)) timeout 5 "$BIN" 2>&1; echo "rc=$?")
+case "$r" in *"rc=2"*) ok "a key file holding only a newline is refused at start";; *) no "newline-only key file accepted" "$r";; esac
+rm -f "$KF" "$GL" "$GL.hwm"
+# G9: delete the log and keep the sidecar: the restart says so IN the chain, and the new file is refused
+DL=/tmp/acc_g9_$$.log; rm -f "$DL" "$DL.hwm"
+start DATABASE_URL="$URL" MCP_AUDIT_LOG="$DL" MCP_AUDIT_HMAC_KEY=g9_key
+tool query '{"sql":"SELECT 1"}' >/dev/null
+stop
+rm -f "$DL"
+start DATABASE_URL="$URL" MCP_AUDIT_LOG="$DL" MCP_AUDIT_HMAC_KEY=g9_key
+stop
+grep -q 'chain_anomaly' "$DL" && ok "a removed log is recorded in the new chain's startup entry" || no "log removal left no trace in the chain" "$(head -c 300 "$DL")"
+out=$(env MCP_AUDIT_HMAC_KEY=g9_key "$BIN" --verify-audit "$DL" 2>&1)
+case "$out" in TAMPERED*"not 1"*) ok "and a log that does not start at entry 1 is refused";; *) no "log with its head missing verified" "$out";; esac
+rm -f "$DL" "$DL.hwm"
+# G14: strict redaction + a database that cannot be asked = nothing served, and no "verified"
+r=$(env DATABASE_URL="postgres://x:y@127.0.0.1:1/x" MCP_REDACT_COLUMNS=email MCP_REDACT_REQUIRE_REVOKE=1 MCP_RATE_RPM=0 MCP_ADDR=127.0.0.1:$((PORT+41)) timeout 8 "$BIN" 2>&1 >/dev/null | grep -c 'verified against the database')
+[ "$r" = 0 ] && ok "an unreachable database is never reported as 'verified'" || no "claimed verification without reaching the database" "$r"
+env DATABASE_URL="postgres://x:y@127.0.0.1:1/x" MCP_REDACT_COLUMNS=email MCP_REDACT_REQUIRE_REVOKE=1 MCP_RATE_RPM=0 MCP_ADDR=127.0.0.1:$((PORT+42)) "$BIN" >/dev/null 2>&1 &
+G14PID=$!; sleep 3
+c=$(curl -s -o /dev/null -w '%{http_code}' -m 10 -H content-type:application/json "http://127.0.0.1:$((PORT+42))/mcp" -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}')
+kill -9 $G14PID 2>/dev/null
+[ "$c" = 503 ] && ok "MCP_REDACT_REQUIRE_REVOKE=1 serves nothing until the database has been checked" || no "strict redaction served before verification" "HTTP $c"
+# G4: a connection that starts a request and never finishes it is closed
+start DATABASE_URL="$URL" MCP_CONN_TIMEOUT_SECS=3
+python3 - "$PORT" <<'PY4' && ok "a stalled connection is closed after MCP_CONN_TIMEOUT_SECS" || no "a stalled connection was left open" ""
+import socket, sys, time
+s = socket.socket(); s.settimeout(1); s.connect(("127.0.0.1", int(sys.argv[1])))
+s.send(b"POST /mcp HTTP/1.1\r\nHost: x\r\n")
+end = time.time() + 10
+while time.time() < end:
+    try:
+        if s.recv(1) == b"": sys.exit(0)      # server closed it
+    except socket.timeout:
+        try: s.send(b"X-a: b\r\n")            # dribble, as a slow-connection attack does
+        except OSError: sys.exit(0)
+    except OSError: sys.exit(0)
+sys.exit(1)
+PY4
+stop
+# G11/G12: the role check sees column grants, sequences, and the groups a NOINHERIT role may become
+docker exec -i acc_pg psql -U postgres -q -v ON_ERROR_STOP=1 <<'SQL' >/dev/null || { echo "fixture failed: gate roles 0.1.12"; exit 1; }
+CREATE ROLE acc_colup LOGIN PASSWORD 'c'; GRANT CONNECT ON DATABASE postgres TO acc_colup; GRANT USAGE ON SCHEMA public TO acc_colup;
+GRANT SELECT ON customers TO acc_colup; GRANT UPDATE (name) ON customers TO acc_colup;
+CREATE ROLE acc_grp NOLOGIN; GRANT INSERT ON customers TO acc_grp;
+CREATE ROLE acc_noinh LOGIN PASSWORD 'n' NOINHERIT; GRANT CONNECT ON DATABASE postgres TO acc_noinh; GRANT USAGE ON SCHEMA public TO acc_noinh;
+GRANT SELECT ON customers TO acc_noinh; GRANT acc_grp TO acc_noinh;
+CREATE SEQUENCE acc_seq; CREATE ROLE acc_seq_r LOGIN PASSWORD 's'; GRANT CONNECT ON DATABASE postgres TO acc_seq_r; GRANT USAGE ON SCHEMA public TO acc_seq_r; GRANT SELECT ON customers TO acc_seq_r; GRANT UPDATE ON SEQUENCE acc_seq TO acc_seq_r;
+SQL
+k=0
+for who in "acc_colup:c:a column-level UPDATE" "acc_noinh:n:membership of a role that can INSERT" "acc_seq_r:s:UPDATE on a sequence"; do
+  k=$((k+1)); u="${who%%:*}"; rest="${who#*:}"; pw="${rest%%:*}"; what="${rest#*:}"
+  r=$(env DATABASE_URL="postgres://$u:$pw@127.0.0.1:$PGPORT_ACC/postgres" MCP_ADDR="0.0.0.0:$((PORT+920+k))" MCP_BEARER_TOKEN=gate_tok_0112_long_enough_xx timeout 10 "$BIN" 2>&1; echo "rc=$?")
+  case "$r" in *"rc=3"*) ok "a role with $what is refused a network listener";; *) no "role with $what was allowed to listen" "$r";; esac
+done
+# G13: on Apify the platform authenticates; the report must not call the listener anonymous
+APORT=$((PORT+930))
+env DATABASE_URL="$RURL" APIFY_IS_AT_HOME=1 ACTOR_WEB_SERVER_PORT=$APORT MCP_ADDR="0.0.0.0:$APORT" MCP_RATE_RPM=0 "$BIN" >/tmp/acc_apify_$$.log 2>&1 &
+APID=$!; sleep 3
+r=$(curl -s -m 10 -H content-type:application/json "http://127.0.0.1:$APORT/mcp" -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"security_posture","arguments":{}}}')
+kill -9 $APID 2>/dev/null; rm -f /tmp/acc_apify_$$.log
+case "$r" in *transport.anonymous*) no "Apify listener reported as anonymous" "$(echo "$r" | head -c 300)";; *posture*|*grade*|*role*) ok "on Apify the report does not call the platform-authenticated listener anonymous";; *) no "no posture answer" "$(echo "$r" | head -c 200)";; esac
+PORT=$((PORT+940))
+
 section "Deployment shapes"
 start MCP_DATABASE_URLS="a=$URL;b=$URL"
 r=$(tool query '{"sql":"SELECT 1 AS x","database":"b"}' | body); echo "$r" | grep -q '"x":1' && ok "several databases from one server" || no "multi-database" "$r"

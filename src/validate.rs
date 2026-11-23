@@ -789,7 +789,7 @@ impl Visitor for SecurityScanner {
                             let name = name.to_lowercase();
                             if SENSITIVE_SHOW_VARS.contains(&name.as_str()) {
                                 self.hit = Some(format!(
-                                    "current_setting('{name}') (server layout, like SHOW {name})"
+                                    "current_setting('{name}') reads server configuration, which SHOW {name} refuses too"
                                 ));
                                 return ControlFlow::Break(());
                             }
