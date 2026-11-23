@@ -3400,3 +3400,412 @@ fn is_reg_type(dt: &sqlparser::ast::DataType) -> bool {
         _ => false,
     }
 }
+
+// --- Operators (P1 of the 0.1.12 review) ---
+//
+// An operator is a function call written as a symbol: `1 ### 1` runs whatever function the operator
+// names, SECURITY DEFINER included, and the surface rule for functions never saw it because there was
+// no call in the statement to look at. These helpers list every place a statement makes PostgreSQL
+// look an operator up by name, so `cost_guard` can resolve each one against `pg_operator`.
+
+/// The operator name that never exists, used to make PostgreSQL report the operand types of one use.
+pub(crate) const PROBE_OPERATOR: &str = "pg_catalog.@@@@@";
+const PROBE_PLACEHOLDER: &str = "__mcp_operator_probe__";
+
+/// One use of an operator in a statement.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct OperatorSite {
+    /// the operator's name, e.g. `=` or `###`
+    pub(crate) symbol: String,
+    /// the schema written in `OPERATOR(schema.op)`, lowercased; `None` when unqualified
+    pub(crate) schema: Option<String>,
+    /// the statement with this use replaced by the same operands around [`PROBE_OPERATOR`], whose
+    /// "operator does not exist" error names the operand types; `None` when it cannot be built
+    pub(crate) probe: Option<String>,
+}
+
+fn is_operator_symbol(s: &str) -> bool {
+    !s.is_empty() && s.chars().all(|c| "+-*/<>=~!@#%^&|`?".contains(c))
+}
+
+fn probe_op() -> BinaryOperator {
+    BinaryOperator::PGCustomBinaryOperator(vec!["pg_catalog".into(), "@@@@@".into()])
+}
+
+fn binary_symbol(op: &BinaryOperator) -> Option<(String, Option<String>)> {
+    if let BinaryOperator::PGCustomBinaryOperator(parts) = op {
+        return Some(match parts.as_slice() {
+            [o] => (o.clone(), None),
+            [s, o] => (o.clone(), Some(s.to_lowercase())),
+            // a name we cannot read is judged as qualified with a schema that matches nothing safe
+            _ => (parts.join("."), Some(String::new())),
+        });
+    }
+    let s = op.to_string();
+    is_operator_symbol(&s).then_some((s, None))
+}
+
+fn nested(e: &Expr) -> Box<Expr> {
+    Box::new(Expr::Nested(Box::new(e.clone())))
+}
+
+/// `(L) OPERATOR(pg_catalog.@@@@@) (R)` as text.
+fn binary_probe(l: &Expr, r: &Expr) -> String {
+    Expr::Nested(Box::new(Expr::BinaryOp {
+        left: nested(l),
+        op: probe_op(),
+        right: nested(r),
+    }))
+    .to_string()
+}
+
+/// The operator uses one expression node makes, each with the probe text for that use.
+fn expr_operator_uses(expr: &Expr) -> Vec<(String, Option<String>, Option<String>)> {
+    use sqlparser::ast::UnaryOperator;
+    let eq = |l: &Expr, r: &Expr, sym: &str| (sym.to_string(), None, Some(binary_probe(l, r)));
+    match expr {
+        Expr::BinaryOp { left, op, right } => match binary_symbol(op) {
+            Some((sym, None)) => vec![(sym, None, Some(binary_probe(left, right)))],
+            Some((sym, schema)) => vec![(sym, schema, None)],
+            None => vec![],
+        },
+        Expr::AnyOp {
+            left,
+            compare_op,
+            right,
+            is_some,
+        } => match binary_symbol(compare_op) {
+            Some((sym, None)) => {
+                let probe = Expr::Nested(Box::new(Expr::AnyOp {
+                    left: nested(left),
+                    compare_op: probe_op(),
+                    right: right.clone(),
+                    is_some: *is_some,
+                }))
+                .to_string();
+                vec![(sym, None, Some(probe))]
+            }
+            Some((sym, schema)) => vec![(sym, schema, None)],
+            None => vec![],
+        },
+        Expr::AllOp {
+            left,
+            compare_op,
+            right,
+        } => match binary_symbol(compare_op) {
+            Some((sym, None)) => {
+                let probe = Expr::Nested(Box::new(Expr::AllOp {
+                    left: nested(left),
+                    compare_op: probe_op(),
+                    right: right.clone(),
+                }))
+                .to_string();
+                vec![(sym, None, Some(probe))]
+            }
+            Some((sym, schema)) => vec![(sym, schema, None)],
+            None => vec![],
+        },
+        Expr::UnaryOp { op, expr } => {
+            let sym = op.to_string();
+            if !is_operator_symbol(&sym) {
+                return vec![];
+            }
+            // postfix operators are gone since PostgreSQL 14; no probe, judged by name alone
+            let probe = (*op != UnaryOperator::PGPostfixFactorial)
+                .then(|| format!("(OPERATOR({PROBE_OPERATOR}) ({expr}))"));
+            vec![(sym, None, probe)]
+        }
+        // The forms that look `=`, `<>`, `<`, `~~` and friends up by name without writing them.
+        Expr::InList {
+            expr,
+            list,
+            negated,
+        } => list
+            .iter()
+            .map(|e| eq(expr, e, if *negated { "<>" } else { "=" }))
+            .collect(),
+        Expr::InSubquery {
+            expr,
+            subquery,
+            negated,
+        } => {
+            let probe = Expr::Nested(Box::new(Expr::AnyOp {
+                left: nested(expr),
+                compare_op: probe_op(),
+                right: Box::new(Expr::Subquery(subquery.clone())),
+                is_some: false,
+            }))
+            .to_string();
+            vec![(
+                (if *negated { "<>" } else { "=" }).into(),
+                None,
+                Some(probe),
+            )]
+        }
+        Expr::Between {
+            expr,
+            negated,
+            low,
+            high,
+        } => {
+            let (lo, hi) = if *negated { ("<", ">") } else { (">=", "<=") };
+            vec![eq(expr, low, lo), eq(expr, high, hi)]
+        }
+        Expr::IsDistinctFrom(a, b) | Expr::IsNotDistinctFrom(a, b) => vec![eq(a, b, "=")],
+        Expr::Like {
+            negated,
+            any,
+            expr,
+            pattern,
+            ..
+        } => {
+            let sym = if *negated { "!~~" } else { "~~" };
+            vec![(
+                sym.into(),
+                None,
+                (!*any).then(|| binary_probe(expr, pattern)),
+            )]
+        }
+        Expr::ILike {
+            negated,
+            any,
+            expr,
+            pattern,
+            ..
+        } => {
+            let sym = if *negated { "!~~*" } else { "~~*" };
+            vec![(
+                sym.into(),
+                None,
+                (!*any).then(|| binary_probe(expr, pattern)),
+            )]
+        }
+        Expr::SimilarTo {
+            negated,
+            expr,
+            pattern,
+            ..
+        } => vec![eq(expr, pattern, if *negated { "!~" } else { "~" })],
+        Expr::Case {
+            operand: Some(o),
+            conditions,
+            ..
+        } => conditions
+            .iter()
+            .map(|c| eq(o, &c.condition, "="))
+            .collect(),
+        Expr::Function(f) if last_part_name(&f.name).as_deref() == Some("nullif") => {
+            match &f.args {
+                FunctionArguments::List(l) => match l.args.as_slice() {
+                    [FunctionArg::Unnamed(FunctionArgExpr::Expr(a)), FunctionArg::Unnamed(FunctionArgExpr::Expr(b))] =>
+                    {
+                        vec![eq(a, b, "=")]
+                    }
+                    _ => vec![("=".into(), None, None)],
+                },
+                _ => vec![("=".into(), None, None)],
+            }
+        }
+        _ => vec![],
+    }
+}
+
+/// Every place `sql` makes PostgreSQL look an operator up by name, in the order a pre-order walk of
+/// the statement meets them, followed by the `ORDER BY ... USING` operators (read from the tokens,
+/// because they appear in window and aggregate orderings too). An unparsable statement has none;
+/// the validator refuses it anyway.
+pub(crate) fn operator_sites(sql: &str) -> Vec<OperatorSite> {
+    let Ok(ast) = parse(sql) else {
+        return Vec::new();
+    };
+    let Some(stmt) = ast.into_iter().next() else {
+        return Vec::new();
+    };
+    struct Collect {
+        uses: Vec<(usize, String, Option<String>, Option<String>)>,
+        n: usize,
+    }
+    impl sqlparser::ast::VisitorMut for Collect {
+        type Break = ();
+        fn pre_visit_expr(&mut self, expr: &mut Expr) -> ControlFlow<()> {
+            for (sym, schema, probe) in expr_operator_uses(expr) {
+                self.uses.push((self.n, sym, schema, probe));
+            }
+            self.n += 1;
+            ControlFlow::Continue(())
+        }
+    }
+    struct Replace {
+        target: usize,
+        n: usize,
+    }
+    impl sqlparser::ast::VisitorMut for Replace {
+        type Break = ();
+        fn pre_visit_expr(&mut self, expr: &mut Expr) -> ControlFlow<()> {
+            if self.n == self.target {
+                *expr = Expr::Identifier(sqlparser::ast::Ident::new(PROBE_PLACEHOLDER));
+                return ControlFlow::Break(());
+            }
+            self.n += 1;
+            ControlFlow::Continue(())
+        }
+    }
+    use sqlparser::ast::VisitMut;
+    let mut walk = stmt.clone();
+    let mut c = Collect {
+        uses: Vec::new(),
+        n: 0,
+    };
+    let _ = VisitMut::visit(&mut walk, &mut c);
+    let mut out: Vec<OperatorSite> = c
+        .uses
+        .into_iter()
+        .map(|(ordinal, symbol, schema, probe)| {
+            let probe = probe.and_then(|p| {
+                let mut copy = stmt.clone();
+                let _ = VisitMut::visit(
+                    &mut copy,
+                    &mut Replace {
+                        target: ordinal,
+                        n: 0,
+                    },
+                );
+                let text = copy.to_string();
+                (text.matches(PROBE_PLACEHOLDER).count() == 1)
+                    .then(|| text.replace(PROBE_PLACEHOLDER, &p))
+            });
+            OperatorSite {
+                symbol,
+                schema,
+                probe,
+            }
+        })
+        .collect();
+    out.extend(
+        order_by_using_operators(sql)
+            .into_iter()
+            .map(|(symbol, schema)| OperatorSite {
+                symbol,
+                schema,
+                probe: None,
+            }),
+    );
+    out
+}
+
+/// `USING <op>` and `USING OPERATOR(schema.op)` after an ordering expression, read from the tokens.
+/// A join's `USING (cols)` is followed by a parenthesis and is not an operator.
+pub(crate) fn order_by_using_operators(sql: &str) -> Vec<(String, Option<String>)> {
+    let Ok(tokens) = Tokenizer::new(&PostgreSqlDialect {}, sql).tokenize() else {
+        return Vec::new();
+    };
+    let t: Vec<&Token> = tokens
+        .iter()
+        .filter(|t| !matches!(t, Token::Whitespace(_)))
+        .collect();
+    let mut out = Vec::new();
+    for i in 0..t.len() {
+        let Token::Word(w) = t[i] else { continue };
+        if !w.value.eq_ignore_ascii_case("using") || w.quote_style.is_some() {
+            continue;
+        }
+        match t.get(i + 1) {
+            Some(Token::Word(o)) if o.value.eq_ignore_ascii_case("operator") => {
+                // OPERATOR ( [schema .] op )
+                let mut inner = Vec::new();
+                for tok in t.iter().skip(i + 2) {
+                    match tok {
+                        Token::LParen => continue,
+                        Token::RParen => break,
+                        other => inner.push(other.to_string()),
+                    }
+                }
+                let joined = inner.concat();
+                match joined.rsplit_once('.') {
+                    Some((s, o)) => {
+                        out.push((o.to_string(), Some(s.trim_matches('"').to_lowercase())))
+                    }
+                    None => out.push((joined, None)),
+                }
+            }
+            Some(Token::LParen) | Some(Token::Word(_)) | None => {}
+            Some(_) => {
+                let mut sym = String::new();
+                for tok in t.iter().skip(i + 1) {
+                    let s = tok.to_string();
+                    if is_operator_symbol(&s) {
+                        sym.push_str(&s);
+                    } else {
+                        break;
+                    }
+                }
+                if !sym.is_empty() {
+                    out.push((sym, None));
+                }
+            }
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod operator_site_tests {
+    use super::*;
+
+    fn syms(sql: &str) -> Vec<(String, Option<String>, bool)> {
+        operator_sites(sql)
+            .into_iter()
+            .map(|s| (s.symbol, s.schema, s.probe.is_some()))
+            .collect()
+    }
+
+    #[test]
+    fn every_way_of_naming_an_operator_is_found() {
+        let has = |sql: &str, sym: &str| syms(sql).iter().any(|(s, _, _)| s == sym);
+        assert!(has("SELECT 1 ### 1", "###"));
+        assert!(has("SELECT a FROM t WHERE a = 1", "="));
+        assert!(has("SELECT a FROM t WHERE a IN (1, 2)", "="));
+        assert!(has("SELECT a FROM t WHERE a NOT IN (1, 2)", "<>"));
+        assert!(has("SELECT a FROM t WHERE a IN (SELECT b FROM u)", "="));
+        assert!(has("SELECT a FROM t WHERE a BETWEEN 1 AND 2", ">="));
+        assert!(has("SELECT a FROM t WHERE a BETWEEN 1 AND 2", "<="));
+        assert!(has("SELECT a FROM t WHERE a LIKE 'x%'", "~~"));
+        assert!(has("SELECT a FROM t WHERE a NOT ILIKE 'x%'", "!~~*"));
+        assert!(has("SELECT a FROM t WHERE a IS DISTINCT FROM 1", "="));
+        assert!(has("SELECT CASE a WHEN 1 THEN 2 END FROM t", "="));
+        assert!(has("SELECT nullif(a, 1) FROM t", "="));
+        assert!(has("SELECT a FROM t WHERE a = ANY(ARRAY[1])", "="));
+        assert!(has("SELECT a FROM t WHERE a < ALL(ARRAY[1])", "<"));
+        assert!(has("SELECT -a FROM t", "-"));
+        assert!(has("SELECT j ->> 'k' FROM t", "->>"));
+        assert!(has("SELECT a FROM t ORDER BY a USING <", "<"));
+        let q = syms("SELECT 1 OPERATOR(ext.<<<) 1");
+        assert!(
+            q.contains(&("<<<".into(), Some("ext".into()), false)),
+            "{q:?}"
+        );
+        let u = operator_sites("SELECT a FROM t ORDER BY a USING OPERATOR(ext.<<<)");
+        assert!(
+            u.iter()
+                .any(|s| s.symbol == "<<<" && s.schema.as_deref() == Some("ext")),
+            "{u:?}"
+        );
+        // a join's USING is not an operator
+        assert!(operator_sites("SELECT * FROM a JOIN b USING (id)").is_empty());
+        assert!(operator_sites("SELECT 1").is_empty());
+    }
+
+    #[test]
+    fn the_probe_keeps_the_rest_of_the_statement_and_replaces_one_use() {
+        let s = operator_sites("SELECT a + 1 FROM t WHERE a = 2 AND b = 3");
+        let probes: Vec<String> = s.iter().filter_map(|x| x.probe.clone()).collect();
+        assert_eq!(probes.len(), 3);
+        for p in &probes {
+            assert_eq!(p.matches(PROBE_OPERATOR).count(), 1, "{p}");
+            assert!(p.contains("FROM t"), "{p}");
+        }
+        assert!(probes
+            .iter()
+            .any(|p| p.contains("(a) OPERATOR(pg_catalog.@@@@@) (2)")));
+    }
+}

@@ -708,6 +708,20 @@ pub(crate) fn cost_guard(sql: &str, max_cost: f64, db: Option<&str>) -> Result<(
                 )));
             }
         }
+        // P1 of the 0.1.12 review: an operator is a function call written as a symbol, and
+        // `1 ### 1` over a SECURITY DEFINER function read a table outside the surface while the
+        // same function called by name was refused. Same rule as for functions, after resolving
+        // each operator the way PostgreSQL does.
+        let offenders = operator_offenders(&mut client, sql, db)?;
+        if !offenders.is_empty() {
+            return Err(CostErr::OutsideSurface(format!(
+                "uses an operator whose function this server cannot see inside: {}. While a \
+                 surface allowlist is configured, only operators backed by built-in functions are \
+                 permitted, for the same reason as functions. Add the function to \
+                 MCP_ALLOW_FUNCTIONS if you have read it and it stays within the surface",
+                offenders.join(", ")
+            )));
+        }
     }
     let row = client
         .query_one(&format!("EXPLAIN (FORMAT JSON, VERBOSE) {}", sql), &[])
@@ -922,6 +936,215 @@ pub(crate) fn wrap_untrusted(data: &Value, tool: &str) -> Value {
         result["structuredContent"] = structured;
     }
     json!({ "result": result })
+}
+
+/// The operators `sql` uses whose function lies outside `pg_catalog` and is not named in
+/// `MCP_ALLOW_FUNCTIONS`, as `schema.op -> schema.function` descriptions.
+///
+/// Resolution follows PostgreSQL: an exact match on the operand types wins, the first one on the
+/// search path; otherwise any candidate the operands can reach by an implicit cast might be chosen,
+/// so one outside `pg_catalog` is an offender. The operand types come from PostgreSQL itself: the
+/// use is replaced by an operator that does not exist and the statement is prepared (parsed and
+/// analysed, never run), and the error names both types. When that cannot be done the answer is
+/// a refusal. The common case costs one catalogue query: no operator of the names used exists
+/// outside `pg_catalog`.
+fn operator_offenders(
+    client: &mut postgres::Client,
+    sql: &str,
+    db: Option<&str>,
+) -> Result<Vec<String>, CostErr> {
+    let sites = crate::validate::operator_sites(sql);
+    if sites.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut names: Vec<String> = sites.iter().map(|s| s.symbol.clone()).collect();
+    names.sort();
+    names.dedup();
+    let v = query_catalog(
+        "SELECT o.oprname AS op, n.nspname AS schema, \
+                COALESCE(array_position(current_schemas(true), n.nspname), 0) AS pos, \
+                format_type(o.oprleft, NULL) AS l, format_type(o.oprright, NULL) AS r, \
+                COALESCE((SELECT typcategory::text FROM pg_type WHERE oid = o.oprleft), '') AS lc, \
+                COALESCE((SELECT typcategory::text FROM pg_type WHERE oid = o.oprright), '') AS rc, \
+                p.proname AS func, pn.nspname AS fschema, p.prosecdef AS definer \
+         FROM pg_operator o JOIN pg_namespace n ON n.oid = o.oprnamespace \
+         JOIN pg_proc p ON p.oid = o.oprcode JOIN pg_namespace pn ON pn.oid = p.pronamespace \
+         WHERE o.oprname = ANY($1)",
+        &[&names],
+        db,
+    )
+    .map_err(CostErr::QueryError)?;
+    struct Op {
+        name: String,
+        schema: String,
+        pos: i64,
+        l: String,
+        r: String,
+        lc: String,
+        rc: String,
+        outside: bool,
+        label: String,
+    }
+    let empty = vec![];
+    let ops: Vec<Op> = v
+        .get("rows")
+        .and_then(|r| r.as_array())
+        .unwrap_or(&empty)
+        .iter()
+        .filter_map(|r| {
+            let s = |k: &str| r.get(k).and_then(|x| x.as_str()).map(str::to_string);
+            let (func, fschema) = (s("func")?, s("fschema")?);
+            let definer = r.get("definer").and_then(|d| d.as_bool()).unwrap_or(false);
+            Some(Op {
+                name: s("op")?,
+                schema: s("schema")?,
+                pos: r.get("pos").and_then(|x| x.as_i64()).unwrap_or(0),
+                l: s("l")?,
+                r: s("r")?,
+                lc: s("lc")?,
+                rc: s("rc")?,
+                outside: fschema != "pg_catalog"
+                    && !crate::validate::function_explicitly_allowed(&func),
+                label: format!(
+                    "{}.{} -> {}.{}{}",
+                    s("schema")?,
+                    s("op")?,
+                    fschema,
+                    func,
+                    if definer { " (SECURITY DEFINER)" } else { "" }
+                ),
+            })
+        })
+        .collect();
+    let mut out: Vec<String> = Vec::new();
+    for site in &sites {
+        if let Some(schema) = &site.schema {
+            if schema == "pg_catalog" {
+                continue;
+            }
+            out.extend(
+                ops.iter()
+                    .filter(|o| o.name == site.symbol && &o.schema == schema && o.outside)
+                    .map(|o| o.label.clone()),
+            );
+            continue;
+        }
+        let visible: Vec<&Op> = ops
+            .iter()
+            .filter(|o| o.name == site.symbol && o.pos > 0)
+            .collect();
+        let suspects: Vec<&&Op> = visible.iter().filter(|o| o.outside).collect();
+        if suspects.is_empty() {
+            continue;
+        }
+        let Some(probe) = &site.probe else {
+            out.extend(suspects.iter().map(|o| o.label.clone()));
+            continue;
+        };
+        let (lt, rt) = match client.prepare(probe) {
+            Err(e) => match e.as_db_error().map(|d| d.message().to_string()) {
+                Some(m) if m.starts_with("operator does not exist: ") => {
+                    let rest = &m["operator does not exist: ".len()..];
+                    let marker = crate::validate::PROBE_OPERATOR;
+                    if let Some(r) = rest.strip_prefix(&format!("{marker} ")) {
+                        ("-".to_string(), r.to_string())
+                    } else if let Some((l, r)) = rest.split_once(&format!(" {marker} ")) {
+                        (l.to_string(), r.to_string())
+                    } else {
+                        out.extend(suspects.iter().map(|o| o.label.clone()));
+                        continue;
+                    }
+                }
+                // Anything else is an error the statement itself would raise; report it as such.
+                _ => return Err(CostErr::QueryError(friendly_pg_error_for(&e, Some(sql)))),
+            },
+            Ok(_) => {
+                out.extend(suspects.iter().map(|o| o.label.clone()));
+                continue;
+            }
+        };
+        // An unknown-typed literal takes the type of the other side when looking for an exact
+        // match; two unknowns resolve as text, the string category PostgreSQL prefers.
+        let (el, er) = match (lt.as_str(), rt.as_str()) {
+            ("unknown", "unknown") => ("text".to_string(), "text".to_string()),
+            ("unknown", r) => (r.to_string(), rt.clone()),
+            (l, "unknown") => (lt.clone(), l.to_string()),
+            _ => (lt.clone(), rt.clone()),
+        };
+        let exact = visible
+            .iter()
+            .filter(|o| o.l == el && o.r == er)
+            .min_by_key(|o| o.pos);
+        match exact {
+            Some(o) if o.outside => out.push(o.label.clone()),
+            Some(_) => {}
+            None => {
+                // No exact match: PostgreSQL chooses among the candidates the operands reach by
+                // implicit casts. Its first narrowing steps are reproduced (most exact matches on
+                // the known types, then the string category at an unknown position); if a
+                // candidate outside pg_catalog is still among them, it may be the one chosen.
+                let mut cache: std::collections::HashMap<(String, String), bool> =
+                    std::collections::HashMap::new();
+                let mut reach = |from: &str, to: &str| -> Result<bool, CostErr> {
+                    if let Some(b) = cache.get(&(from.to_string(), to.to_string())) {
+                        return Ok(*b);
+                    }
+                    let b = reachable(from, to, db)?;
+                    cache.insert((from.to_string(), to.to_string()), b);
+                    Ok(b)
+                };
+                let mut cands: Vec<&&Op> = Vec::new();
+                for o in &visible {
+                    let left_ok = if lt == "-" {
+                        o.l == "-"
+                    } else {
+                        reach(&lt, &o.l)?
+                    };
+                    if left_ok && reach(&rt, &o.r)? {
+                        cands.push(o);
+                    }
+                }
+                let exactness = |o: &Op| (o.l == lt) as u8 + (o.r == rt) as u8;
+                let best = cands.iter().map(|o| exactness(o)).max().unwrap_or(0);
+                cands.retain(|o| exactness(o) == best);
+                if lt == "unknown" && cands.iter().any(|o| o.lc == "S") {
+                    cands.retain(|o| o.lc == "S");
+                }
+                if rt == "unknown" && cands.iter().any(|o| o.rc == "S") {
+                    cands.retain(|o| o.rc == "S");
+                }
+                out.extend(cands.iter().filter(|o| o.outside).map(|o| o.label.clone()));
+            }
+        }
+    }
+    out.sort();
+    out.dedup();
+    Ok(out)
+}
+
+/// Whether a value of type `from` can be passed where `to` is expected without an explicit cast:
+/// the same type, an unknown literal, a polymorphic parameter, a domain over it, or an implicit cast.
+fn reachable(from: &str, to: &str, db: Option<&str>) -> Result<bool, CostErr> {
+    if from == to || from == "unknown" {
+        return Ok(true);
+    }
+    let v = query_catalog(
+        "SELECT (EXISTS (SELECT 1 FROM pg_type t WHERE t.oid = to_regtype($2) AND t.typtype = 'p') \
+              OR EXISTS (SELECT 1 FROM pg_type d WHERE d.oid = to_regtype($1) AND d.typtype = 'd' \
+                         AND d.typbasetype = to_regtype($2)) \
+              OR EXISTS (SELECT 1 FROM pg_cast c WHERE c.castsource = to_regtype($1) \
+                         AND c.casttarget = to_regtype($2) AND c.castcontext = 'i') \
+              OR to_regtype($1) IS NULL OR to_regtype($2) IS NULL) AS ok",
+        &[&from, &to],
+        db,
+    )
+    .map_err(CostErr::QueryError)?;
+    Ok(v.get("rows")
+        .and_then(|r| r.as_array())
+        .and_then(|r| r.first())
+        .and_then(|r| r.get("ok"))
+        .and_then(|b| b.as_bool())
+        .unwrap_or(true))
 }
 
 #[cfg(test)]

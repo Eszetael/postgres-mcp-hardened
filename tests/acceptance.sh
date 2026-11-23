@@ -1484,6 +1484,23 @@ for q in "SELECT 'EU'::acc_region" "SELECT CAST('US' AS acc_region)" "SELECT 'ok
   r=$(tool query "{\"sql\":\"$q\"}" | body)
   case "$r" in ERROR:*) no "surface refused a user type: $q" "$r";; *) ok "surface: a user type starting with reg works: $q";; esac
 done
+# P1 (0.1.12 review, also in 0.1.11): an operator is a function call written as a symbol
+docker exec -i acc_pg psql -U postgres -q >/dev/null 2>&1 <<'SQL'
+CREATE FUNCTION public.acc_peek(int,int) RETURNS int LANGUAGE plpgsql SECURITY DEFINER AS $$BEGIN RETURN 100; END$$;
+CREATE OPERATOR public.### (LEFTARG=int, RIGHTARG=int, FUNCTION=public.acc_peek);
+CREATE SCHEMA acc_ext; CREATE OPERATOR acc_ext.<<< (LEFTARG=int, RIGHTARG=int, FUNCTION=public.acc_peek);
+CREATE FUNCTION public.acc_fake_eq(text,int) RETURNS bool LANGUAGE sql IMMUTABLE AS 'SELECT true';
+CREATE OPERATOR public.= (LEFTARG=text, RIGHTARG=int, FUNCTION=public.acc_fake_eq);
+SQL
+for q in "SELECT 1 ### 1" "SELECT 1 OPERATOR(acc_ext.<<<) 1" "SELECT id FROM customers WHERE id ### 1 > 0" "SELECT name FROM customers WHERE name = 1" "SELECT id FROM customers ORDER BY id USING OPERATOR(acc_ext.<<<)"; do
+  r=$(tool query "{\"sql\":\"$q\"}" | body)
+  case "$r" in ERROR:*operator*) ok "surface: refused an operator over a function outside pg_catalog: $q";; *) no "operator bypassed the surface: $q" "$r";; esac
+done
+for q in "SELECT 1 = 1, 2 < 3, 'a' || 'b'" "SELECT name FROM customers WHERE name = 'x'" "SELECT '{\\\"a\\\":1}'::jsonb ->> 'a'" "SELECT '{\\\"a\\\":1}'::jsonb @> '{}'" "SELECT name FROM customers WHERE name LIKE 'a%'" "SELECT ARRAY[1] && ARRAY[1]" "SELECT int4range(1,5) @> 3" "SELECT id FROM customers WHERE id IN (1,2) AND id BETWEEN 0 AND 9"; do
+  r=$(tool query "{\"sql\":\"$q\"}" | body)
+  case "$r" in ERROR:*) no "surface refused an ordinary operator: $q" "$r";; *) ok "surface: an ordinary operator still works: $q";; esac
+done
+docker exec acc_pg psql -U postgres -qc "DROP OPERATOR public.= (text, int); DROP OPERATOR public.### (int, int); DROP SCHEMA acc_ext CASCADE;" >/dev/null 2>&1
 stop
 # G5/G16: the password in the connection string never reaches the audit record or stderr
 i=0
