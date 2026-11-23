@@ -652,6 +652,24 @@ fn part_of(b: &[char], from: usize, to: usize) -> String {
     b[from..to].iter().collect()
 }
 
+/// `statement_timeout` as PostgreSQL reads it, in milliseconds: a bare number is milliseconds, and
+/// the units are ms, s, min, h and d. `None` for anything else.
+fn statement_timeout_ms(v: &str) -> Option<u64> {
+    let v = v.trim();
+    let split = v.find(|c: char| !c.is_ascii_digit()).unwrap_or(v.len());
+    let (num, unit) = v.split_at(split);
+    let n: u64 = num.parse().ok()?;
+    let mult = match unit.trim().to_ascii_lowercase().as_str() {
+        "" | "ms" => 1,
+        "s" => 1_000,
+        "min" => 60_000,
+        "h" => 3_600_000,
+        "d" => 86_400_000,
+        _ => return None,
+    };
+    n.checked_mul(mult)
+}
+
 /// Opens the chain with what this process is, before it serves anything.
 pub(crate) fn audit_startup(transport: &str) {
     let snapshot = config_snapshot();
@@ -778,6 +796,30 @@ pub(crate) fn preflight_config() {
                 "MCP_STATEMENT_TIMEOUT is not a PostgreSQL interval: {:?}",
                 v
             ));
+        }
+    }
+    // R9 of the 0.1.12 review: a query allowed to run longer than the connection budget was cut off
+    // with no answer at all (the client saw the connection drop). Over HTTP the budget has to
+    // cover the statement timeout with room for the rest of the request.
+    if !std::env::args().any(|a| a == "--stdio") {
+        let st = crate::tools::statement_timeout();
+        let budget = crate::conn_limit::timeout().as_secs();
+        match statement_timeout_ms(&st) {
+            Some(0) => eprintln!(
+                "MCP_STATEMENT_TIMEOUT=0 switches the query time limit off, so a query can outlive \
+                 MCP_CONN_TIMEOUT_SECS ({budget} s) and be cut off without an answer."
+            ),
+            Some(ms) if budget * 1000 <= ms + 10_000 => fatal.push(format!(
+                "MCP_CONN_TIMEOUT_SECS ({budget} s) must exceed the statement timeout ({st}) by more \
+                 than 10 s: a query that runs to its limit would otherwise be cut off without an \
+                 answer. Raise MCP_CONN_TIMEOUT_SECS or lower MCP_STATEMENT_TIMEOUT"
+            )),
+            Some(_) => {}
+            None => eprintln!(
+                "MCP_STATEMENT_TIMEOUT ({st}) is in a unit this check does not read; make sure \
+                 MCP_CONN_TIMEOUT_SECS ({budget} s) is longer, or long queries are cut off without \
+                 an answer."
+            ),
         }
     }
     if let Ok(p) = std::env::var("MCP_PASSWORD_FILE") {
@@ -1120,6 +1162,18 @@ mod tests {
             accepted > 1000,
             "only {accepted} strings were accepted by the driver"
         );
+    }
+
+    #[test]
+    fn statement_timeouts_are_read_in_postgresql_units() {
+        assert_eq!(statement_timeout_ms("30s"), Some(30_000));
+        assert_eq!(statement_timeout_ms("500ms"), Some(500));
+        assert_eq!(statement_timeout_ms("1500"), Some(1_500));
+        assert_eq!(statement_timeout_ms("2min"), Some(120_000));
+        assert_eq!(statement_timeout_ms(" 1 h"), Some(3_600_000));
+        assert_eq!(statement_timeout_ms("0"), Some(0));
+        assert_eq!(statement_timeout_ms("30 seconds"), None);
+        assert_eq!(statement_timeout_ms("abc"), None);
     }
 
     #[test]

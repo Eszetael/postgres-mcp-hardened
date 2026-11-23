@@ -24,7 +24,7 @@
 //! The request clock is deliberately "time to first response byte", not "time to finish the
 //! headers": below HTTP there is no telling where the headers end, and the response is the one
 //! event that proves the request was complete. Legitimate requests stay well inside it because
-//! `statement_timeout` is 30s by default.
+//! the start-up check refuses a budget that does not exceed `statement_timeout` by more than 10 s.
 
 use axum::serve::Listener;
 use std::collections::HashMap;

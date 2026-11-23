@@ -1613,7 +1613,7 @@ docker exec acc_pg psql -U postgres -qc "CREATE ROLE acc_rv LOGIN PASSWORD 'rv';
 r=$( (echo "$INIT"; sleep 4; echo "$QCALL"; sleep 2) | env DATABASE_URL="postgres://acc_rv:rv@127.0.0.1:$PGPORT_ACC/postgres" MCP_REDACT_COLUMNS=email MCP_REDACT_REQUIRE_REVOKE=1 timeout 12 "$BIN" --stdio 2>/dev/null)
 case "$r" in *'"id":1'*'"result"'*) case "$(echo "$r" | grep '"id":2')" in *'"result"'*) ok "a revoked column over stdio: initialize at once, queries after the check";; *) no "query refused after verification (stdio)" "$r";; esac;; *) no "initialize refused (stdio, revoked role)" "$r";; esac
 # G4: a connection that starts a request and never finishes it is closed
-start DATABASE_URL="$URL" MCP_CONN_TIMEOUT_SECS=3
+start DATABASE_URL="$URL" MCP_CONN_TIMEOUT_SECS=3 MCP_STATEMENT_TIMEOUT=0
 python3 - "$PORT" <<'PY4' && ok "a stalled connection is closed after MCP_CONN_TIMEOUT_SECS" || no "a stalled connection was left open" ""
 import socket, sys, time
 s = socket.socket(); s.settimeout(1); s.connect(("127.0.0.1", int(sys.argv[1])))
@@ -1630,7 +1630,7 @@ sys.exit(1)
 PY4
 stop
 # R2 (0.1.12 review): one address holding every slot and pinging each one; /health must keep answering
-start DATABASE_URL="$URL" MCP_MAX_CONNECTIONS=40 MCP_CONN_TIMEOUT_SECS=10
+start DATABASE_URL="$URL" MCP_MAX_CONNECTIONS=40 MCP_CONN_TIMEOUT_SECS=10 MCP_STATEMENT_TIMEOUT=0
 python3 - "$PORT" <<'PY5' && ok "one address cannot hold every connection: /health answers throughout" || no "one address starved /health" ""
 import socket, sys, time
 port = int(sys.argv[1])
@@ -1654,7 +1654,7 @@ PY5
 grep -q "MCP_MAX_CONNECTIONS_PER_IP (8)" /tmp/acc_$PORT.log && ok "and the operator is told why connections are being closed" || no "no warning about the per-address cap" "$(tail -3 /tmp/acc_$PORT.log)"
 stop
 # R3: pipelining requests and never reading the answers no longer keeps a connection past the budget
-start DATABASE_URL="$URL" MCP_CONN_TIMEOUT_SECS=3
+start DATABASE_URL="$URL" MCP_CONN_TIMEOUT_SECS=3 MCP_STATEMENT_TIMEOUT=0
 python3 - "$PORT" <<'PY6' && ok "a client that never reads its responses is closed within the budget" || no "a non-reading client outlived the budget" ""
 import socket, sys, time
 s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
@@ -1669,6 +1669,11 @@ while time.time() - t0 < 12:
 sys.exit(1)
 PY6
 stop
+# R9 (0.1.12 review): a connection budget shorter than the statement timeout cut long queries off unanswered
+r=$(env DATABASE_URL="$URL" MCP_CONN_TIMEOUT_SECS=20 MCP_ADDR=127.0.0.1:$((PORT+45)) timeout 5 "$BIN" 2>&1; echo "rc=$?")
+case "$r" in *"must exceed the statement timeout"*rc=2*) ok "MCP_CONN_TIMEOUT_SECS not above statement_timeout + 10 s stops the start";; *) no "a budget shorter than the statement timeout was accepted" "$r";; esac
+r=$(env DATABASE_URL="$URL" MCP_CONN_TIMEOUT_SECS=45 MCP_ADDR=127.0.0.1:$((PORT+46)) timeout 3 "$BIN" 2>&1; echo "rc=$?")
+case "$r" in *"must exceed"*) no "a sufficient budget was refused" "$r";; *) ok "and 45 s over the default 30 s statement timeout starts";; esac
 r=$(env DATABASE_URL="$URL" MCP_MAX_CONNECTIONS_PER_IP=1.5 MCP_ADDR=127.0.0.1:$((PORT+44)) timeout 5 "$BIN" 2>&1; echo "rc=$?")
 case "$r" in *"MCP_MAX_CONNECTIONS_PER_IP must be a whole number"*rc=2*) ok "MCP_MAX_CONNECTIONS_PER_IP that is not a whole number stops the start";; *) no "bad MCP_MAX_CONNECTIONS_PER_IP accepted" "$r";; esac
 # G11/G12: the role check sees column grants, sequences, and the groups a NOINHERIT role may become
