@@ -818,14 +818,19 @@ impl Visitor for SecurityScanner {
                             }
                     )
                 });
-                if whole_row
-                    && !f
-                        .name
-                        .0
-                        .last()
-                        .and_then(|n| n.as_ident())
-                        .is_some_and(|n| n.value.eq_ignore_ascii_case("count"))
-                {
+                // `count(*)` and `count(t.*)` count rows and carry no value out. `count(DISTINCT t.*)`
+                // does: it counts DISTINCT rows, so it answers "are these two rows equal" over the
+                // redacted column too, and a binary search on that is a read. DISTINCT turns the one
+                // exception into a refusal.
+                let distinct = matches!(&f.args, FunctionArguments::List(l)
+                    if matches!(l.duplicate_treatment, Some(sqlparser::ast::DuplicateTreatment::Distinct)));
+                let is_count = f
+                    .name
+                    .0
+                    .last()
+                    .and_then(|n| n.as_ident())
+                    .is_some_and(|n| n.value.eq_ignore_ascii_case("count"));
+                if whole_row && !(is_count && !distinct) {
                     self.evasion =
                         Some("serialising a whole row through a wildcard argument".into());
                     return ControlFlow::Break(());
@@ -1520,7 +1525,6 @@ fn is_known_read(name: &str) -> bool {
         "pg_visible_in_snapshot",
         "pg_settings_get_flags",
         "pg_show_all_settings",
-        "pg_show_all_file_settings",
         "pg_tablespace_databases",
         "pg_partition_tree",
         "pg_partition_root",
@@ -1832,6 +1836,24 @@ const DENY_FAMILIES: &[&str] = &[
     "pg_rotate_", // konfiguracja/logi serwera
     "pg_ls_",
     "pg_file_",
+    // Server configuration in its other spellings. `pg_file_settings` was refused while
+    // `pg_show_all_file_settings()` (the function behind it) and the views `pg_hba_file_rules` and
+    // `pg_ident_file_mappings` went through: one fact, three doors, one closed.
+    "pg_show_all_file_settings",
+    "pg_hba_file_",
+    "pg_ident_file_",
+    // The view and the function of the extension are the same data: the text of every statement the
+    // server ran, literals included, so a redacted value typed into somebody's WHERE clause comes
+    // back out. `top_queries` reads it through the server's own connection instead.
+    "pg_stat_statements",
+    // `pg_replication_slots` was refused through the `pg_replication_` family while the function
+    // behind it, `pg_get_replication_slots()`, was not; `pg_config` lists the build's install paths
+    // and was open as a view while the function was refused. Found by walking every catalogue view
+    // against the function it is built on (0.1.12), so the pairs agree.
+    "pg_get_replication_slots",
+    "pg_config",
+    // closes connections held by this session's foreign servers: a side effect
+    "postgres_fdw_disconnect",
     "pg_write_",
     "pg_logdir_", // server filesystem
     "gin_clean_",
@@ -2430,6 +2452,27 @@ mod tests {
         assert!(!count.contains("LIMIT"), "count should be skipped: {count}");
     }
 
+    /// What reaches PostgreSQL is `enforce_limit`'s reserialisation, not the caller's text, so a
+    /// statement that parses but serialises into something PostgreSQL rejects fails only at the
+    /// database, after every check here said yes. Round-trip: parse, render, parse again, and the
+    /// rendering must itself be accepted.
+    #[test]
+    fn what_we_send_to_the_database_parses_again() {
+        for sql in [
+            "SELECT 1 x UNION ALL TABLE seq",
+            "SELECT 1 UNION SELECT 2 ORDER BY 1",
+            "(SELECT 1) UNION ALL (SELECT 2)",
+            "VALUES (1), (2)",
+            "WITH c AS (SELECT 1 UNION ALL SELECT 2) SELECT * FROM c",
+        ] {
+            let sent = enforce_limit(sql, 100).unwrap_or_else(|e| panic!("{sql}: {e}"));
+            let again = Parser::parse_sql(&PostgreSqlDialect {}, &sent).unwrap_or_else(|e| {
+                panic!("{sql} was sent as `{sent}`, which does not parse: {e}")
+            });
+            assert_eq!(again.len(), 1, "{sent}");
+        }
+    }
+
     /// Only statements that return ONE row skip the limit. These looked like counts and were not.
     #[test]
     fn a_projection_that_only_resembles_a_count_still_gets_a_limit() {
@@ -2457,6 +2500,16 @@ mod adversarial {
 
     // Attack vectors: EVERY one must return Err(ValidationError)
     const MUST_REJECT: &[&str] = &[
+        // one fact, one answer: the function, the view and its siblings (0.1.12 audit)
+        "SELECT * FROM pg_show_all_file_settings()",
+        "SELECT * FROM LATERAL pg_show_all_file_settings() x",
+        "SELECT * FROM pg_hba_file_rules",
+        "SELECT * FROM pg_ident_file_mappings",
+        "SELECT * FROM pg_file_settings",
+        "SELECT * FROM pg_stat_statements",
+        "SELECT postgres_fdw_disconnect_all()",
+        "SELECT * FROM pg_get_replication_slots()",
+        "SELECT * FROM pg_config",
         // current_setting answers what SHOW refuses (0.1.12 audit F10).
         "SELECT current_setting('data_directory')",
         "SELECT current_setting('SSL_KEY_FILE')",
@@ -3001,6 +3054,25 @@ mod join_oracle_tests {
                 ControlFlow::<()>::Continue(())
             });
             assert_eq!(found, want, "{sql}");
+        }
+    }
+
+    /// `count(DISTINCT s.*)` compares whole rows for equality, redacted column included (0.1.12).
+    #[test]
+    fn distinct_over_a_whole_row_is_refused_but_a_plain_count_is_not() {
+        for sql in [
+            "SELECT count(DISTINCT s.*) FROM staff s",
+            "SELECT count(DISTINCT staff.*) FROM staff",
+            "SELECT array_agg(s.*) FROM staff s",
+        ] {
+            assert!(refusal_with_redaction(sql).is_some(), "{sql}");
+        }
+        for sql in [
+            "SELECT count(*) FROM staff",
+            "SELECT count(s.*) FROM staff s",
+            "SELECT count(DISTINCT first_name) FROM staff",
+        ] {
+            assert!(refusal_with_redaction(sql).is_none(), "{sql}");
         }
     }
 
