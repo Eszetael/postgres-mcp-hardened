@@ -776,6 +776,27 @@ impl Visitor for SecurityScanner {
             _ => {}
         }
         if let Expr::Function(f) = expr {
+            // `SHOW data_directory` is refused; `SELECT current_setting('data_directory')` answered
+            // the same question. Only a literal name can be read here (`current_setting('data_' ||
+            // 'directory')` is not), which is why `cost_guard` also refuses the function itself
+            // while a surface is configured, and why `pg_settings` is documented as the way round.
+            if last_part_name(&f.name).as_deref() == Some("current_setting") {
+                if let FunctionArguments::List(l) = &f.args {
+                    if let Some(FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::Value(v)))) =
+                        l.args.first()
+                    {
+                        if let Value::SingleQuotedString(name) = &v.value {
+                            let name = name.to_lowercase();
+                            if SENSITIVE_SHOW_VARS.contains(&name.as_str()) {
+                                self.hit = Some(format!(
+                                    "current_setting('{name}') (server layout, like SHOW {name})"
+                                ));
+                                return ControlFlow::Break(());
+                            }
+                        }
+                    }
+                }
+            }
             // `t.*` as a function argument is a FunctionArgExpr, not an Expr, so the whole-row check
             // never saw `ROW(t.*)::text` or `to_jsonb(t.*)::text` — both of which flatten the record
             // into one string and carry the redacted column out inside it. In a plain projection
@@ -2436,6 +2457,10 @@ mod adversarial {
 
     // Attack vectors: EVERY one must return Err(ValidationError)
     const MUST_REJECT: &[&str] = &[
+        // current_setting answers what SHOW refuses (0.1.12 audit F10).
+        "SELECT current_setting('data_directory')",
+        "SELECT current_setting('SSL_KEY_FILE')",
+        "SELECT current_setting('archive_command', true)",
         // SQL passed as TEXT: the AST cannot see inside a string literal, so nothing this validator
         // enforces applies to what these run. Live proof before the fix: server files read, the data
         // directory listed, a catalog-writing function executed, two statements from one call.
@@ -2598,6 +2623,9 @@ mod adversarial {
 
     // Legitimate reads: EVERY one must return Ok(())
     const MUST_ALLOW: &[&str] = &[
+        // an ordinary setting stays readable
+        "SELECT current_setting('statement_timeout')",
+        "SELECT current_setting('search_path')",
         r#"SELECT * FROM users"#,
         r#"SELECT a,b FROM t WHERE x>1 ORDER BY a LIMIT 10"#,
         r#"WITH r AS (SELECT 1 AS n) SELECT * FROM r"#,
