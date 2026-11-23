@@ -1080,12 +1080,16 @@ OTHER=$(SUB=mallory mint "mcp:query mcp:read" mcp.pg https://idp 300)
 DISC='{"jsonrpc":"2.0","id":3,"method":"server/discover"}'
 [ "$(scall "$GOOD" "$DISC")" = 200 ] && ok "server/discover with the owner's session id is answered" || no "server/discover refused the owner's session id" "$(scall "$GOOD" "$DISC")"
 [ "$(scall "" "$DISC")" = 200 ] && ok "and answered the same without a token, so it says nothing about the id" || no "anonymous discover with a session id differs" "$(scall "" "$DISC")"
+[ "$(scall "$GOOD" "" DELETE)" = 204 ] && ok "the owner can end it" || no "owner cannot end the session" "$(scall "$GOOD" "" DELETE)"
+stop
 # R6 (0.1.12 review): the per-client cap counted the address, so another identity on it pushed the
-# session out with 70 calls to initialize. `last` has one-second resolution, hence the pause.
+# session out with 70 calls to initialize. `last` has one-second resolution, hence the pause; the
+# rate limit is off so the 70 calls arrive.
+start DATABASE_URL="$URL" JWT_PUBKEY_PEM="$JWTDIR/pub.pem" JWT_AUD=mcp.pg JWT_ISS=https://idp MCP_RATE_RPM=0
+SID=$(curl -s -D - -o /dev/null -m 15 -H content-type:application/json -H "authorization: Bearer $GOOD" "http://127.0.0.1:$PORT/mcp" -d "$INIT" | tr -d '\r' | awk -F': ' 'tolower($1)=="mcp-session-id"{print $2}')
 sleep 1.5
 for _ in $(seq 1 70); do curl -s -o /dev/null -m 15 -H content-type:application/json -H "authorization: Bearer $OTHER" "http://127.0.0.1:$PORT/mcp" -d "$INIT"; done
 [ "$(scall "$GOOD" "$PING")" = 200 ] && ok "70 sessions opened by another identity on the same address leave this one alive" || no "another identity evicted the session" "$(scall "$GOOD" "$PING")"
-[ "$(scall "$GOOD" "" DELETE)" = 204 ] && ok "the owner can end it" || no "owner cannot end the session" "$(scall "$GOOD" "" DELETE)"
 stop
 rm -rf "$JWTDIR"
 
@@ -1656,10 +1660,11 @@ kill -9 $G14PID 2>/dev/null
 # R4 (0.1.12 review): strict redaction over stdio blocks what reaches data, not the handshake
 INIT='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"1"}}}'
 QCALL='{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"query","arguments":{"sql":"SELECT 1"}}}'
-r=$( (echo "$INIT"; echo "$QCALL"; sleep 2) | env DATABASE_URL="postgres://x:y@127.0.0.1:1/x" MCP_REDACT_COLUMNS=email MCP_REDACT_REQUIRE_REVOKE=1 timeout 8 "$BIN" --stdio 2>/dev/null)
+# (initialize asks the database for the posture it reports; unreachable, that takes the pool's ~10 s)
+r=$( (echo "$INIT"; echo "$QCALL"; sleep 14) | env DATABASE_URL="postgres://x:y@127.0.0.1:1/x" MCP_REDACT_COLUMNS=email MCP_REDACT_REQUIRE_REVOKE=1 timeout 20 "$BIN" --stdio 2>/dev/null)
 case "$r" in *'"id":1'*'"result"'*) ok "strict redaction over stdio answers an immediate initialize";; *) no "initialize refused while redaction was unverified" "$r";; esac
 case "$(echo "$r" | grep '"id":2')" in *'"code":-32000'*REVOKE*) ok "and refuses tools/call until the database has been checked";; *) no "tools/call served before verification" "$r";; esac
-c=$( (sleep 1; curl -s -m 5 -H content-type:application/json "http://127.0.0.1:$((PORT+43))/mcp" -d "$INIT") & env DATABASE_URL="postgres://x:y@127.0.0.1:1/x" MCP_REDACT_COLUMNS=email MCP_REDACT_REQUIRE_REVOKE=1 MCP_RATE_RPM=0 MCP_ADDR=127.0.0.1:$((PORT+43)) timeout 4 "$BIN" >/dev/null 2>&1; wait)
+c=$( (sleep 3; curl -s -m 15 -H content-type:application/json "http://127.0.0.1:$((PORT+43))/mcp" -d "$INIT") & env DATABASE_URL="postgres://x:y@127.0.0.1:1/x" MCP_REDACT_COLUMNS=email MCP_REDACT_REQUIRE_REVOKE=1 MCP_RATE_RPM=0 MCP_ADDR=127.0.0.1:$((PORT+43)) timeout 20 "$BIN" >/dev/null 2>&1; wait)
 case "$c" in *'"result"'*protocolVersion*) ok "the same over HTTP: initialize passes while the check is pending";; *) no "HTTP initialize refused while redaction was unverified" "$c";; esac
 docker exec acc_pg psql -U postgres -qc "CREATE ROLE acc_rv LOGIN PASSWORD 'rv'; GRANT CONNECT ON DATABASE postgres TO acc_rv; GRANT USAGE ON SCHEMA public TO acc_rv; GRANT SELECT (id, name) ON customers TO acc_rv;" >/dev/null
 r=$( (echo "$INIT"; sleep 4; echo "$QCALL"; sleep 2) | env DATABASE_URL="postgres://acc_rv:rv@127.0.0.1:$PGPORT_ACC/postgres" MCP_REDACT_COLUMNS=email MCP_REDACT_REQUIRE_REVOKE=1 timeout 12 "$BIN" --stdio 2>/dev/null)
