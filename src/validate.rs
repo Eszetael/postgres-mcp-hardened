@@ -125,6 +125,12 @@ pub fn validate_readonly(sql: &str) -> Result<(), ValidationError> {
     // 0. Nothing invisible outside a literal. Before any rule that reasons about a name, because
     //    every one of them compares text a hidden character can quietly change.
     reject_invisible_outside_literals(sql)?;
+    // 0. No comment glued to an operator. sqlparser lexes `###/**/` and `>--` as one operator, while
+    //    PostgreSQL ends the operator where `/*` or `--` begins and reads the rest as a comment: the
+    //    operator checks then looked up a name that exists nowhere (`1 ###/**/ 1` ran `###`), and a
+    //    `--` comments out whatever this server puts after it on the same line. Found by the fuzzer
+    //    in the 0.1.12 review round.
+    reject_comment_in_operator(sql)?;
     // 1. The statement shape must be purely read-only (SELECT/WITH/EXPLAIN/SHOW).
     structural_readonly(&ast[0])?;
     // `ORDER BY x USING OPERATOR(s.op)`: sqlparser 0.63 parses it (0.62 did not), and it calls the
@@ -351,6 +357,26 @@ fn reject_invisible_outside_literals(sql: &str) -> Result<(), ValidationError> {
                  space, refused because it makes the text a reader sees and the text the parser \
                  sees disagree",
                 c as u32
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// See the call site: an operator token that contains `/*` or `--` means two different statements
+/// to sqlparser and to PostgreSQL.
+fn reject_comment_in_operator(sql: &str) -> Result<(), ValidationError> {
+    let Ok(tokens) = Tokenizer::new(&PostgreSqlDialect {}, sql).tokenize() else {
+        return Ok(()); // unlexable input is rejected by the parser
+    };
+    for t in &tokens {
+        let Token::CustomBinaryOperator(text) = t else {
+            continue;
+        };
+        if text.contains("/*") || text.contains("--") {
+            return Err(ValidationError::NotParseable(format!(
+                "the operator {text:?} runs into a comment; PostgreSQL would end the operator where \
+                 the comment starts and read the rest differently. Put a space before the comment"
             )));
         }
     }
@@ -1297,11 +1323,10 @@ fn folded_size_estimate(expr: &Expr) -> Option<u64> {
             _ => None,
         },
         // `a || b` concatenates, so the sizes add.
-        Expr::BinaryOp {
-            left,
-            op: BinaryOperator::StringConcat,
-            right,
-        } => {
+        Expr::BinaryOp { left, op, right }
+            if matches!(op, BinaryOperator::StringConcat)
+                || matches!(op, BinaryOperator::Custom(c) if pg_operator_name(c) == "||") =>
+        {
             let (a, b) = (folded_size_estimate(left)?, folded_size_estimate(right)?);
             Some(a.saturating_add(b).min(CAP))
         }
@@ -2558,6 +2583,10 @@ mod adversarial {
 
     // Attack vectors: EVERY one must return Err(ValidationError)
     const MUST_REJECT: &[&str] = &[
+        // a comment glued to an operator: one statement to sqlparser, another to PostgreSQL
+        "SELECT 1 ###/**/ 1",
+        "SELECT id FROM t ORDER BY id USING >--",
+        "SELECT id FROM t WHERE id >/**/ 0",
         // R15: a sort operator outside pg_catalog
         r#"SELECT id FROM t ORDER BY id USING OPERATOR(s.<<<)"#,
         r#"SELECT array_agg(id ORDER BY id USING OPERATOR(public.<<<)) FROM t"#,
@@ -2578,6 +2607,7 @@ mod adversarial {
         r#"SELECT current_setting(('data_directory'))"#,
         r#"SELECT current_setting(CAST('data_directory' AS text))"#,
         r#"SELECT current_setting('data_' || 'directory')"#,
+        r#"SELECT current_setting('data_' ||/*?*/ 'directory')"#,
         r#"SELECT current_setting(text('data_directory'))"#,
         // one fact, one answer: the function, the view and its siblings (0.1.12 audit)
         "SELECT * FROM pg_show_all_file_settings()",
@@ -3477,11 +3507,10 @@ fn literal_texts(e: &Expr) -> Vec<String> {
             raw.dedup();
             raw
         }
-        Expr::BinaryOp {
-            left,
-            op: BinaryOperator::StringConcat,
-            right,
-        } => {
+        Expr::BinaryOp { left, op, right }
+            if matches!(op, BinaryOperator::StringConcat)
+                || matches!(op, BinaryOperator::Custom(c) if pg_operator_name(c) == "||") =>
+        {
             let (l, r) = (literal_texts(left), literal_texts(right));
             let mut out = Vec::new();
             for a in &l {
@@ -3678,11 +3707,35 @@ fn probe_op() -> BinaryOperator {
     BinaryOperator::PGCustomBinaryOperator(vec!["pg_catalog".into(), "@@@@@".into()])
 }
 
+/// The operator name PostgreSQL's lexer reads from `s`. A multi-character operator ends where `/*`
+/// or `--` begins, and cannot end in `+` or `-` unless it also contains one of `~ ! @ # % ^ & | ` ?`.
+/// sqlparser lexes a custom operator greedily, so `1 ###/**/ 1` reached here as the operator
+/// `###/**/`, which exists nowhere, while PostgreSQL ran `###` (found by the fuzzer in the 0.1.12
+/// review round: it walked straight past the operator check).
+pub(crate) fn pg_operator_name(s: &str) -> String {
+    let end = ["/*", "--"]
+        .iter()
+        .filter_map(|p| s.find(p))
+        .min()
+        .unwrap_or(s.len());
+    let mut name = &s[..end];
+    if !name.contains(['~', '!', '@', '#', '%', '^', '&', '|', '`', '?']) {
+        while name.len() > 1 && (name.ends_with('+') || name.ends_with('-')) {
+            name = &name[..name.len() - 1];
+        }
+    }
+    name.to_string()
+}
+
 fn binary_symbol(op: &BinaryOperator) -> Option<(String, Option<String>)> {
+    if let BinaryOperator::Custom(c) = op {
+        let name = pg_operator_name(c);
+        return is_operator_symbol(&name).then_some((name, None));
+    }
     if let BinaryOperator::PGCustomBinaryOperator(parts) = op {
         return Some(match parts.as_slice() {
-            [o] => (o.clone(), None),
-            [s, o] => (o.clone(), Some(s.to_lowercase())),
+            [o] => (pg_operator_name(o), None),
+            [s, o] => (pg_operator_name(o), Some(s.to_lowercase())),
             // a name we cannot read is judged as qualified with a schema that matches nothing safe
             _ => (parts.join("."), Some(String::new())),
         });
@@ -3974,10 +4027,11 @@ pub(crate) fn order_by_using_operators(sql: &str) -> Vec<(String, Option<String>
                 }
                 let joined = inner.concat();
                 match joined.rsplit_once('.') {
-                    Some((s, o)) => {
-                        out.push((o.to_string(), Some(s.trim_matches('"').to_lowercase())))
-                    }
-                    None => out.push((joined, None)),
+                    Some((s, o)) => out.push((
+                        pg_operator_name(o),
+                        Some(s.trim_matches('"').to_lowercase()),
+                    )),
+                    None => out.push((pg_operator_name(&joined), None)),
                 }
             }
             Some(Token::LParen) | Some(Token::Word(_)) | None => {}
@@ -3992,7 +4046,7 @@ pub(crate) fn order_by_using_operators(sql: &str) -> Vec<(String, Option<String>
                     }
                 }
                 if !sym.is_empty() {
-                    out.push((sym, None));
+                    out.push((pg_operator_name(&sym), None));
                 }
             }
         }
@@ -4015,6 +4069,13 @@ mod operator_site_tests {
     fn every_way_of_naming_an_operator_is_found() {
         let has = |sql: &str, sym: &str| syms(sql).iter().any(|(s, _, _)| s == sym);
         assert!(has("SELECT 1 ### 1", "###"));
+        // a comment glued to a custom operator is not part of its name (sqlparser lexes it in)
+        assert!(has("SELECT 1 ###/**/ 1", "###"));
+        assert!(has("SELECT 1 ###/*?*/ 1", "###"));
+        assert_eq!(pg_operator_name("<<<-"), "<<<");
+        assert_eq!(pg_operator_name("@-"), "@-");
+        assert_eq!(pg_operator_name("||/*?*/"), "||");
+        assert_eq!(pg_operator_name("###--x"), "###");
         assert!(has("SELECT a FROM t WHERE a = 1", "="));
         assert!(has("SELECT a FROM t WHERE a IN (1, 2)", "="));
         assert!(has("SELECT a FROM t WHERE a NOT IN (1, 2)", "<>"));

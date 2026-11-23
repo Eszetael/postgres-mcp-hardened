@@ -311,8 +311,11 @@ fn comment_junk(rng: &mut Rng, n: usize) -> String {
 /// so the mutation would change semantics and produce false findings.
 fn is_token_boundary(sql: &str, at: usize) -> bool {
     let ident = |c: char| c.is_alphanumeric() || c == '_' || c == '$';
+    // Between two operator characters is inside an operator: `|/**/|` is not `||` but two `|`, a
+    // different statement, which the checks then rightly did not treat as the seed.
+    let op = |c: char| "+-*/<>=~!@#%^&|`?".contains(c);
     match (sql[..at].chars().next_back(), sql[at..].chars().next()) {
-        (Some(p), Some(n)) => !(ident(p) && ident(n)),
+        (Some(p), Some(n)) => !(ident(p) && ident(n)) && !(op(p) && op(n)),
         _ => true,
     }
 }

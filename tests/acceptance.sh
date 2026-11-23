@@ -1549,7 +1549,7 @@ CREATE FUNCTION public.acc_fake_eq(text,int) RETURNS bool LANGUAGE sql IMMUTABLE
 CREATE OPERATOR public.= (LEFTARG=text, RIGHTARG=int, FUNCTION=public.acc_fake_eq);
 CREATE EXTENSION IF NOT EXISTS citext;
 SQL
-for q in "SELECT 1 ### 1" "SELECT 1 OPERATOR(acc_ext.<<<) 1" "SELECT id FROM customers WHERE id ### 1 > 0" "SELECT name FROM customers WHERE name = 1" "SELECT id FROM customers ORDER BY id USING OPERATOR(acc_ext.<<<)"; do
+for q in "SELECT 1 ### 1" "SELECT 1 OPERATOR(acc_ext.<<<) 1" "SELECT id FROM customers WHERE id ### 1 > 0" "SELECT name FROM customers WHERE name = 1" "SELECT id FROM customers ORDER BY id USING OPERATOR(acc_ext.<<<)" "SELECT 1 ###/**/ 1"; do
   r=$(tool query "{\"sql\":\"$q\"}" | body)
   case "$r" in ERROR:*operator*) ok "surface: refused an operator over a function outside pg_catalog: $q";; *) no "operator bypassed the surface: $q" "$r";; esac
 done
