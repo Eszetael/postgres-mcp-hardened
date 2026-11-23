@@ -366,7 +366,16 @@ pub(crate) async fn mcp_handler(
     // Carries the revision this session agreed on at `initialize`, so a request that arrives
     // without the header is answered under the contract the client actually negotiated.
     let mut session_rev: Option<protocol::Rev> = None;
-    if let Some(sid) = headers.get("mcp-session-id").and_then(|v| v.to_str().ok()) {
+    // `server/discover` answers without credentials (`enforce_auth` gives it no identity), so it
+    // cannot be matched to a session's owner: the owner's own id came back as 404 (R10 of the
+    // 0.1.12 review). It neither needs nor touches the session, and answering it the same way
+    // with any id or none keeps it from saying whether an id exists.
+    let is_discover = req.get("method").and_then(|v| v.as_str()) == Some("server/discover");
+    if let Some(sid) = headers
+        .get("mcp-session-id")
+        .and_then(|v| v.to_str().ok())
+        .filter(|_| !is_discover)
+    {
         let mut known = state.sessions.write().await;
         match known.get_mut(sid) {
             // A session belongs to the identity that opened it. Presenting another valid token with

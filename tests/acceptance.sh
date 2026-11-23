@@ -1076,6 +1076,10 @@ OTHER=$(SUB=mallory mint "mcp:query mcp:read" mcp.pg https://idp 300)
 [ "$(scall "$OTHER" "$PING")" = 404 ] && ok "another valid identity presenting that id is told it is unknown" || no "session usable by another identity" "$(scall "$OTHER" "$PING")"
 [ "$(scall "$OTHER" "" DELETE)" = 404 ] && ok "and cannot end it" || no "another identity ended the session" "$(scall "$OTHER" "" DELETE)"
 [ "$(scall "$GOOD" "$PING")" = 200 ] && ok "which is still alive afterwards" || no "session lost" "$(scall "$GOOD" "$PING")"
+# R10 (0.1.12 review): server/discover with the owner's own session id was a 404
+DISC='{"jsonrpc":"2.0","id":3,"method":"server/discover"}'
+[ "$(scall "$GOOD" "$DISC")" = 200 ] && ok "server/discover with the owner's session id is answered" || no "server/discover refused the owner's session id" "$(scall "$GOOD" "$DISC")"
+[ "$(scall "" "$DISC")" = 200 ] && ok "and answered the same without a token, so it says nothing about the id" || no "anonymous discover with a session id differs" "$(scall "" "$DISC")"
 # R6 (0.1.12 review): the per-client cap counted the address, so another identity on it pushed the
 # session out with 70 calls to initialize. `last` has one-second resolution, hence the pause.
 sleep 1.5
