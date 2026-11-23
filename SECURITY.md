@@ -60,11 +60,13 @@ Verify a log with `postgres-mcp-hardened --verify-audit <file>`. Be precise abou
 
 - **Modified entry** — detected (hash mismatch, with the line number).
 - **Entry removed from the middle** — detected (broken link and a gap in `seq`).
-- **Unsigned entries after signed ones** (the signature stripped from a recomputed tail) — detected
+- **Unsigned entries after signed ones** (the signature stripped from a recomputed tail): detected
   when the key is given: the first entry without a key fingerprint after a signed one is refused,
   and so is a log in which nothing is signed. A log may begin unsigned (the key came later); it may
   not go back. The mode printed (`HMAC-SHA256` or `SHA-256, unkeyed`) is read from the entries.
-- **Head cut off** — detected: a log that does not start at entry 1 is refused.
+- **Head cut off**: a log that does not start at entry 1 is refused. With the key that settles it,
+  because the remaining entries cannot be recomputed. Without the key, whoever cuts the head can
+  renumber `seq` from 1 and recompute the chain, and the result verifies.
 - **Tail cut off, or the file emptied** — *not* detectable from the file alone: what remains is
   internally consistent, and cutting it needs no key. The only defence is an anchor kept elsewhere.
   Every verification prints the last hash for exactly this purpose — store it outside the host

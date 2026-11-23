@@ -4,16 +4,17 @@
 
 Our own audit of the released 0.1.11, in two halves: a read of the modules the first audit left out
 (transport, protocol, rate limiter, audit log, start-up, posture, setup SQL) and a live pass of 618
-probes over PostgreSQL 13, 14, 15, 16, 17 and 18, with `dblink`, `tablefunc`, `postgres_fdw`,
-`pgcrypto`, `pg_stat_statements`, `pg_trgm` and `hstore` installed for real. The live pass found no
-new way to read a redacted column on any version. The read of the code found what the live pass could
+probes: 550 over PostgreSQL 13, 14, 15, 17 and 18, and 68 over 16. No extension was installed for
+that pass. It found no new way to read a redacted column on any of those versions. The read of the code found what the live pass could
 not: the controls around the controls.
 
 The pattern is the one 0.1.11 named, one level up: a fix applied where the problem was reported and
 not to its copies. The rate limiter lost its `clear()` and the session table kept one; the setup SQL
 learned `comment_safe` and the repair text printed at start-up did not; `X-Forwarded-For` was read by
-its first line and so were three other headers. Every fix below was searched for copies of itself
-before it was closed.
+its first line and so were three other headers. An independent review before the tag found the same
+pattern in the fixes themselves (a password masker that still stopped at `/`, a `reg*` check that
+also caught a user's `region` type, a header rule that forgot its own `initialize` exception); what
+it found is the last part of this entry, and each commit of that round names the copies it searched.
 
 ### Two `X-Forwarded-For` lines gave the client its own rate-limit bucket
 
@@ -28,8 +29,8 @@ one is now a `400`, and a header that is not text no longer counts as absent.
 
 When 10,000 sessions were live, the next `initialize` cleared the table. Anyone able to send 10,000
 of them ended every other client's session (their next request: `404`). The rate limiter had the same
-`clear()` fixed in 0.1.8. The table now drops its oldest quarter, and one client key may hold 64
-sessions. A session is also looked up only after authentication and only for the identity that opened
+`clear()` fixed in 0.1.8. The table now drops its oldest quarter, and one identity on one client key may hold
+64 sessions. A session is also looked up only after authentication and only for the identity that opened
 it: another valid token presenting the id is told it does not exist, and cannot end it either.
 
 ### The password reached the audit log in six of seven spellings of `DATABASE_URL`
@@ -53,9 +54,10 @@ mode in the output comes from the entries, not from the environment. Also in the
 - An empty `MCP_AUDIT_HMAC_KEY` (what compose makes of an unset `${VAR}`) hid `MCP_AUDIT_HMAC_KEY_FILE`
   and the log ran unkeyed with a key file beside it. A key file holding only a newline passed the
   start-up check and became no key.
-- `<log>.hwm` is authenticated with the key when there is one; the removal of the log, a log that
-  does not start at entry 1, and a mark that does not match are reported in the chain's own
-  `startup` record (`chain_anomaly`), not only on stderr.
+- `<log>.hwm` is authenticated with the key when there is one. The removal of the log, a mark that
+  does not match the log, and (with a key) a missing mark are reported in the chain's own `startup`
+  record (`chain_anomaly`), not only on stderr. A log that does not start at entry 1 is refused by
+  `--verify-audit`.
 - A line is accepted only if it serialises back to itself, so `"caller":"alice"` placed before the
   real `"caller":"bob"` no longer verifies while a grep reads alice.
 
@@ -89,22 +91,31 @@ changes every role.
 ### Slow connections
 
 Nothing closed a connection that sent a request one byte at a time: 2,000 of them were still open
-five minutes later and the descriptor count grew one for one. `MCP_MAX_CONNECTIONS` (1024) and
-`MCP_CONN_TIMEOUT_SECS` (120) bound it; a connection that has not produced its first response byte
-within the budget, or has been idle for it, is closed. `/health` kept answering at 2,000, so this is
-a bound and not the report of an outage.
+five minutes later and the descriptor count grew one for one. Three settings bound it now.
+`MCP_MAX_CONNECTIONS` (1024) caps open connections. `MCP_MAX_CONNECTIONS_PER_IP` (the larger of 8 and
+an eighth of that) caps one TCP peer address; a new connection past it closes that address's
+longest-idle one. `MCP_CONN_TIMEOUT_SECS` (120) is the time a started request has to produce its
+first response byte, and the time a response may make no progress because the client is not
+reading. A connection waiting for its next request is closed after 15 s, and none lives longer than
+ten budgets. Many addresses can still fill the table; a public listener belongs behind a reverse
+proxy with its own limits.
 
 ### Server configuration and existence, answered in one place
 
 - `pg_show_all_file_settings()`, `pg_hba_file_rules`, `pg_ident_file_mappings`, `pg_get_replication_slots()`
-  and `pg_config` each answered what a sibling was refused for; the view/function pairs of
-  `pg_catalog` now agree. `pg_stat_statements` (the view and the function) and
-  `postgres_fdw_disconnect*` are refused: the first returns the text of other sessions' statements,
-  literals included.
-- `current_setting('data_directory')` and the other names `SHOW` refuses are refused.
+  and `pg_config` each answered what a sibling was refused for. Of the 13 view/function pairs walked,
+  these five were open on one side; they are now refused on both, by full name. The pairs open on
+  both sides stay open. `pg_stat_statements` (the view and the function) and
+  `postgres_fdw_disconnect`/`postgres_fdw_disconnect_all` are refused: the first returns the text of
+  other sessions' statements, literals included.
+- `current_setting('data_directory')` and the other names `SHOW` refuses are refused, in every
+  spelling of the literal: `E''`, `$$..$$`, `U&''`, a cast, parentheses, `text('...')` and a
+  concatenation of literals.
 - With a surface allowlist: `to_regclass` and its siblings, `has_*_privilege`, `col_description`,
-  `obj_description`, `shobj_description` and a cast to `regclass`, `regtype` and the other `reg*`
-  types are refused. Each answered whether a relation outside the surface exists.
+  `obj_description`, `shobj_description`, a cast to one of the eleven `reg*` types (also as an array,
+  `'{secret.t}'::regclass[]`), the same lookup written as a call (`regclass('secret.t')`,
+  `regclassin('secret.t')`), `currval('secret.t')` and `SHOW ALL` are refused. Each answered whether
+  a relation outside the surface exists, or listed what `pg_settings` lists.
 - `count(DISTINCT t.*)` is refused while redaction is on. `count(*)` and `count(t.*)` are not.
 - A projection that only resembles a count (`count(*) OVER ()`, `count(*)` with `GROUP BY`,
   `EXISTS (...)` with a `FROM`) gets a `LIMIT`.
@@ -120,12 +131,63 @@ a bound and not the report of an outage.
   mutation that wraps a table function in `LATERAL`, `CROSS JOIN LATERAL` and `WITH ORDINALITY`.
 - `release.yml` no longer carries `NODE_AUTH_TOKEN`; npm publishes by trusted publishing.
 
+### Found by an independent review before the tag
+
+The review re-ran every fix above against its own reproductions. What it found, each fixed with a
+test and a case in `tests/acceptance.sh`:
+
+- **An operator over a function outside `pg_catalog` passed the surface allowlist (also in 0.1.11
+  and earlier).** With `MCP_ALLOW_SCHEMAS=public`, `SELECT public.peek(1,1)` was refused, but
+  `CREATE OPERATOR public.### (LEFTARG=int, RIGHTARG=int, FUNCTION=public.peek)` made
+  `SELECT 1 ### 1` return what the `SECURITY DEFINER` function read from a schema the role cannot
+  see. The same went through `OPERATOR(ext.<<<)`, `ORDER BY ... USING` and, for an `IMMUTABLE`
+  function, through `EXPLAIN`, whose plan printed the folded value. With an allowlist active, every
+  operator a statement uses (written, or implied by `IN`, `BETWEEN`, `LIKE`, `CASE x WHEN`, `NULLIF`,
+  `IS DISTINCT FROM`, `ANY`/`ALL`) is now resolved the way PostgreSQL resolves it, from the operand
+  types PostgreSQL reports, and one whose function lies outside `pg_catalog` is refused unless that
+  function is in `MCP_ALLOW_FUNCTIONS`. `=`, `<`, `||`, `@>`, `->>`, `~~`, `&&` and the range
+  operators are unaffected, also when another schema defines the same symbol for other operand types
+(tested with `citext` and `hstore` installed, and with `=`, `@>` and `~~` defined that way). An
+  operator reached through an operator class (sorting or grouping a user-defined type) is not
+  checked.
+- **A password with `/`, `?`, `#` or `;` reached the audit log.** PostgreSQL's driver takes the
+  credentials up to the first `@` of the whole string, so `postgres://u:Zm9v/YmFy+cXV4@host/db`
+  connects, and the masker, which stopped at `/`, wrote it out. Of the 37 spellings in the review,
+  10 leaked; none does now, and a property test checks that whatever the driver accepts loses the
+  password the driver reads. `;` separates entries only in `MCP_DATABASE_URLS`, and parameter names
+  are percent-decoded before they are compared (`?pass%77ord=`).
+- **One address held every connection.** 1,024 connections from one client, each sending
+  `GET /health` every few seconds, kept the table full and `/health` unanswered. Now `/health`
+  answers throughout (the per-address cap above). A client that pipelined requests and never read
+  the answers outlived its budget, because the clock was looked at only while reading; it is closed
+  within the budget now.
+- **Strict redaction refused the handshake over stdio.** With `MCP_REDACT_REQUIRE_REVOKE=1` an
+  `initialize` sent at once got `-32000`. Only methods that reach data wait for the check now;
+  `initialize`, `ping`, `tools/list` and notifications are answered.
+- **Deleting `<log>.hwm` hid a truncation even with a key.** A keyed log whose mark is missing is now
+  an anomaly. The opposite false alarms are gone too: a new log file, a key configured on an existing
+  log, a key rotation with the old key in `MCP_AUDIT_HMAC_KEYS_OLD`, and a keyed log written by
+  0.1.11 no longer report tampering (the second and fourth are a `chain_note`).
+- **Another identity on the same address pushed a session out.** Under OAuth, 70 calls to
+  `initialize` by bob removed alice's session. The 64-session cap counts one identity on one address.
+- **A cast to an array of `regclass` and `regclass('x')` still answered existence**, and a user's
+  type named `region` was refused as a `reg*` type. The list is exact, arrays count, and the name
+  checks run before the query is planned.
+- **A query allowed to run longer than `MCP_CONN_TIMEOUT_SECS` was cut off without an answer.** Over
+  HTTP the budget must now exceed the statement timeout by more than 10 s, or the server does not
+  start.
+- `server/discover` with the owner's own session id was a `404`; an `initialize` with a repeated
+  `MCP-Protocol-Version` was a `400`; an `X-Forwarded-For` line that is not text moved the client to
+  the peer's rate-limit bucket; `ORDER BY ... USING OPERATOR(s.op)`, which `sqlparser` 0.63 parses
+  and 0.62 did not, was accepted; the `pg_config` and `pg_stat_statements` entries were prefixes and
+  refused a user's `public.pg_configs` as a "side-effect function". All fixed.
+
 ### What this release does not claim
 
 `SELECT 1 x UNION ALL TABLE seq` is not a serialisation fault: PostgreSQL rejects it because a
-sequence has three columns. `pg_settings` still shows server configuration (documented), and the
-literal-only reach of `current_setting('data_' || 'directory')` stays outside the check; the
-surface allowlist closes it by refusing the function. `pg_get_backend_memory_contexts()` and
+sequence has three columns. Without a surface allowlist `pg_settings` and `SHOW ALL` still show server
+configuration (documented), and a name built by a function, `current_setting(lower('DATA_DIRECTORY'))`,
+is not read by the check; the surface allowlist closes both by refusing the function and the view. `pg_get_backend_memory_contexts()` and
 the other server-internals functions that return no user data are unchanged.
 
 ## 0.1.11 — 2026-11-14 — our own audit of the published 0.1.10
