@@ -1590,6 +1590,48 @@ while time.time() < end:
 sys.exit(1)
 PY4
 stop
+# R2 (0.1.12 review): one address holding every slot and pinging each one; /health must keep answering
+start DATABASE_URL="$URL" MCP_MAX_CONNECTIONS=40 MCP_CONN_TIMEOUT_SECS=10
+python3 - "$PORT" <<'PY5' && ok "one address cannot hold every connection: /health answers throughout" || no "one address starved /health" ""
+import socket, sys, time
+port = int(sys.argv[1])
+def health():
+    try:
+        s = socket.create_connection(("127.0.0.1", port), timeout=3)
+        s.sendall(b"GET /health HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+        return s.recv(15) == b"HTTP/1.1 200 OK"
+    except OSError:
+        return False
+socks = [socket.create_connection(("127.0.0.1", port)) for _ in range(40)]
+good = health()
+for _ in range(3):
+    for s in socks:
+        try: s.sendall(b"GET /health HTTP/1.1\r\nHost: x\r\n\r\n"); s.settimeout(0.2); s.recv(4096)
+        except OSError: pass
+    time.sleep(1)
+    good = good and health()
+sys.exit(0 if good else 1)
+PY5
+grep -q "MCP_MAX_CONNECTIONS_PER_IP (8)" /tmp/acc_$PORT.log && ok "and the operator is told why connections are being closed" || no "no warning about the per-address cap" "$(tail -3 /tmp/acc_$PORT.log)"
+stop
+# R3: pipelining requests and never reading the answers no longer keeps a connection past the budget
+start DATABASE_URL="$URL" MCP_CONN_TIMEOUT_SECS=3
+python3 - "$PORT" <<'PY6' && ok "a client that never reads its responses is closed within the budget" || no "a non-reading client outlived the budget" ""
+import socket, sys, time
+s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
+s.connect(("127.0.0.1", int(sys.argv[1]))); s.setblocking(False)
+req = b"GET /.well-known/mcp/server-card.json HTTP/1.1\r\nHost: x\r\n\r\n" * 200
+t0 = time.time()
+while time.time() - t0 < 12:
+    try: s.send(req)
+    except BlockingIOError: pass
+    except OSError: sys.exit(0 if time.time() - t0 < 9 else 1)
+    time.sleep(0.2)
+sys.exit(1)
+PY6
+stop
+r=$(env DATABASE_URL="$URL" MCP_MAX_CONNECTIONS_PER_IP=1.5 MCP_ADDR=127.0.0.1:$((PORT+44)) timeout 5 "$BIN" 2>&1; echo "rc=$?")
+case "$r" in *"MCP_MAX_CONNECTIONS_PER_IP must be a whole number"*rc=2*) ok "MCP_MAX_CONNECTIONS_PER_IP that is not a whole number stops the start";; *) no "bad MCP_MAX_CONNECTIONS_PER_IP accepted" "$r";; esac
 # G11/G12: the role check sees column grants, sequences, and the groups a NOINHERIT role may become
 docker exec -i acc_pg psql -U postgres -q -v ON_ERROR_STOP=1 <<'SQL' >/dev/null || { echo "fixture failed: gate roles 0.1.12"; exit 1; }
 CREATE ROLE acc_colup LOGIN PASSWORD 'c'; GRANT CONNECT ON DATABASE postgres TO acc_colup; GRANT USAGE ON SCHEMA public TO acc_colup;

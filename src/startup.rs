@@ -205,6 +205,7 @@ pub(crate) const KNOWN_VARS: &[&str] = &[
     "MCP_DATABASE_URLS",
     "MCP_FUZZ_VERBOSE",
     "MCP_MAX_CONNECTIONS",
+    "MCP_MAX_CONNECTIONS_PER_IP",
     "MCP_CONN_TIMEOUT_SECS",
     "MCP_MAX_COST",
     "MCP_MAX_INFLIGHT_PER_CLIENT",
@@ -690,9 +691,23 @@ pub(crate) fn preflight_config() {
         ("MCP_MAX_INFLIGHT_PER_CLIENT", true),
         ("MCP_MAX_COST", false),
         ("MCP_MAX_CONNECTIONS", false),
+        ("MCP_MAX_CONNECTIONS_PER_IP", false),
         ("MCP_CONN_TIMEOUT_SECS", false),
     ] {
         if let Ok(v) = std::env::var(var) {
+            // These three are read as whole numbers; "1e3" or "2.5" would pass a float check and
+            // then silently fall back to the default.
+            let whole = matches!(
+                var,
+                "MCP_MAX_CONNECTIONS" | "MCP_MAX_CONNECTIONS_PER_IP" | "MCP_CONN_TIMEOUT_SECS"
+            );
+            if whole
+                && v.trim().parse::<u64>().is_err()
+                && v.trim().parse::<f64>().is_ok_and(|n| n > 0.0)
+            {
+                fatal.push(format!("{} must be a whole number ({:?})", var, v));
+                continue;
+            }
             match v.trim().parse::<f64>() {
                 Ok(n) if n < 0.0 => fatal.push(format!("{} is negative ({})", var, v)),
                 Ok(n) if n == 0.0 && !allow_zero => {

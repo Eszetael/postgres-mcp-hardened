@@ -149,7 +149,8 @@ pub(crate) async fn run_http() {
     let listener = conn_limit::Limited::new(
         listener,
         conn_limit::max_connections(),
-        conn_limit::timeout(),
+        conn_limit::max_per_ip(),
+        conn_limit::Clocks::from_budget(conn_limit::timeout()),
     );
     if let Err(e) = axum::serve(
         listener,
