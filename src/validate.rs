@@ -2152,9 +2152,18 @@ fn is_count_or_exists(q: &Query) -> bool {
         SelectItem::ExprWithAlias { expr, .. } => expr,
         _ => return false,
     };
+    // Only a statement that returns ONE row needs no LIMIT. `count(*) OVER ()` and `count(*)` with
+    // GROUP BY return a row per input row or per group, and `SELECT EXISTS(...) FROM t` one row per
+    // row of t: each used to skip the limit because the projection merely looked like a count.
+    let one_row_aggregate =
+        matches!(&s.group_by, sqlparser::ast::GroupByExpr::Expressions(v, _) if v.is_empty());
     match expr {
-        Expr::Function(f) => last_part_name(&f.name).as_deref() == Some("count"),
-        Expr::Exists { .. } => true,
+        Expr::Function(f) => {
+            last_part_name(&f.name).as_deref() == Some("count")
+                && f.over.is_none()
+                && one_row_aggregate
+        }
+        Expr::Exists { .. } => s.from.is_empty(),
         _ => false,
     }
 }
@@ -2398,6 +2407,26 @@ mod tests {
             .unwrap()
             .to_uppercase();
         assert!(!count.contains("LIMIT"), "count should be skipped: {count}");
+    }
+
+    /// Only statements that return ONE row skip the limit. These looked like counts and were not.
+    #[test]
+    fn a_projection_that_only_resembles_a_count_still_gets_a_limit() {
+        for sql in [
+            "SELECT count(*) OVER () FROM users",
+            "SELECT EXISTS(SELECT 1) FROM users",
+            "SELECT count(*) FROM users GROUP BY id",
+        ] {
+            let out = enforce_limit(sql, 100).unwrap().to_uppercase();
+            assert!(out.contains("LIMIT 100"), "{sql} -> {out}");
+        }
+        for sql in [
+            "SELECT count(*) FROM users",
+            "SELECT EXISTS(SELECT 1 FROM users)",
+        ] {
+            let out = enforce_limit(sql, 100).unwrap().to_uppercase();
+            assert!(!out.contains("LIMIT"), "{sql} -> {out}");
+        }
     }
 }
 
