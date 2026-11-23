@@ -151,6 +151,9 @@ const WRITE_SEEDS: &[&str] = &[
     "SELECT current_setting($$hba_file$$)",
     "SELECT current_setting(('data_directory'::text))",
     "SELECT current_setting('data_' || 'directory')",
+    // a sort operator outside pg_catalog (R15, 0.1.12 review)
+    "SELECT id FROM users ORDER BY id USING OPERATOR(public.<<<)",
+    "SELECT array_agg(id ORDER BY id USING OPERATOR(ext.<<<)) FROM users",
 ];
 
 /// Corpus of legitimate READS — exercises I3/I4 (canonicalisation, cost routing) and panic freedom.

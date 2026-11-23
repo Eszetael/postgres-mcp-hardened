@@ -127,6 +127,18 @@ pub fn validate_readonly(sql: &str) -> Result<(), ValidationError> {
     reject_invisible_outside_literals(sql)?;
     // 1. The statement shape must be purely read-only (SELECT/WITH/EXPLAIN/SHOW).
     structural_readonly(&ast[0])?;
+    // `ORDER BY x USING OPERATOR(s.op)`: sqlparser 0.63 parses it (0.62 did not), and it calls the
+    // operator's function on every comparison of the sort. One outside pg_catalog is refused
+    // always, with or without a surface (R15 of the 0.1.12 review).
+    if let Some((op, schema)) = order_by_using_operators(sql)
+        .into_iter()
+        .find_map(|(o, s)| s.filter(|s| s != "pg_catalog").map(|s| (o, s)))
+    {
+        return Err(ValidationError::NotReadOnly(format!(
+            "ORDER BY ... USING OPERATOR({schema}.{op}) sorts with an operator outside pg_catalog, \
+             whose function this server cannot see inside"
+        )));
+    }
     // 2. Defence in depth: functions with SIDE EFFECTS (setval, dblink_exec, lo_export, pg_read_file…).
     //    We scan the AST (Expr::Function nodes and relation/table-function names in FROM), NOT the text —
     //    we read `ident.value`, so how a literal is rendered (quotes, $$…$$, E'…') and where comments sit
@@ -2546,6 +2558,10 @@ mod adversarial {
 
     // Attack vectors: EVERY one must return Err(ValidationError)
     const MUST_REJECT: &[&str] = &[
+        // R15: a sort operator outside pg_catalog
+        r#"SELECT id FROM t ORDER BY id USING OPERATOR(s.<<<)"#,
+        r#"SELECT array_agg(id ORDER BY id USING OPERATOR(public.<<<)) FROM t"#,
+        r#"SELECT row_number() OVER (ORDER BY id USING OPERATOR(s.<<<)) FROM t"#,
         // R14: the exact names stay refused, in any schema (an extension lives where it was created)
         r#"SELECT * FROM public.pg_stat_statements"#,
         r#"SELECT * FROM pg_config"#,
@@ -2739,6 +2755,8 @@ mod adversarial {
 
     // Legitimate reads: EVERY one must return Ok(())
     const MUST_ALLOW: &[&str] = &[
+        r#"SELECT id FROM t ORDER BY id USING <"#,
+        r#"SELECT id FROM t ORDER BY id USING OPERATOR(pg_catalog.<)"#,
         // R14: a user's table whose name merely starts like a refused catalogue object
         r#"SELECT * FROM public.pg_configs"#,
         r#"SELECT * FROM pg_stat_statements_archive"#,

@@ -1483,6 +1483,11 @@ c=$(curl -s -o /dev/null -w '%{http_code}' -m 10 -H content-type:application/jso
 # F2/F4: existence and privilege oracles, and current_setting, answer what SHOW refuses
 r=$(tool query '{"sql":"SELECT current_setting('"'"'data_directory'"'"')"}' | body)
 case "$r" in ERROR:*) ok "current_setting('data_directory') is refused like SHOW";; *) no "current_setting leaked the data directory" "$r";; esac
+# R15 (0.1.12 review): ORDER BY ... USING an operator outside pg_catalog
+r=$(tool query '{"sql":"SELECT id FROM customers ORDER BY id USING OPERATOR(public.<<<)"}' | body)
+case "$r" in ERROR:*USING*) ok "ORDER BY ... USING OPERATOR(public.<<<) is refused";; *) no "a sort operator outside pg_catalog was accepted" "$r";; esac
+r=$(tool query '{"sql":"SELECT id FROM customers ORDER BY id USING <"}' | body)
+case "$r" in ERROR:*) no "ORDER BY ... USING < refused" "$r";; *) ok "and ORDER BY ... USING < still works";; esac
 # R14 (0.1.12 review): a user's table named like a refused catalogue object is not refused
 docker exec acc_pg psql -U postgres -qc "CREATE TABLE IF NOT EXISTS public.pg_configs(k text); INSERT INTO public.pg_configs VALUES ('a');" >/dev/null 2>&1
 r=$(tool query '{"sql":"SELECT k FROM public.pg_configs"}' | body)
