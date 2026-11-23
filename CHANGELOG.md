@@ -1,5 +1,133 @@
 # Changelog
 
+## 0.1.12 — 2026-11-23 — a second audit of the published 0.1.11
+
+Our own audit of the released 0.1.11, in two halves: a read of the modules the first audit left out
+(transport, protocol, rate limiter, audit log, start-up, posture, setup SQL) and a live pass of 618
+probes over PostgreSQL 13, 14, 15, 16, 17 and 18, with `dblink`, `tablefunc`, `postgres_fdw`,
+`pgcrypto`, `pg_stat_statements`, `pg_trgm` and `hstore` installed for real. The live pass found no
+new way to read a redacted column on any version. The read of the code found what the live pass could
+not: the controls around the controls.
+
+The pattern is the one 0.1.11 named, one level up: a fix applied where the problem was reported and
+not to its copies. The rate limiter lost its `clear()` and the session table kept one; the setup SQL
+learned `comment_safe` and the repair text printed at start-up did not; `X-Forwarded-For` was read by
+its first line and so were three other headers. Every fix below was searched for copies of itself
+before it was closed.
+
+### Two `X-Forwarded-For` lines gave the client its own rate-limit bucket
+
+With `MCP_TRUST_PROXY=1` the limiter read the first line of the header, and a proxy that appends its
+own line (HAProxy `option forwardfor` does) leaves the client's line first. Two lines,
+`X-Forwarded-For: 8.8.8.1` and `X-Forwarded-For: 203.0.113.99`, were six `200`s in a row at
+`MCP_RATE_RPM=8 MCP_RATE_BURST=2`; now they are `200 200 429 429 429 429`. The same read of only the
+first line applied to `Mcp-Method`, `Mcp-Name` and `MCP-Protocol-Version`; a repeated or unreadable
+one is now a `400`, and a header that is not text no longer counts as absent.
+
+### Filling the session table logged everybody out
+
+When 10,000 sessions were live, the next `initialize` cleared the table. Anyone able to send 10,000
+of them ended every other client's session (their next request: `404`). The rate limiter had the same
+`clear()` fixed in 0.1.8. The table now drops its oldest quarter, and one client key may hold 64
+sessions. A session is also looked up only after authentication and only for the identity that opened
+it: another valid token presenting the id is told it does not exist, and cannot end it either.
+
+### The password reached the audit log in six of seven spellings of `DATABASE_URL`
+
+`?password=`, a password with an unencoded `@`, `password = x` with spaces, a quoted value with a
+space, `?sslpassword=` and `?PassWord=` all put the secret into the `startup` record, which was
+reproduced on 0.1.11. A keyword entry inside a `;`-separated `MCP_DATABASE_URLS` had the same fault
+and is covered by a test. `strip_password` was a cut on characters; it is now a URL parser and a
+tokenizer for libpq's keyword form.
+
+### The audit chain: a key was given and the verifier did not use it
+
+`--verify-audit` with `MCP_AUDIT_HMAC_KEY` accepted entries that had no `key_fp` as plain SHA-256. Cut
+an entry out, strip `key_fp` from what follows, recompute with SHA-256, and the output was
+`OK (HMAC-SHA256)`. That is the one attack the key exists to stop. An unsigned entry after a signed
+one is now `TAMPERED`, a log with no signed entry at all is refused when a key was given, and the
+mode in the output comes from the entries, not from the environment. Also in the chain:
+
+- The sequence number was drawn before the chain lock, so concurrent requests could write `6` before
+  `5` and the verifier called it a removal. Drawn under the lock now (8 threads, 800 entries, test).
+- An empty `MCP_AUDIT_HMAC_KEY` (what compose makes of an unset `${VAR}`) hid `MCP_AUDIT_HMAC_KEY_FILE`
+  and the log ran unkeyed with a key file beside it. A key file holding only a newline passed the
+  start-up check and became no key.
+- `<log>.hwm` is authenticated with the key when there is one; the removal of the log, a log that
+  does not start at entry 1, and a mark that does not match are reported in the chain's own
+  `startup` record (`chain_anomaly`), not only on stderr.
+- A line is accepted only if it serialises back to itself, so `"caller":"alice"` placed before the
+  real `"caller":"bob"` no longer verifies while a grep reads alice.
+
+### Redaction verification said "verified" when it had not asked
+
+If the catalogue query failed (database down, TLS error), the failure was skipped and the server
+printed "verified against the database, the connected role cannot read those columns anywhere". With
+`MCP_REDACT_REQUIRE_REVOKE=1` the check also ran in the background, so queries were served first.
+Failures now mean "could NOT verify" and a retry every five seconds, and in strict mode no query is
+answered, over HTTP or stdio, until the answer is in. The `REVOKE`/`GRANT` text it prints quotes
+every name, and puts them through `comment_safe` inside comments.
+
+### The start-up gate missed four ways to write
+
+`GRANT UPDATE (status)`, an `UPDATE` on a sequence, a writable view, and membership of a role that can
+`INSERT` (the generated role is `NOINHERIT`, and the check looked at the connected role's own
+privileges only) all left a role "read-only as far as the database is concerned" and exposed on
+`0.0.0.0`. The check now asks about every role the connected one may become and about column
+privileges and sequences. `CREATE` on a schema is not part of the gate, because PostgreSQL 14 and
+older give it to `PUBLIC` on `public` and every stock install would be refused; `--print-setup-sql`
+checks it instead. On Apify the report no longer calls the platform-authenticated listener
+anonymous.
+
+### `--print-setup-sql`
+
+The database name in the closing comment was not passed through `comment_safe`. The check that the
+role owns nothing used `'Reader'::regrole`, which folds to `reader`. The checks now include `CREATE`
+on schemas, with the one-line `REVOKE ... FROM PUBLIC` as a comment, not as a statement, because it
+changes every role.
+
+### Slow connections
+
+Nothing closed a connection that sent a request one byte at a time: 2,000 of them were still open
+five minutes later and the descriptor count grew one for one. `MCP_MAX_CONNECTIONS` (1024) and
+`MCP_CONN_TIMEOUT_SECS` (120) bound it; a connection that has not produced its first response byte
+within the budget, or has been idle for it, is closed. `/health` kept answering at 2,000, so this is
+a bound and not the report of an outage.
+
+### Server configuration and existence, answered in one place
+
+- `pg_show_all_file_settings()`, `pg_hba_file_rules`, `pg_ident_file_mappings`, `pg_get_replication_slots()`
+  and `pg_config` each answered what a sibling was refused for; the view/function pairs of
+  `pg_catalog` now agree. `pg_stat_statements` (the view and the function) and
+  `postgres_fdw_disconnect*` are refused: the first returns the text of other sessions' statements,
+  literals included.
+- `current_setting('data_directory')` and the other names `SHOW` refuses are refused.
+- With a surface allowlist: `to_regclass` and its siblings, `has_*_privilege`, `col_description`,
+  `obj_description`, `shobj_description` and a cast to `regclass`, `regtype` and the other `reg*`
+  types are refused. Each answered whether a relation outside the surface exists.
+- `count(DISTINCT t.*)` is refused while redaction is on. `count(*)` and `count(t.*)` are not.
+- A projection that only resembles a count (`count(*) OVER ()`, `count(*)` with `GROUP BY`,
+  `EXISTS (...)` with a `FROM`) gets a `LIMIT`.
+
+### Other
+
+- JWT: `aud` may be a string or an array (RFC 7519); a token with `"aud": ["a", "b"]` was rejected
+  before the audience was looked at. `scopes_supported` lists all three scopes.
+- `MCP_BEARER_TOKEN` and `MCP_METRICS_TOKEN` shorter than 24 characters draw a warning: the audit
+  log carries a short fingerprint of them.
+- `sqlparser` 0.63. The one new `FROM` variant (`UNPIVOT <expr>`) is refused, and the join kinds
+  PostgreSQL does not have are refused under redaction instead of skipped. The fuzzer gained a
+  mutation that wraps a table function in `LATERAL`, `CROSS JOIN LATERAL` and `WITH ORDINALITY`.
+- `release.yml` no longer carries `NODE_AUTH_TOKEN`; npm publishes by trusted publishing.
+
+### What this release does not claim
+
+`SELECT 1 x UNION ALL TABLE seq` is not a serialisation fault: PostgreSQL rejects it because a
+sequence has three columns. `pg_settings` still shows server configuration (documented), and the
+literal-only reach of `current_setting('data_' || 'directory')` stays outside the check; the
+surface allowlist closes it by refusing the function. `pg_get_backend_memory_contexts()` and
+the other server-internals functions that return no user data are unchanged.
+
 ## 0.1.11 — 2026-11-14 — our own audit of the published 0.1.10
 
 These findings come from an audit of the released 0.1.10 binary by its maintainers, run against a

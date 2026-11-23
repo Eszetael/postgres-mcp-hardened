@@ -330,7 +330,7 @@ Beyond unit tests, the repository carries two harnesses that run in CI on every 
 - `--fuzz` — a deterministic fuzzer that mutates a corpus of known writes with transformations
   that do not change SQL meaning (comments, case, dollar-quoting, invisible Unicode, parentheses)
   and asserts that none of them ever becomes an allowed statement.
-- `tests/acceptance.sh` — an end-to-end suite that starts its own PostgreSQL and checks 329
+- `tests/acceptance.sh` — an end-to-end suite that starts its own PostgreSQL and checks 366
   behaviours: every write-bypass reported against the deprecated server (including the
   `COMMIT`/`END` injection), truthful results, schema introspection, protocol conformance,
   configuration mistakes failing loudly, audit tamper detection, fair use under load, and
@@ -800,6 +800,8 @@ defeated in review and are therefore described as depth rather than as boundarie
   a log that has gone away entirely. This is not proof of tampering — an unclean shutdown looks the
   same — but a tamper-*evident* trail owes you the question, not the verdict. Keep the sidecar with
   the log when you archive or move it; deleting it only loses the truncation check, never an entry.
+  With `MCP_AUDIT_HMAC_KEY` the mark carries a MAC, and a mark without a valid one is reported as such
+  in the chain's own `startup` record.
   The offline verifier is unchanged and still needs an external anchor:
   `--verify-audit <file> --expect-last <hash>`.
   *verified* (acceptance: "a shortened log is noticed at startup, without any external anchor")

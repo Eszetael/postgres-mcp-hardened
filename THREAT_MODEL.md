@@ -91,9 +91,10 @@ server checks each one rather than assuming it.
 | Surface allowlist | `surface.rs`, the query plan | anything the plan does not name: a function body is opaque to the planner, so calls outside `pg_catalog` are refused while an allowlist is active |
 | Start-up gate | `posture.rs` | an operator setting `i-accept-the-risk` — recorded in the audit |
 | Cost guard and timeouts | `tools.rs`, session settings | a query cheap to plan and expensive to run; `statement_timeout` is the backstop |
-| Rate and concurrency limits | `ratelimit.rs`, `pipeline.rs` | many source addresses; per-IP limiting does not isolate an actor, and we say so in the code |
+| Rate and concurrency limits | `ratelimit.rs`, `pipeline.rs` | many source addresses; per-IP limiting does not isolate an actor, and we say so in the code. With `MCP_TRUST_PROXY=1` the key is the last `X-Forwarded-For` entry across all lines, so it is only as honest as the proxy that appends it |
+| Connection bounds | `conn_limit.rs` | `MCP_MAX_CONNECTIONS` slow connections held for the whole `MCP_CONN_TIMEOUT_SECS` budget each: a bound, not a defence against an attacker with many addresses. Put a reverse proxy with its own timeouts in front of a public listener |
 | Provenance wrapper | `tools.rs` | a client that renders `structuredContent` straight into a prompt — off by default, documented |
-| Hash-chained audit | `audit_log.rs` | truncating the tail, unless an anchor is kept elsewhere |
+| Hash-chained audit | `audit_log.rs` | truncating the tail, unless an anchor is kept elsewhere. Without `MCP_AUDIT_HMAC_KEY` anyone who can write the file recomputes the chain. With it, an unsigned entry after a signed one, a log that does not start at entry 1 and a sidecar with no valid MAC are all reported (0.1.12); a host that holds the key defeats it |
 | Request/header agreement | `protocol.rs` | nothing, for a gateway that authorises on `Mcp-Method`/`Mcp-Name` — but only from `2026-07-28`, where those headers exist. Earlier revisions have no such headers, so a gateway on those transports must read the body |
 | Scope enforcement | `authz.rs` | a token issued with more scope than its holder needs — we check the scope, not the wisdom of whoever minted it. It now covers `resources/*` as well as `tools/call`: schema reads are data |
 | Origin refusal | `http.rs` | a non-browser client, which never sends `Origin` — this defends against a page in someone's browser reaching a loopback server, not against a program |
@@ -249,3 +250,15 @@ Reports: see `SECURITY.md`. An accepted report becomes a line in the corpus, cre
   with `fd` or containing four numbers was taken for a private address and excused from TLS. What
   remains: the list of functions that run text as SQL is a list of names, so for extensions it
   cannot be complete.
+- **2026-11-23** — round 0.1.12, our own second audit of the published 0.1.11: a read of the modules
+  the first audit skipped and 618 live probes over PostgreSQL 13 to 18 with real extensions. No new way
+  to read a redacted column. What it found was around the controls: a rate-limit key read from the
+  first `X-Forwarded-For` line only, a session table that cleared itself for everybody, a connection
+  password reaching the audit log in six spellings, an audit verifier that took unsigned entries as
+  valid when a key was given, a redaction check that said "verified" without reaching the database,
+  a start-up gate blind to column grants, sequences and `NOINHERIT` memberships, and no bound on slow
+  connections. Each had a copy of a fix that was applied somewhere else. What remains:
+  `pg_settings` shows configuration (the surface allowlist refuses it, nothing else does);
+  `current_setting` is checked only for a literal name; a short shared token leaves a short
+  fingerprint in the log (a warning, not a refusal); the host that holds the audit key can still
+  rewrite the log.
