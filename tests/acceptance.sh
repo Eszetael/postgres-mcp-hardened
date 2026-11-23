@@ -1480,6 +1480,12 @@ stop
 start DATABASE_URL="$URL"
 c=$(curl -s -o /dev/null -w '%{http_code}' -m 10 -H content-type:application/json -H "MCP-Protocol-Version: 2026-07-28" -H "Mcp-Method: tools/call" -H "Mcp-Name: query" -H "Mcp-Name: list_tables" "http://127.0.0.1:$PORT/mcp" -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"query","arguments":{"sql":"SELECT 1"}}}')
 [ "$c" = 400 ] && ok "a repeated Mcp-Name header is refused" || no "repeated Mcp-Name accepted" "HTTP $c"
+# R16 (0.1.12 review): initialize is exempt from the version header rule, a repeated header included
+INIT16='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"1"}}}'
+c=$(curl -s -o /dev/null -w '%{http_code}' -m 10 -H content-type:application/json -H "MCP-Protocol-Version: 2025-06-18" -H "MCP-Protocol-Version: 2025-03-26" "http://127.0.0.1:$PORT/mcp" -d "$INIT16")
+[ "$c" = 200 ] && ok "initialize with a repeated MCP-Protocol-Version is answered (negotiation is in the body)" || no "initialize refused for a repeated version header" "HTTP $c"
+c=$(curl -s -o /dev/null -w '%{http_code}' -m 10 -H content-type:application/json -H "MCP-Protocol-Version: 2025-06-18" -H "MCP-Protocol-Version: 2025-03-26" "http://127.0.0.1:$PORT/mcp" -d '{"jsonrpc":"2.0","id":2,"method":"ping"}')
+[ "$c" = 400 ] && ok "and any other method with a repeated version header is still a 400" || no "repeated version header accepted after the handshake" "HTTP $c"
 # F2/F4: existence and privilege oracles, and current_setting, answer what SHOW refuses
 r=$(tool query '{"sql":"SELECT current_setting('"'"'data_directory'"'"')"}' | body)
 case "$r" in ERROR:*) ok "current_setting('data_directory') is refused like SHOW";; *) no "current_setting leaked the data directory" "$r";; esac

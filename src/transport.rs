@@ -489,6 +489,10 @@ pub(crate) async fn mcp_handler(
     // non-ASCII value into "absent", the downgrade the paragraph above says must not happen.
     let proto_hdr = match http::single_header(&headers, "mcp-protocol-version") {
         Ok(v) => v,
+        // The `initialize` exemption above covers a repeated header too: it was a 400 there,
+        // against the paragraph that says why it must not be (R16 of the 0.1.12 review).
+        // Negotiation happens in the body, so the header is simply not used.
+        Err(()) if is_initialize => None,
         Err(()) => {
             let mut body = protocol::unsupported_header_error("<repeated or unreadable>");
             body["jsonrpc"] = Value::String("2.0".into());
