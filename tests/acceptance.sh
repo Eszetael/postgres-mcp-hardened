@@ -1475,6 +1475,24 @@ for i in 1 2 3 4 5 6; do
   codes="$codes $(curl -s -o /dev/null -w '%{http_code}' -m 10 -H content-type:application/json -H "X-Forwarded-For: 8.8.8.$i" -H "X-Forwarded-For: 203.0.113.99" "http://127.0.0.1:$PORT/mcp" -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}')"
 done
 case "$codes" in *429*) ok "two X-Forwarded-For lines do not give the client its own rate-limit bucket";; *) no "client-chosen rate-limit key" "$codes";; esac
+# R17 (0.1.12 review): a first line that is not text made the key fall back to the peer: a second bucket
+codes=$(python3 - "$PORT" <<'PY7'
+import socket, sys
+body = b'{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
+out = []
+for i in range(3):
+    req = (b"POST /mcp HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nConnection: close\r\n"
+           b"Content-Length: %d\r\nX-Forwarded-For: \xe9%d\r\nX-Forwarded-For: 203.0.113.99\r\n\r\n" % (len(body), i)) + body
+    s = socket.create_connection(("127.0.0.1", int(sys.argv[1]))); s.sendall(req); d = b""
+    while True:
+        c = s.recv(65536)
+        if not c: break
+        d += c
+    out.append(d.split(b" ", 2)[1].decode() if d else "EOF")
+print(" ".join(out))
+PY7
+)
+case "$codes" in "429 429 429") ok "a line that is not text does not move the client to another bucket";; *) no "non-text X-Forwarded-For line gave a fresh bucket" "$codes";; esac
 stop
 # G21: a repeated Mcp-Name is refused, not read from its first line.
 start DATABASE_URL="$URL"

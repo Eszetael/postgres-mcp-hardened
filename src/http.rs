@@ -76,12 +76,16 @@ pub(crate) fn render_metrics() -> String {
 /// Every `X-Forwarded-For` line, joined in arrival order. `HeaderMap::get` returns only the FIRST
 /// line, and a proxy that appends its own line (HAProxy `option forwardfor`) leaves the client's
 /// line first, so the rate-limit key was whatever the client wrote. The last entry of the joined
-/// list is the one our proxy added. A line that is not valid text yields `None` (key = peer address).
+/// list is the one our proxy added. A line that is not valid text is read lossily, not dropped.
 pub(crate) fn forwarded_for(headers: &HeaderMap) -> Option<String> {
-    let mut parts = Vec::new();
-    for v in headers.get_all("x-forwarded-for") {
-        parts.push(v.to_str().ok()?);
-    }
+    // Bytes, read lossily: one line that is not text used to discard the whole header, so the same
+    // client got the peer's bucket when an earlier line held a stray byte and its own otherwise
+    // (R17 of the 0.1.12 review). Only the last entry is used, and the proxy wrote that one.
+    let parts: Vec<String> = headers
+        .get_all("x-forwarded-for")
+        .iter()
+        .map(|v| String::from_utf8_lossy(v.as_bytes()).into_owned())
+        .collect();
     if parts.is_empty() {
         None
     } else {
@@ -384,6 +388,25 @@ mod tests {
         );
         assert!(single_header(&b, "mcp-name").is_err());
         assert_eq!(single_header(&HeaderMap::new(), "mcp-name"), Ok(None));
+    }
+
+    #[test]
+    fn a_line_that_is_not_text_does_not_hide_the_proxy_entry() {
+        let mut h = HeaderMap::new();
+        h.append(
+            "x-forwarded-for",
+            axum::http::HeaderValue::from_bytes(b"\xe9 1").unwrap(),
+        );
+        h.append(
+            "x-forwarded-for",
+            axum::http::HeaderValue::from_static("203.0.113.98"),
+        );
+        let joined = forwarded_for(&h).expect("present");
+        assert!(joined.ends_with(", 203.0.113.98"), "{joined}");
+        assert_eq!(
+            crate::ratelimit::client_key_with("127.0.0.1", Some(&joined), true),
+            crate::ratelimit::client_key_with("127.0.0.1", Some("203.0.113.98"), true)
+        );
     }
 
     #[test]
