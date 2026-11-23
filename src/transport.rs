@@ -79,7 +79,7 @@ pub(crate) fn run_stdio() {
         let _scope = audit_log::set_caller(Some(pipeline::stdio_caller()));
         // The same refusal HTTP gives while the start-up checks are still pending; stdio had none, so
         // `MCP_REDACT_REQUIRE_REVOKE=1` guarded the network transport and not the one most people use.
-        let blocked = posture::serving_blocked();
+        let blocked = posture::serving_blocked_for(req.get("method").and_then(|m| m.as_str()));
         let mut resp = match pipeline::gate(&caller_key, "stdio") {
             Ok(_) if blocked.is_some() => {
                 json!({"error": {"code": -32000, "message": blocked.unwrap_or_default()}})
@@ -286,7 +286,7 @@ pub(crate) async fn mcp_handler(
         audit("http", "denied_origin", None);
         return (StatusCode::FORBIDDEN, msg).into_response();
     }
-    if let Some(why) = posture::serving_blocked() {
+    if let Some(why) = posture::serving_blocked_for(req.get("method").and_then(|m| m.as_str())) {
         let body = json!({ "jsonrpc": "2.0", "id": req.get("id").cloned().unwrap_or(Value::Null),
             "error": { "code": -32000, "message": why } });
         return (StatusCode::SERVICE_UNAVAILABLE, Json(body)).into_response();

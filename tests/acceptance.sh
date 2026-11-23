@@ -1558,9 +1558,21 @@ r=$(env DATABASE_URL="postgres://x:y@127.0.0.1:1/x" MCP_REDACT_COLUMNS=email MCP
 [ "$r" = 0 ] && ok "an unreachable database is never reported as 'verified'" || no "claimed verification without reaching the database" "$r"
 env DATABASE_URL="postgres://x:y@127.0.0.1:1/x" MCP_REDACT_COLUMNS=email MCP_REDACT_REQUIRE_REVOKE=1 MCP_RATE_RPM=0 MCP_ADDR=127.0.0.1:$((PORT+42)) "$BIN" >/dev/null 2>&1 &
 G14PID=$!; sleep 3
-c=$(curl -s -o /dev/null -w '%{http_code}' -m 10 -H content-type:application/json "http://127.0.0.1:$((PORT+42))/mcp" -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}')
+c=$(curl -s -o /dev/null -w '%{http_code}' -m 10 -H content-type:application/json "http://127.0.0.1:$((PORT+42))/mcp" -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"query","arguments":{"sql":"SELECT 1"}}}')
+c2=$(curl -s -o /dev/null -w '%{http_code}' -m 10 -H content-type:application/json "http://127.0.0.1:$((PORT+42))/mcp" -d '{"jsonrpc":"2.0","id":1,"method":"resources/list"}')
 kill -9 $G14PID 2>/dev/null
-[ "$c" = 503 ] && ok "MCP_REDACT_REQUIRE_REVOKE=1 serves nothing until the database has been checked" || no "strict redaction served before verification" "HTTP $c"
+[ "$c $c2" = "503 503" ] && ok "MCP_REDACT_REQUIRE_REVOKE=1 serves nothing until the database has been checked" || no "strict redaction served before verification" "HTTP $c $c2"
+# R4 (0.1.12 review): strict redaction over stdio blocks what reaches data, not the handshake
+INIT='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"1"}}}'
+QCALL='{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"query","arguments":{"sql":"SELECT 1"}}}'
+r=$( (echo "$INIT"; echo "$QCALL"; sleep 2) | env DATABASE_URL="postgres://x:y@127.0.0.1:1/x" MCP_REDACT_COLUMNS=email MCP_REDACT_REQUIRE_REVOKE=1 timeout 8 "$BIN" --stdio 2>/dev/null)
+case "$r" in *'"id":1'*'"result"'*) ok "strict redaction over stdio answers an immediate initialize";; *) no "initialize refused while redaction was unverified" "$r";; esac
+case "$(echo "$r" | grep '"id":2')" in *'"code":-32000'*REVOKE*) ok "and refuses tools/call until the database has been checked";; *) no "tools/call served before verification" "$r";; esac
+c=$( (sleep 1; curl -s -m 5 -H content-type:application/json "http://127.0.0.1:$((PORT+43))/mcp" -d "$INIT") & env DATABASE_URL="postgres://x:y@127.0.0.1:1/x" MCP_REDACT_COLUMNS=email MCP_REDACT_REQUIRE_REVOKE=1 MCP_RATE_RPM=0 MCP_ADDR=127.0.0.1:$((PORT+43)) timeout 4 "$BIN" >/dev/null 2>&1; wait)
+case "$c" in *'"result"'*protocolVersion*) ok "the same over HTTP: initialize passes while the check is pending";; *) no "HTTP initialize refused while redaction was unverified" "$c";; esac
+docker exec acc_pg psql -U postgres -qc "CREATE ROLE acc_rv LOGIN PASSWORD 'rv'; GRANT CONNECT ON DATABASE postgres TO acc_rv; GRANT USAGE ON SCHEMA public TO acc_rv; GRANT SELECT (id, name) ON customers TO acc_rv;" >/dev/null
+r=$( (echo "$INIT"; sleep 4; echo "$QCALL"; sleep 2) | env DATABASE_URL="postgres://acc_rv:rv@127.0.0.1:$PGPORT_ACC/postgres" MCP_REDACT_COLUMNS=email MCP_REDACT_REQUIRE_REVOKE=1 timeout 12 "$BIN" --stdio 2>/dev/null)
+case "$r" in *'"id":1'*'"result"'*) case "$(echo "$r" | grep '"id":2')" in *'"result"'*) ok "a revoked column over stdio: initialize at once, queries after the check";; *) no "query refused after verification (stdio)" "$r";; esac;; *) no "initialize refused (stdio, revoked role)" "$r";; esac
 # G4: a connection that starts a request and never finishes it is closed
 start DATABASE_URL="$URL" MCP_CONN_TIMEOUT_SECS=3
 python3 - "$PORT" <<'PY4' && ok "a stalled connection is closed after MCP_CONN_TIMEOUT_SECS" || no "a stalled connection was left open" ""

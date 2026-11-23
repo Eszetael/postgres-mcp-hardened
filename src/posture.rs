@@ -373,6 +373,18 @@ pub(crate) fn serving_blocked() -> Option<&'static str> {
     }
 }
 
+/// [`serving_blocked`] for one JSON-RPC method. Only methods that reach data wait for the checks;
+/// the handshake and the calls that describe the server do not, so a client that connects while the
+/// checks run (an stdio client always does) still gets through `initialize`. The list is of what
+/// may pass, so a method added later waits by default.
+pub(crate) fn serving_blocked_for(method: Option<&str>) -> Option<&'static str> {
+    match method {
+        Some("initialize" | "ping" | "tools/list" | "prompts/list" | "server/discover") => None,
+        Some(m) if m.starts_with("notifications/") => None,
+        _ => serving_blocked(),
+    }
+}
+
 /// How bad a finding is. The grade is the worst one present — never an average, because averaging
 /// lets nine good answers hide one fatal one, and a report that does that teaches operators to skim.
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
@@ -678,6 +690,41 @@ pub(crate) fn audit_posture() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_methods_that_reach_data_wait_for_the_start_up_checks() {
+        for m in [
+            "initialize",
+            "ping",
+            "tools/list",
+            "notifications/initialized",
+            "server/discover",
+        ] {
+            assert_eq!(serving_blocked_for(Some(m)), None, "{m}");
+        }
+        // with nothing pending, nothing is blocked either way
+        for m in [
+            "tools/call",
+            "resources/read",
+            "resources/list",
+            "resources/templates/list",
+        ] {
+            assert_eq!(serving_blocked_for(Some(m)), serving_blocked(), "{m}");
+        }
+        *PENDING.write().unwrap() = true;
+        for m in [
+            Some("tools/call"),
+            Some("resources/read"),
+            Some("resources/list"),
+            Some("resources/templates/list"),
+            Some("x/unknown"),
+            None,
+        ] {
+            assert!(serving_blocked_for(m).is_some(), "{m:?}");
+        }
+        assert_eq!(serving_blocked_for(Some("initialize")), None);
+        *PENDING.write().unwrap() = false;
+    }
 
     #[test]
     fn loopback_is_recognised_in_every_spelling() {
