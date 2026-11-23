@@ -781,11 +781,12 @@ impl Visitor for SecurityScanner {
             // 'directory')` is not), which is why `cost_guard` also refuses the function itself
             // while a surface is configured, and why `pg_settings` is documented as the way round.
             if last_part_name(&f.name).as_deref() == Some("current_setting") {
+                // Every spelling of a string literal counts (R11 of the 0.1.12 review: E'',
+                // $$..$$, U&'', a cast to text and parentheses went through), and so does a
+                // concatenation of literals.
                 if let FunctionArguments::List(l) = &f.args {
-                    if let Some(FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::Value(v)))) =
-                        l.args.first()
-                    {
-                        if let Value::SingleQuotedString(name) = &v.value {
+                    if let Some(FunctionArg::Unnamed(FunctionArgExpr::Expr(arg))) = l.args.first() {
+                        for name in literal_texts(arg) {
                             let name = name.to_lowercase();
                             if SENSITIVE_SHOW_VARS.contains(&name.as_str()) {
                                 self.hit = Some(format!(
@@ -1018,6 +1019,17 @@ fn structural_readonly(stmt: &Statement) -> Result<(), ValidationError> {
                     "SHOW {} (server layout)",
                     name
                 )))
+            } else if name == "all"
+                && crate::surface::active()
+                && !crate::surface::catalog_allowed()
+            {
+                // `SHOW ALL` is `pg_settings` in another form, and the surface refuses pg_settings.
+                Err(ValidationError::NotReadOnly(
+                    "SHOW ALL lists every server setting, like pg_settings; while a surface \
+                     allowlist is configured the catalogue is out of reach (MCP_ALLOW_CATALOG=1 \
+                     opens it)"
+                        .into(),
+                ))
             } else {
                 Ok(())
             }
@@ -2500,6 +2512,18 @@ mod adversarial {
 
     // Attack vectors: EVERY one must return Err(ValidationError)
     const MUST_REJECT: &[&str] = &[
+        // R11 of the 0.1.12 review: every spelling of the literal
+        r#"SELECT current_setting(E'data_directory')"#,
+        r#"SELECT current_setting(E'data\x5fdirectory')"#,
+        r#"SELECT current_setting($$data_directory$$)"#,
+        r#"SELECT current_setting($x$hba_file$x$)"#,
+        r#"SELECT current_setting(U&'data_directory')"#,
+        r#"SELECT current_setting(U&'d\0061ta_directory')"#,
+        r#"SELECT current_setting('data_directory'::text)"#,
+        r#"SELECT current_setting(('data_directory'))"#,
+        r#"SELECT current_setting(CAST('data_directory' AS text))"#,
+        r#"SELECT current_setting('data_' || 'directory')"#,
+        r#"SELECT current_setting(text('data_directory'))"#,
         // one fact, one answer: the function, the view and its siblings (0.1.12 audit)
         "SELECT * FROM pg_show_all_file_settings()",
         "SELECT * FROM LATERAL pg_show_all_file_settings() x",
@@ -2676,6 +2700,8 @@ mod adversarial {
 
     // Legitimate reads: EVERY one must return Ok(())
     const MUST_ALLOW: &[&str] = &[
+        r#"SELECT current_setting(E'search_path')"#,
+        r#"SELECT current_setting($$statement_timeout$$)"#,
         // a user's type named reg-something, and reg* casts without a surface (R8, 0.1.12 review)
         r#"SELECT * FROM sales WHERE region = 'EU'::region"#,
         r#"SELECT '{a}'::regclass[]"#,
@@ -3351,6 +3377,166 @@ mod folded_constant_tests {
         assert!(e.contains("planning"), "{e}");
         assert!(v("DROP TABLE t").unwrap_err().contains("non-read-only"));
     }
+}
+
+/// The texts a string-literal expression can stand for: every literal spelling (plain, `E''` with
+/// its escapes read, `$$..$$`, `U&''` with its escapes read), under parentheses and casts, and the
+/// concatenation of such literals. Both the raw and the decoded text are returned when they differ.
+/// Empty when the expression is not built from literals alone.
+fn literal_texts(e: &Expr) -> Vec<String> {
+    match e {
+        Expr::Nested(inner) => literal_texts(inner),
+        Expr::Cast { expr, .. } => literal_texts(expr),
+        Expr::TypedString(ts) => literal_texts(&Expr::Value(ts.value.clone())),
+        // `text('x')`, `varchar('x')`: a cast written as a call
+        Expr::Function(f)
+            if matches!(
+                last_part_name(&f.name).as_deref(),
+                Some("text" | "varchar" | "name" | "bpchar")
+            ) =>
+        {
+            match &f.args {
+                FunctionArguments::List(l) => match l.args.as_slice() {
+                    [FunctionArg::Unnamed(FunctionArgExpr::Expr(a))] => literal_texts(a),
+                    _ => vec![],
+                },
+                _ => vec![],
+            }
+        }
+        Expr::Value(v) => {
+            let raw = match &v.value {
+                Value::SingleQuotedString(s)
+                | Value::TripleSingleQuotedString(s)
+                | Value::NationalStringLiteral(s) => vec![s.clone()],
+                Value::EscapedStringLiteral(s) => vec![s.clone(), decode_c_escapes(s)],
+                Value::UnicodeStringLiteral(s) => vec![s.clone(), decode_unicode_escapes(s)],
+                Value::DollarQuotedString(d) => vec![d.value.clone()],
+                _ => vec![],
+            };
+            let mut raw = raw;
+            raw.dedup();
+            raw
+        }
+        Expr::BinaryOp {
+            left,
+            op: BinaryOperator::StringConcat,
+            right,
+        } => {
+            let (l, r) = (literal_texts(left), literal_texts(right));
+            let mut out = Vec::new();
+            for a in &l {
+                for b in &r {
+                    out.push(format!("{a}{b}"));
+                }
+            }
+            out
+        }
+        _ => vec![],
+    }
+}
+
+/// `E'...'` escapes: `\n`-style letters, octal, `\xHH`, `\uXXXX`, `\UXXXXXXXX`, and `\c` = `c`.
+fn decode_c_escapes(s: &str) -> String {
+    let c: Vec<char> = s.chars().collect();
+    let (mut out, mut i) = (String::new(), 0);
+    let hex = |from: usize, max: usize| -> (Option<char>, usize) {
+        let digits: String = c[from..]
+            .iter()
+            .take(max)
+            .take_while(|d| d.is_ascii_hexdigit())
+            .collect();
+        let n = digits.len();
+        (
+            u32::from_str_radix(&digits, 16)
+                .ok()
+                .and_then(char::from_u32),
+            n,
+        )
+    };
+    while i < c.len() {
+        if c[i] != '\\' || i + 1 >= c.len() {
+            out.push(c[i]);
+            i += 1;
+            continue;
+        }
+        let k = c[i + 1];
+        let (ch, used) = match k {
+            'n' => (Some('\n'), 1),
+            't' => (Some('\t'), 1),
+            'r' => (Some('\r'), 1),
+            'b' => (Some('\u{8}'), 1),
+            'f' => (Some('\u{c}'), 1),
+            'x' => {
+                let (ch, n) = hex(i + 2, 2);
+                (ch, 1 + n)
+            }
+            'u' => {
+                let (ch, n) = hex(i + 2, 4);
+                (ch, 1 + n)
+            }
+            'U' => {
+                let (ch, n) = hex(i + 2, 8);
+                (ch, 1 + n)
+            }
+            '0'..='7' => {
+                let digits: String = c[i + 1..]
+                    .iter()
+                    .take(3)
+                    .take_while(|d| ('0'..='7').contains(d))
+                    .collect();
+                let n = digits.len();
+                (
+                    u32::from_str_radix(&digits, 8)
+                        .ok()
+                        .and_then(char::from_u32),
+                    n,
+                )
+            }
+            other => (Some(other), 1),
+        };
+        if let Some(ch) = ch {
+            out.push(ch);
+        }
+        i += 1 + used;
+    }
+    out
+}
+
+/// `U&'...'` escapes with the default escape character: `\XXXX` and `\+XXXXXX`.
+fn decode_unicode_escapes(s: &str) -> String {
+    let c: Vec<char> = s.chars().collect();
+    let (mut out, mut i) = (String::new(), 0);
+    while i < c.len() {
+        if c[i] == '\\' {
+            let (start, len) = if c.get(i + 1) == Some(&'+') {
+                (i + 2, 6)
+            } else {
+                (i + 1, 4)
+            };
+            let digits: String = c
+                .get(start..start + len)
+                .map(|d| d.iter().collect())
+                .unwrap_or_default();
+            if digits.len() == len {
+                if let Some(ch) = u32::from_str_radix(&digits, 16)
+                    .ok()
+                    .and_then(char::from_u32)
+                {
+                    out.push(ch);
+                    i = start + len;
+                    continue;
+                }
+            }
+            if c.get(i + 1) == Some(&'\\') {
+                out.push('\\');
+                i += 2;
+                continue;
+            }
+        }
+        out.push(c[i]);
+        i += 1;
+    }
+    out
 }
 
 /// The object-identifier aliases whose input function resolves a name through the catalogue. An

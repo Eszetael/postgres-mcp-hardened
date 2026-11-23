@@ -1471,13 +1471,14 @@ c=$(curl -s -o /dev/null -w '%{http_code}' -m 10 -H content-type:application/jso
 # F2/F4: existence and privilege oracles, and current_setting, answer what SHOW refuses
 r=$(tool query '{"sql":"SELECT current_setting('"'"'data_directory'"'"')"}' | body)
 case "$r" in ERROR:*) ok "current_setting('data_directory') is refused like SHOW";; *) no "current_setting leaked the data directory" "$r";; esac
-for q in "SELECT * FROM pg_hba_file_rules" "SELECT * FROM pg_show_all_file_settings()" "SELECT * FROM pg_stat_statements" "SELECT * FROM pg_ident_file_mappings"; do
+for q in "SELECT * FROM pg_hba_file_rules" "SELECT * FROM pg_show_all_file_settings()" "SELECT * FROM pg_stat_statements" "SELECT * FROM pg_ident_file_mappings" \
+         "SELECT current_setting(E'data_directory')" "SELECT current_setting(\$\$data_directory\$\$)" "SELECT current_setting(U&'data_directory')" "SELECT current_setting('data_directory'::text)" "SELECT current_setting(('data_directory'))" "SELECT current_setting('data_' || 'directory')"; do
   r=$(tool query "{\"sql\":\"$q\"}" | body)
   case "$r" in ERROR:*) ok "refused: $q";; *) no "server configuration readable through: $q" "$r";; esac
 done
 stop
 start DATABASE_URL="$URL" MCP_ALLOW_SCHEMAS=public
-for q in "SELECT to_regclass('secret.t')" "SELECT 'secret.t'::regclass" "SELECT has_table_privilege('secret.t','select')" "SELECT col_description('customers'::regclass,1)" \
+for q in "SHOW ALL" "SELECT to_regclass('secret.t')" "SELECT 'secret.t'::regclass" "SELECT has_table_privilege('secret.t','select')" "SELECT col_description('customers'::regclass,1)" \
          "SELECT '{secret.t}'::regclass[]" "SELECT ARRAY['secret.t']::regclass[]" "SELECT CAST(ARRAY['secret.t'] AS regclass[])" "SELECT regclass('secret.t')" "SELECT regclassin('secret.t')" "SELECT 'secret'::pg_catalog.regnamespace" "SELECT pg_relation_size('secret.t')" "SELECT currval('secret.t')"; do
   r=$(tool query "{\"sql\":\"$q\"}" | body)
   case "$r" in ERROR:*) ok "surface: refused $q";; *) no "surface leaks existence through: $q" "$r";; esac

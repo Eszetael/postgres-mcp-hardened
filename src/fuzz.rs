@@ -144,6 +144,13 @@ const WRITE_SEEDS: &[&str] = &[
     "SELECT * FROM pg_read_file('/etc/passwd')",
     "SELECT 1 UNION SELECT setval('s', 1)",
     "SELECT array_agg(x) FROM (SELECT pg_sleep(1) AS x) t",
+    // current_setting of a variable SHOW refuses, in the literal spellings a mutation keeps equal
+    // (R11, 0.1.12 review). `U&'x'` is pinned in MUST_REJECT instead: a comment inserted between
+    // `U` and `&` makes it a different expression, which is not a bypass.
+    "SELECT current_setting(E'data_directory')",
+    "SELECT current_setting($$hba_file$$)",
+    "SELECT current_setting(('data_directory'::text))",
+    "SELECT current_setting('data_' || 'directory')",
 ];
 
 /// Corpus of legitimate READS — exercises I3/I4 (canonicalisation, cost routing) and panic freedom.
@@ -457,7 +464,14 @@ fn requote_literal(rng: &mut Rng, sql: &str) -> String {
         .iter()
         .filter(|(s, e)| {
             let inner = &sql[s + 1..e - 1];
-            !inner.contains('$') && !inner.contains('\\') && !inner.is_empty()
+            // A prefixed literal (`E'x'`, `U&'x'`, `N'x'`) is not `'x'`: replacing only the quoted
+            // part turned `E'x'` into the identifier `E$$x$$`, a different statement, which the
+            // checks then rightly did not treat as the seed.
+            let prefixed = *s > 0 && {
+                let p = b[s - 1];
+                p.is_ascii_alphanumeric() || p == b'_' || p == b'&'
+            };
+            !prefixed && !inner.contains('$') && !inner.contains('\\') && !inner.is_empty()
         })
         .collect();
     if usable.is_empty() {
