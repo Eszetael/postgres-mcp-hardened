@@ -2676,6 +2676,9 @@ mod adversarial {
 
     // Legitimate reads: EVERY one must return Ok(())
     const MUST_ALLOW: &[&str] = &[
+        // a user's type named reg-something, and reg* casts without a surface (R8, 0.1.12 review)
+        r#"SELECT * FROM sales WHERE region = 'EU'::region"#,
+        r#"SELECT '{a}'::regclass[]"#,
         // an ordinary setting stays readable
         "SELECT current_setting('statement_timeout')",
         "SELECT current_setting('search_path')",
@@ -3040,8 +3043,24 @@ mod join_oracle_tests {
             ("SELECT regclass 'a'", true),
             ("SELECT CAST('a' AS regproc)", true),
             ("SELECT 'a'::regnamespace", true),
+            ("SELECT 'a'::pg_catalog.regclass", true),
+            ("SELECT 'a'::\"regclass\"", true),
+            ("SELECT '{a}'::regclass[]", true),
+            ("SELECT ARRAY['a']::regclass[]", true),
+            ("SELECT CAST(ARRAY['a'] AS regclass[])", true),
+            ("SELECT '{a}'::pg_catalog.regtype[]", true),
+            ("SELECT 'a'::regcollation", true),
+            ("SELECT '{a}'::regclass ARRAY", true),
             ("SELECT 1::int", false),
             ("SELECT 'a'::text", false),
+            // R8: user types that merely start with "reg"
+            ("SELECT 'EU'::region", false),
+            ("SELECT CAST('US' AS region)", false),
+            ("SELECT 'ok'::registry_status", false),
+            ("SELECT NULL::regular_t", false),
+            ("SELECT '{EU}'::region[]", false),
+            ("SELECT 'a'::app.regclass", false),
+            ("SELECT 'a'::regclassx", false),
         ] {
             let ast = Parser::parse_sql(&PostgreSqlDialect {}, sql).expect("parses");
             let mut found = false;
@@ -3334,17 +3353,50 @@ mod folded_constant_tests {
     }
 }
 
-/// `regclass`, `regtype`, `regproc`, ... : the object-identifier aliases whose input function resolves
-/// a name through the catalogue.
+/// The object-identifier aliases whose input function resolves a name through the catalogue. An
+/// exact list: "starts with reg" also caught a user's `region` enum (R8 of the 0.1.12 review).
+pub(crate) const REG_TYPES: &[&str] = &[
+    "regclass",
+    "regtype",
+    "regproc",
+    "regprocedure",
+    "regoper",
+    "regoperator",
+    "regnamespace",
+    "regrole",
+    "regconfig",
+    "regdictionary",
+    "regcollation",
+];
+
+/// A reg* type in any spelling: bare or `pg_catalog.`-qualified, quoted, or as the element of an
+/// array (`regclass[]`, R7 of the 0.1.12 review: `'{secret.t}'::regclass[]` was the same oracle).
 fn is_reg_type(dt: &sqlparser::ast::DataType) -> bool {
-    use sqlparser::ast::DataType;
+    use sqlparser::ast::{ArrayElemTypeDef, DataType};
     match dt {
         DataType::Regclass => true,
-        DataType::Custom(name, _) => name
-            .0
-            .last()
-            .and_then(|p| p.as_ident())
-            .is_some_and(|i| i.value.to_lowercase().starts_with("reg")),
+        DataType::Array(
+            ArrayElemTypeDef::AngleBracket(inner)
+            | ArrayElemTypeDef::SquareBracket(inner, _)
+            | ArrayElemTypeDef::Parenthesis(inner)
+            | ArrayElemTypeDef::Qualified(inner, _),
+        ) => is_reg_type(inner),
+        DataType::Custom(name, _) => {
+            let parts: Vec<String> = name
+                .0
+                .iter()
+                .map(|p| {
+                    p.as_ident()
+                        .map(|i| i.value.to_lowercase())
+                        .unwrap_or_default()
+                })
+                .collect();
+            match parts.as_slice() {
+                [t] => REG_TYPES.contains(&t.as_str()),
+                [schema, t] => schema == "pg_catalog" && REG_TYPES.contains(&t.as_str()),
+                _ => false,
+            }
+        }
         _ => false,
     }
 }

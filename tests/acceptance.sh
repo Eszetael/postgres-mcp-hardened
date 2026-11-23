@@ -1473,9 +1473,16 @@ for q in "SELECT * FROM pg_hba_file_rules" "SELECT * FROM pg_show_all_file_setti
 done
 stop
 start DATABASE_URL="$URL" MCP_ALLOW_SCHEMAS=public
-for q in "SELECT to_regclass('secret.t')" "SELECT 'secret.t'::regclass" "SELECT has_table_privilege('secret.t','select')" "SELECT col_description('customers'::regclass,1)"; do
+for q in "SELECT to_regclass('secret.t')" "SELECT 'secret.t'::regclass" "SELECT has_table_privilege('secret.t','select')" "SELECT col_description('customers'::regclass,1)" \
+         "SELECT '{secret.t}'::regclass[]" "SELECT ARRAY['secret.t']::regclass[]" "SELECT CAST(ARRAY['secret.t'] AS regclass[])" "SELECT regclass('secret.t')" "SELECT regclassin('secret.t')" "SELECT 'secret'::pg_catalog.regnamespace" "SELECT pg_relation_size('secret.t')" "SELECT currval('secret.t')"; do
   r=$(tool query "{\"sql\":\"$q\"}" | body)
   case "$r" in ERROR:*) ok "surface: refused $q";; *) no "surface leaks existence through: $q" "$r";; esac
+done
+# R8: a user's type whose name merely starts with "reg" is not an object-identifier type
+docker exec acc_pg psql -U postgres -qc "CREATE TYPE acc_region AS ENUM ('EU','US'); CREATE TYPE registry_status AS ENUM ('ok');" >/dev/null 2>&1
+for q in "SELECT 'EU'::acc_region" "SELECT CAST('US' AS acc_region)" "SELECT 'ok'::registry_status" "SELECT '{EU}'::acc_region[]"; do
+  r=$(tool query "{\"sql\":\"$q\"}" | body)
+  case "$r" in ERROR:*) no "surface refused a user type: $q" "$r";; *) ok "surface: a user type starting with reg works: $q";; esac
 done
 stop
 # G5/G16: the password in the connection string never reaches the audit record or stderr

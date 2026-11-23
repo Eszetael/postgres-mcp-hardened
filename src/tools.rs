@@ -603,32 +603,10 @@ pub(crate) fn cost_guard(sql: &str, max_cost: f64, db: Option<&str>) -> Result<(
         if !outside.is_empty() {
             return Err(CostErr::OutsideSurface(surface::refusal_message(&outside)));
         }
-    }
-    let row = client
-        .query_one(&format!("EXPLAIN (FORMAT JSON, VERBOSE) {}", sql), &[])
-        .map_err(|e| CostErr::QueryError(friendly_pg_error_for(&e, Some(sql))))?;
-    let plan: Value = row.get(0); // kolumna json: [{"Plan":{"Total Cost":..}}]
-                                  // Fail CLOSED. This was `.unwrap_or(0.0)`, so a plan whose shape we did not recognise — a
-                                  // different PostgreSQL version, a renamed field — scored zero and sailed past the cost limit
-                                  // with nothing in the log to say the guard had abstained. A cost guard that cannot read the cost
-                                  // has not measured a cheap query; it has failed to measure, and those are different answers.
-    let Some(total) = plan
-        .get(0)
-        .and_then(|v| v.get("Plan"))
-        .and_then(|v| v.get("Total Cost"))
-        .and_then(|v| v.as_f64())
-    else {
-        return Err(CostErr::QueryError(
-            "could not read the estimated cost out of the query plan, so the cost limit cannot be \
-             applied — refusing rather than guessing. This usually means an unexpected PostgreSQL \
-             version; please report it"
-                .to_string(),
-        ));
-    };
-    // The surface check belongs here, on the plan, for the reason the module explains: the planner
-    // has already resolved aliases, applied search_path, expanded views and distinguished a CTE from
-    // the table it shadows. Reading the statement instead is what lost three rounds.
-    if surface::active() {
+        // Functions are judged by name, before the plan: planning a call folds constants, and
+        // `regclass('secret.t')` or `pg_relation_size('secret.t')` resolve the name WHILE planning,
+        // so "permission denied" versus "does not exist" came back from the EXPLAIN before any of
+        // the checks below had run (0.1.12 review, R7).
         // Functions first, because a plan cannot answer for them. A function body is opaque to the
         // planner, so `SELECT secret_lookup('x')` plans to a bare Result node and reads whatever it
         // likes; with SECURITY DEFINER it reads it with the owner's privileges, defeating the role
@@ -658,10 +636,19 @@ pub(crate) fn cost_guard(sql: &str, max_cost: f64, db: Option<&str>) -> Result<(
                         // the comment of a column the caller may not know exists: each answers a
                         // question about a relation outside the surface. Families again, not a list.
                         || f.starts_with("to_reg")
+                        // The same lookup in function form: `regclass('x')` (a cast written as a
+                        // call), the I/O functions `regclassin('x')`, `regclassout('x')` (R7, 0.1.12
+                        // review), and `currval('x')`, whose argument is a regclass, so a string
+                        // literal is looked up as a relation name while planning.
+                        || crate::validate::REG_TYPES.iter().any(|t| {
+                            f.strip_prefix(t)
+                                .is_some_and(|rest| matches!(rest, "" | "in" | "out" | "send" | "recv"))
+                        })
                         || (f.starts_with("has_") && f.ends_with("_privilege"))
                         || matches!(
                             f.as_str(),
                             "current_setting"
+                                | "currval"
                                 | "inet_server_addr"
                                 | "inet_server_port"
                                 | "col_description"
@@ -721,6 +708,32 @@ pub(crate) fn cost_guard(sql: &str, max_cost: f64, db: Option<&str>) -> Result<(
                 )));
             }
         }
+    }
+    let row = client
+        .query_one(&format!("EXPLAIN (FORMAT JSON, VERBOSE) {}", sql), &[])
+        .map_err(|e| CostErr::QueryError(friendly_pg_error_for(&e, Some(sql))))?;
+    let plan: Value = row.get(0); // kolumna json: [{"Plan":{"Total Cost":..}}]
+                                  // Fail CLOSED. This was `.unwrap_or(0.0)`, so a plan whose shape we did not recognise — a
+                                  // different PostgreSQL version, a renamed field — scored zero and sailed past the cost limit
+                                  // with nothing in the log to say the guard had abstained. A cost guard that cannot read the cost
+                                  // has not measured a cheap query; it has failed to measure, and those are different answers.
+    let Some(total) = plan
+        .get(0)
+        .and_then(|v| v.get("Plan"))
+        .and_then(|v| v.get("Total Cost"))
+        .and_then(|v| v.as_f64())
+    else {
+        return Err(CostErr::QueryError(
+            "could not read the estimated cost out of the query plan, so the cost limit cannot be \
+             applied — refusing rather than guessing. This usually means an unexpected PostgreSQL \
+             version; please report it"
+                .to_string(),
+        ));
+    };
+    // The surface check belongs here, on the plan, for the reason the module explains: the planner
+    // has already resolved aliases, applied search_path, expanded views and distinguished a CTE from
+    // the table it shadows. Reading the statement instead is what lost three rounds.
+    if surface::active() {
         let found = surface::relations_in_plan(&plan);
         // An empty relation list is not consent. `SELECT x FROM secret.t WHERE false` plans to a
         // `Result` node with a one-time false filter and no relation at all, so the allowlist had
