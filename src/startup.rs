@@ -226,6 +226,7 @@ pub(crate) const KNOWN_VARS: &[&str] = &[
     "MCP_STATEMENT_TIMEOUT",
     "MCP_STRUCTURED_CONTENT",
     "MCP_TRUST_PROXY",
+    "MCP_TRUSTED_EXTENSIONS",
 ];
 
 /// Levenshtein distance, for turning "unknown variable" into "did you mean".

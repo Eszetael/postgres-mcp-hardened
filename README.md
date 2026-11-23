@@ -330,7 +330,7 @@ Beyond unit tests, the repository carries two harnesses that run in CI on every 
 - `--fuzz` — a deterministic fuzzer that mutates a corpus of known writes with transformations
   that do not change SQL meaning (comments, case, dollar-quoting, invisible Unicode, parentheses)
   and asserts that none of them ever becomes an allowed statement.
-- `tests/acceptance.sh` — an end-to-end suite that starts its own PostgreSQL and checks 437
+- `tests/acceptance.sh` — an end-to-end suite that starts its own PostgreSQL and checks 448
   behaviours: every write-bypass reported against the deprecated server (including the
   `COMMIT`/`END` injection), truthful results, schema introspection, protocol conformance,
   configuration mistakes failing loudly, audit tamper detection, fair use under load, and
@@ -683,9 +683,21 @@ it connected to and as whom. `SHOW ALL` lists what `pg_settings` lists and is re
 
 An operator is a function call written as a symbol, so it follows the same rule: with an allowlist
 active, an operator whose function lies outside `pg_catalog` is refused unless that function is
-named in `MCP_ALLOW_FUNCTIONS`. The built-in operators are unaffected. If an extension such as
-`citext` or `hstore` sits in an allowed schema, its operators count as its functions; list the ones
-you have read.
+named in `MCP_ALLOW_FUNCTIONS`. The built-in operators are unaffected.
+
+The same holds for code a statement runs without naming it. With an allowlist active, a cast to a
+domain whose `CHECK` calls a function outside `pg_catalog` (`SELECT 150::dpeek`), a cast `WITH
+FUNCTION`, a non-built-in default operator class of a column's type (used by `ORDER BY`,
+`DISTINCT`, `GROUP BY`, `UNION`), the input and output functions of a type, a range's helper
+functions, and the functions a view calls are refused, with a message naming the type or view and
+the function. A domain whose `CHECK` uses only built-in functions, enums and composite types are
+unaffected. Row-level security policies are not checked: a policy is the table owner's access
+control, and its functions run as part of it. A generated column runs nothing when it is read.
+
+Functions of the extensions in `MCP_TRUSTED_EXTENSIONS` count as built-in for all three rules
+(called, used as an operator, reached through a type). The default list is `pgcrypto`, `citext`,
+`hstore`, `pg_trgm`, `uuid-ossp`, `ltree`, `cube` and `earthdistance`: code installed by a superuser
+that reads no table. Set the variable to replace the list, or to an empty value to trust none.
 
 ## The corpus of things that got through
 
@@ -886,6 +898,7 @@ Reproduce it with `tests/soak.sh` rather than believing the paragraph.
 | `MCP_SERVER_LABEL` | name shown in the client UI, e.g. `production` → `postgres-mcp-hardened (production)` |
 | `MCP_SHOW_PARTITIONS` | `1` to list partition children as well (hidden by default) |
 | `MCP_ALLOW_FUNCTIONS` | comma-separated catalog functions to permit that we do not know to be read-only |
+| `MCP_TRUSTED_EXTENSIONS` | comma-separated extensions whose functions count as built-in under a surface allowlist (default `pgcrypto,citext,hstore,pg_trgm,uuid-ossp,ltree,cube,earthdistance`; empty = none) |
 | `MCP_SSLROOTCERT` | path to a PEM CA bundle for TLS to PostgreSQL (e.g. the AWS RDS bundle); system and Mozilla roots are trusted by default |
 | `MCP_MAX_INFLIGHT_PER_CLIENT` | max concurrent requests from one client (default 4; `0` disables) |
 | `MCP_RATE_RPM` | per-client request rate limit (default 120/min; `0` disables) |

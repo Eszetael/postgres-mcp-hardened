@@ -153,6 +153,25 @@ test and a case in `tests/acceptance.sh`:
   check as an operator named `###/**/`, while PostgreSQL ran `###`: the parser here reads an
   operator and a comment written without a space between them as one token. Such a statement is
   now refused with a message asking for the space.
+- **Code reached without being named passed the surface allowlist too (also in 0.1.11 and
+  earlier).** The same review class as the operator, found while closing it: with
+  `CREATE DOMAIN dpeek AS int CHECK (public.peek(VALUE, 1) > VALUE)`, `SELECT 50::dpeek` returned a
+  row and `SELECT 150::dpeek` failed with "violates check constraint", an oracle on the value the
+  `SECURITY DEFINER` function read; also as `dpeek(150)`, `'{150}'::dpeek[]`, a domain over that
+  domain, a composite with such a field, a `VALUES` row and a column list of `jsonb_to_record`. A
+  cast `WITH FUNCTION` (`'...'::text::mood`), a default btree operator class of a user type
+  (`ORDER BY`, `DISTINCT`, `GROUP BY`, `UNION` ran its comparison function) and a view calling the
+  function (`SELECT * FROM vpeek`) ran it as well. With an allowlist active, the relations and types
+  a statement uses are now followed through the catalogue before the query is planned (views and
+  the relations behind them, base types, array elements, composite fields, range subtypes), and any
+  function they reach outside `pg_catalog` is refused: a domain's `CHECK`, a cast function, type
+  input/output, range helpers, default btree/hash operator classes, the comparison operators of a
+  type that is not built in, and a view's calls. Functions of the extensions in the new
+  `MCP_TRUSTED_EXTENSIONS` (default `pgcrypto`, `citext`, `hstore`, `pg_trgm`, `uuid-ossp`,
+  `ltree`, `cube`, `earthdistance`) count as built-in, for function calls and operators as well;
+  `citext` and `hstore` queries that the allowlist refused before now pass. User-defined aggregates
+  and window functions were already refused by name. Row-level security policies are not checked,
+  and a generated column runs nothing when read (both tested).
 - **A password with `/`, `?`, `#` or `;` reached the audit log.** PostgreSQL's driver takes the
   credentials up to the first `@` of the whole string, so `postgres://u:Zm9v/YmFy+cXV4@host/db`
   connects, and the masker, which stopped at `/`, wrote it out. Of the 37 spellings in the review,

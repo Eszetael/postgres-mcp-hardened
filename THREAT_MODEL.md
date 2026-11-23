@@ -88,7 +88,7 @@ server checks each one rather than assuming it.
 | `BEGIN TRANSACTION READ ONLY` + rollback | `db.rs` | functions that write outside transactional control (`pg_import_system_collations` and relatives — hence the family denial above) |
 | Column redaction | `validate.rs`, `db.rs` | **name-based filtering, defeated four ways in review, and again in 0.1.11 through a `*` in a set operation, a whole row used as a value and `ORDER BY` by position. Depth, not a boundary.** The boundary is the column privilege. |
 | Role privileges | PostgreSQL | a `SECURITY DEFINER` function, which runs as its owner — the one thing that defeats even this, and the reason the surface allowlist refuses functions it cannot see inside |
-| Surface allowlist | `surface.rs`, the query plan | anything the plan does not name: a function body is opaque to the planner, so calls outside `pg_catalog` are refused while an allowlist is active, and so are operators whose function lies outside it (0.1.12). An operator reached through an operator class, when sorting or grouping a user-defined type, is not checked |
+| Surface allowlist | `surface.rs`, the query plan | anything the plan does not name: a function body is opaque to the planner, so calls outside `pg_catalog` are refused while an allowlist is active, and so are operators whose function lies outside it and code reached through a type or a view: a domain's `CHECK`, a cast function, a default operator class, a type's input and output (0.1.12). Functions of the extensions in `MCP_TRUSTED_EXTENSIONS` count as built-in. Row-level security policies are not checked: they are the table owner's control |
 | Start-up gate | `posture.rs` | an operator setting `i-accept-the-risk` — recorded in the audit |
 | Cost guard and timeouts | `tools.rs`, session settings | a query cheap to plan and expensive to run; `statement_timeout` is the backstop |
 | Rate and concurrency limits | `ratelimit.rs`, `pipeline.rs` | many source addresses; per-IP limiting does not isolate an actor, and we say so in the code. With `MCP_TRUST_PROXY=1` the key is the last `X-Forwarded-For` entry across all lines, so it is only as honest as the proxy that appends it |
@@ -259,8 +259,12 @@ Reports: see `SECURITY.md`. An accepted report becomes a line in the corpus, cre
   a start-up gate blind to column grants, sequences and `NOINHERIT` memberships, and no bound on slow
   connections. Each had a copy of a fix that was applied somewhere else. An independent review before
   the tag found one more, older than the round: an operator over a `SECURITY DEFINER` function passed
-  the surface allowlist, as it had since the allowlist existed. Operators are now resolved and judged
-  like the functions they call. What remains:
+  the surface allowlist, as it had since the allowlist existed, and so did the rest of that class:
+  a domain whose `CHECK` calls such a function (`150::dpeek` answered with a row or an error, an
+  oracle on the value), a cast `WITH FUNCTION`, a default operator class, a view that calls one.
+  Operators are now resolved and judged like the functions they call, and the code a statement
+  reaches through its types and views is found in the catalogue before the query is planned.
+  What remains:
   without a surface allowlist `pg_settings` and `SHOW ALL` show configuration (with one, both are
   refused); `current_setting` is checked for a literal name in any spelling, not for a name a
   function builds; a short shared token leaves a short

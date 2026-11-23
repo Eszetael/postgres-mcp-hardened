@@ -1559,8 +1559,32 @@ for q in "SELECT 1 = 1, 2 < 3, 'a' || 'b'" "SELECT name FROM customers WHERE nam
   case "$r" in ERROR:*) no "surface refused an ordinary operator: $q" "$r";; *) ok "surface: an ordinary operator still works: $q";; esac
 done
 r=$(tool query '{"sql":"SELECT name::citext = '"'"'x'"'"' FROM customers"}' | body)
-case "$r" in ERROR:*operator*) ok "surface: an extension's operator counts as its function (citext =)";; *) no "citext operator passed the surface" "$r";; esac
+case "$r" in ERROR:*) no "a trusted extension's operator was refused (citext =)" "$r";; *) ok "surface: an operator of a trusted extension works (citext is in MCP_TRUSTED_EXTENSIONS by default)";; esac
 docker exec acc_pg psql -U postgres -qc "DROP OPERATOR public.= (text, int); DROP OPERATOR public.### (int, int); DROP SCHEMA acc_ext CASCADE; DROP EXTENSION IF EXISTS citext;" >/dev/null 2>&1
+# P2 (0.1.12 review, also in 0.1.11): code a statement runs without naming it
+docker exec -i acc_pg psql -U postgres -q >/dev/null 2>&1 <<'SQL'
+CREATE DOMAIN public.acc_dpeek AS int CHECK (public.acc_peek(VALUE, 1) > VALUE);
+CREATE DOMAIN public.acc_dpos AS int CHECK (VALUE > 0);
+CREATE TYPE public.acc_mood AS ENUM ('ok', 'bad');
+CREATE FUNCTION public.acc_t2m(text) RETURNS public.acc_mood LANGUAGE plpgsql SECURITY DEFINER AS $$BEGIN RETURN enum_first(NULL::public.acc_mood); END$$;
+CREATE CAST (text AS public.acc_mood) WITH FUNCTION public.acc_t2m(text) AS IMPLICIT;
+CREATE VIEW public.acc_vpeek AS SELECT public.acc_peek(1, 1) AS s;
+CREATE TYPE public.acc_m2 AS ENUM ('a', 'b');
+CREATE FUNCTION public.acc_m2cmp(public.acc_m2, public.acc_m2) RETURNS int LANGUAGE plpgsql IMMUTABLE SECURITY DEFINER AS $$BEGIN RETURN enum_cmp($1, $2); END$$;
+CREATE OPERATOR CLASS public.acc_m2_ops DEFAULT FOR TYPE public.acc_m2 USING btree AS
+  OPERATOR 1 pg_catalog.< (anyenum, anyenum), OPERATOR 2 pg_catalog.<= (anyenum, anyenum), OPERATOR 3 pg_catalog.= (anyenum, anyenum),
+  OPERATOR 4 pg_catalog.>= (anyenum, anyenum), OPERATOR 5 pg_catalog.> (anyenum, anyenum), FUNCTION 1 public.acc_m2cmp(public.acc_m2, public.acc_m2);
+CREATE TABLE public.acc_m2t (k public.acc_m2); INSERT INTO public.acc_m2t VALUES ('a'), ('b');
+SQL
+for q in "SELECT 150::acc_dpeek" "SELECT '{150}'::acc_dpeek[]" "SELECT acc_dpeek(150)" "SELECT * FROM (VALUES (150::acc_dpeek)) v(x)" "SELECT 'x'::text::acc_mood" "SELECT * FROM acc_vpeek" "SELECT k FROM acc_m2t ORDER BY k" "SELECT DISTINCT k FROM acc_m2t"; do
+  r=$(tool query "{\"sql\":\"$q\"}" | body)
+  case "$r" in ERROR:*"without naming it"*) ok "surface: implicit code refused: $q";; *) no "implicit code ran under the surface: $q" "$r";; esac
+done
+for q in "SELECT 5::acc_dpos" "SELECT 'ok'::acc_mood" "SELECT id FROM customers ORDER BY name"; do
+  r=$(tool query "{\"sql\":\"$q\"}" | body)
+  case "$r" in ERROR:*) no "surface refused code-free types: $q" "$r";; *) ok "surface: a domain with a built-in CHECK, an enum and ordinary sorting work: $q";; esac
+done
+docker exec acc_pg psql -U postgres -qc "DROP VIEW public.acc_vpeek; DROP TABLE public.acc_m2t; DROP TYPE public.acc_m2 CASCADE; DROP CAST (text AS public.acc_mood); DROP TYPE public.acc_mood CASCADE; DROP DOMAIN public.acc_dpeek; DROP DOMAIN public.acc_dpos;" >/dev/null 2>&1
 stop
 # G5/G16: the password in the connection string never reaches the audit record or stderr
 i=0

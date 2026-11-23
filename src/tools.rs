@@ -674,8 +674,9 @@ pub(crate) fn cost_guard(sql: &str, max_cost: f64, db: Option<&str>) -> Result<(
             let v = query_catalog(
                 "SELECT p.proname AS name, n.nspname AS schema, p.prosecdef AS definer \
                  FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace \
-                 WHERE lower(p.proname) = ANY($1) AND n.nspname <> 'pg_catalog'",
-                &[&called],
+                 WHERE lower(p.proname) = ANY($1) AND n.nspname <> 'pg_catalog' \
+                   AND NOT EXISTS (SELECT 1 FROM pg_depend e JOIN pg_extension x ON x.oid = e.refobjid WHERE e.classid = 'pg_proc'::regclass AND e.objid = p.oid AND e.refclassid = 'pg_extension'::regclass AND e.deptype = 'e' AND x.extname = ANY($2))",
+                &[&called, &trusted_extensions()],
                 db,
             )
             .map_err(CostErr::QueryError)?;
@@ -720,6 +721,18 @@ pub(crate) fn cost_guard(sql: &str, max_cost: f64, db: Option<&str>) -> Result<(
                  permitted, for the same reason as functions. Add the function to \
                  MCP_ALLOW_FUNCTIONS if you have read it and it stays within the surface",
                 offenders.join(", ")
+            )));
+        }
+        // P2: code a statement runs without naming it.
+        let implicit = implicit_code_offenders(sql, db)?;
+        if !implicit.is_empty() {
+            return Err(CostErr::OutsideSurface(format!(
+                "would run code this server cannot see inside, without naming it: {}. While a \
+                 surface allowlist is configured, only built-in functions (and those of the \
+                 extensions in MCP_TRUSTED_EXTENSIONS) may run, whether called, used as an \
+                 operator, or reached through a type. Add the function to MCP_ALLOW_FUNCTIONS if \
+                 you have read it and it stays within the surface",
+                implicit.join(", ")
             )));
         }
     }
@@ -938,6 +951,174 @@ pub(crate) fn wrap_untrusted(data: &Value, tool: &str) -> Value {
     json!({ "result": result })
 }
 
+/// Extensions whose functions count as built-in for the surface rules: their code is the
+/// extension's, installed by a superuser, and reads no table. `MCP_TRUSTED_EXTENSIONS` replaces the
+/// default list (empty = none).
+pub(crate) const DEFAULT_TRUSTED_EXTENSIONS: &[&str] = &[
+    "pgcrypto",
+    "citext",
+    "hstore",
+    "pg_trgm",
+    "uuid-ossp",
+    "ltree",
+    "cube",
+    "earthdistance",
+];
+
+pub(crate) fn trusted_extensions() -> Vec<String> {
+    match std::env::var("MCP_TRUSTED_EXTENSIONS") {
+        Ok(v) => v
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect(),
+        Err(_) => DEFAULT_TRUSTED_EXTENSIONS
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
+    }
+}
+
+/// The catalogue walk behind P2, as one statement. $1: the relations the statement names, $2: the
+/// type names it converts to or calls, $3: trusted extensions. A view adds the relations and
+/// functions its rules depend on; a type adds its base, element, range subtype and composite
+/// fields. Then every function those reach: type input/output, a domain's CHECK (only for a type
+/// converted to, since reading a stored value does not check it), a cast whose source and target
+/// are both in play, a range's canonical and subtype_diff, the default btree and hash operator
+/// classes (sorting, grouping, DISTINCT, UNION, hashing), the comparison operators of a type in
+/// play that is not built in (`JOIN ... USING` looks `=` up by name), and the functions a view calls.
+/// Comparisons written in the statement are resolved exactly by the operator check (P1).
+const IMPLICIT_CODE_SQL: &str = "
+WITH RECURSIVE
+rels(oid) AS (
+  SELECT DISTINCT to_regclass(n)::oid FROM unnest($1::text[]) n WHERE to_regclass(n) IS NOT NULL
+  UNION
+  SELECT d.refobjid FROM rels r JOIN pg_rewrite rw ON rw.ev_class = r.oid
+    JOIN pg_depend d ON d.classid = 'pg_rewrite'::regclass AND d.objid = rw.oid
+     AND d.refclassid = 'pg_class'::regclass AND d.refobjid <> r.oid
+),
+seed(oid, via_cast) AS (
+  SELECT a.atttypid, false FROM pg_attribute a JOIN rels r ON a.attrelid = r.oid
+   WHERE a.attnum > 0 AND NOT a.attisdropped
+  UNION
+  SELECT to_regtype(n)::oid, true FROM unnest($2::text[]) n WHERE to_regtype(n) IS NOT NULL
+),
+types(oid, via_cast) AS (
+  SELECT oid, via_cast FROM seed
+  UNION
+  SELECT c.child, t.via_cast FROM types t JOIN pg_type ty ON ty.oid = t.oid
+  CROSS JOIN LATERAL (
+    SELECT NULLIF(ty.typbasetype, 0)
+    UNION ALL SELECT NULLIF(ty.typelem, 0)
+    UNION ALL SELECT rngsubtype FROM pg_range WHERE rngtypid = ty.oid
+    UNION ALL SELECT atttypid FROM pg_attribute
+              WHERE attrelid = ty.typrelid AND ty.typrelid <> 0 AND attnum > 0 AND NOT attisdropped
+  ) c(child) WHERE c.child IS NOT NULL
+),
+alltypes AS (SELECT DISTINCT oid FROM types),
+funcs(fn, why) AS (
+  SELECT f, 'input/output of type ' || format_type(ty.oid, NULL)
+    FROM alltypes t JOIN pg_type ty ON ty.oid = t.oid,
+    LATERAL unnest(ARRAY[ty.typinput, ty.typoutput, ty.typreceive, ty.typsend,
+                         ty.typmodin, ty.typmodout]::oid[]) f WHERE f <> 0
+  UNION ALL
+  SELECT d.refobjid, 'CHECK of domain ' || format_type(t.oid, NULL)
+    FROM types t JOIN pg_constraint c ON c.contypid = t.oid
+    JOIN pg_depend d ON d.classid = 'pg_constraint'::regclass AND d.objid = c.oid
+     AND d.refclassid = 'pg_proc'::regclass
+   WHERE t.via_cast
+  UNION ALL
+  SELECT c.castfunc, 'cast ' || format_type(c.castsource, NULL) || ' -> ' || format_type(c.casttarget, NULL)
+    FROM pg_cast c WHERE c.castfunc <> 0
+     AND c.castsource IN (SELECT oid FROM alltypes) AND c.casttarget IN (SELECT oid FROM alltypes)
+  UNION ALL
+  SELECT f, 'range type ' || format_type(r.rngtypid, NULL)
+    FROM pg_range r, LATERAL unnest(ARRAY[r.rngcanonical, r.rngsubdiff]::oid[]) f
+   WHERE r.rngtypid IN (SELECT oid FROM alltypes) AND f <> 0
+  UNION ALL
+  SELECT ap.amproc, 'operator class ' || oc.opcname || ' of ' || format_type(oc.opcintype, NULL)
+    FROM pg_opclass oc JOIN pg_am am ON am.oid = oc.opcmethod AND am.amname IN ('btree', 'hash')
+    JOIN pg_amproc ap ON ap.amprocfamily = oc.opcfamily
+   WHERE oc.opcdefault AND oc.opcintype IN (SELECT oid FROM alltypes)
+  UNION ALL
+  SELECT o.oprcode, 'operator class ' || oc.opcname || ' of ' || format_type(oc.opcintype, NULL)
+    FROM pg_opclass oc JOIN pg_am am ON am.oid = oc.opcmethod AND am.amname IN ('btree', 'hash')
+    JOIN pg_amop ao ON ao.amopfamily = oc.opcfamily JOIN pg_operator o ON o.oid = ao.amopopr
+   WHERE oc.opcdefault AND oc.opcintype IN (SELECT oid FROM alltypes)
+  UNION ALL
+  SELECT o.oprcode, 'operator ' || o.oprname || ' between ' || format_type(o.oprleft, NULL)
+         || ' and ' || format_type(o.oprright, NULL)
+    FROM pg_operator o JOIN pg_type lt ON lt.oid = o.oprleft
+   WHERE o.oprname IN ('=', '<>', '<', '<=', '>', '>=') AND o.oprleft = o.oprright
+     AND lt.typnamespace <> 'pg_catalog'::regnamespace
+     AND o.oprleft IN (SELECT oid FROM alltypes)
+  UNION ALL
+  SELECT d.refobjid, 'view ' || r.oid::regclass::text
+    FROM rels r JOIN pg_class rc ON rc.oid = r.oid AND rc.relkind = 'v'
+    JOIN pg_rewrite rw ON rw.ev_class = r.oid
+    JOIN pg_depend d ON d.classid = 'pg_rewrite'::regclass AND d.objid = rw.oid
+     AND d.refclassid = 'pg_proc'::regclass
+)
+SELECT DISTINCT f.why AS why, n.nspname AS schema, p.proname AS name, p.prosecdef AS definer
+  FROM funcs f JOIN pg_proc p ON p.oid = f.fn JOIN pg_namespace n ON n.oid = p.pronamespace
+ WHERE n.nspname <> 'pg_catalog'
+   AND NOT EXISTS (SELECT 1 FROM pg_depend e JOIN pg_extension x ON x.oid = e.refobjid
+                    WHERE e.classid = 'pg_proc'::regclass AND e.objid = p.oid
+                      AND e.refclassid = 'pg_extension'::regclass AND e.deptype = 'e'
+                      AND x.extname = ANY($3))
+";
+
+/// P2 of the 0.1.12 review: with a surface active, no function outside `pg_catalog` may run,
+/// including the ones a statement reaches without naming them. A domain's CHECK
+/// (`150::dpeek` answered "violates check constraint" or a row, an oracle on a salary),
+/// a cast `WITH FUNCTION`, a default operator class (`ORDER BY`, `DISTINCT` on a user type), and a
+/// view that calls a function all ran code the function check never saw. Returns `why: schema.fn`
+/// descriptions; empty when nothing outside the trusted set is reachable.
+fn implicit_code_offenders(sql: &str, db: Option<&str>) -> Result<Vec<String>, CostErr> {
+    let inputs = crate::validate::implicit_code_inputs(sql);
+    if inputs.unsure {
+        return Err(CostErr::OutsideSurface(
+            "uses a FROM item whose column types this server does not read, so it cannot tell \
+             what code converting into them would run; while a surface allowlist is configured \
+             it is refused"
+                .into(),
+        ));
+    }
+    if inputs.relations.is_empty() && inputs.types.is_empty() {
+        return Ok(Vec::new());
+    }
+    let v = query_catalog(
+        IMPLICIT_CODE_SQL,
+        &[&inputs.relations, &inputs.types, &trusted_extensions()],
+        db,
+    )
+    .map_err(CostErr::QueryError)?;
+    let empty = vec![];
+    let mut out: Vec<String> = v
+        .get("rows")
+        .and_then(|r| r.as_array())
+        .unwrap_or(&empty)
+        .iter()
+        .filter_map(|r| {
+            let name = r.get("name")?.as_str()?;
+            if crate::validate::function_explicitly_allowed(name) {
+                return None;
+            }
+            let definer = r.get("definer").and_then(|d| d.as_bool()).unwrap_or(false);
+            Some(format!(
+                "{}: {}.{}{}",
+                r.get("why")?.as_str()?,
+                r.get("schema")?.as_str()?,
+                name,
+                if definer { " (SECURITY DEFINER)" } else { "" }
+            ))
+        })
+        .collect();
+    out.sort();
+    out.dedup();
+    Ok(out)
+}
+
 /// The operators `sql` uses whose function lies outside `pg_catalog` and is not named in
 /// `MCP_ALLOW_FUNCTIONS`, as `schema.op -> schema.function` descriptions.
 ///
@@ -966,11 +1147,12 @@ fn operator_offenders(
                 format_type(o.oprleft, NULL) AS l, format_type(o.oprright, NULL) AS r, \
                 COALESCE((SELECT typcategory::text FROM pg_type WHERE oid = o.oprleft), '') AS lc, \
                 COALESCE((SELECT typcategory::text FROM pg_type WHERE oid = o.oprright), '') AS rc, \
-                p.proname AS func, pn.nspname AS fschema, p.prosecdef AS definer \
+                p.proname AS func, pn.nspname AS fschema, p.prosecdef AS definer, \
+                EXISTS (SELECT 1 FROM pg_depend e JOIN pg_extension x ON x.oid = e.refobjid WHERE e.classid = 'pg_proc'::regclass AND e.objid = p.oid AND e.refclassid = 'pg_extension'::regclass AND e.deptype = 'e' AND x.extname = ANY($2)) AS trusted \
          FROM pg_operator o JOIN pg_namespace n ON n.oid = o.oprnamespace \
          JOIN pg_proc p ON p.oid = o.oprcode JOIN pg_namespace pn ON pn.oid = p.pronamespace \
          WHERE o.oprname = ANY($1)",
-        &[&names],
+        &[&names, &trusted_extensions()],
         db,
     )
     .map_err(CostErr::QueryError)?;
@@ -1004,6 +1186,7 @@ fn operator_offenders(
                 lc: s("lc")?,
                 rc: s("rc")?,
                 outside: fschema != "pg_catalog"
+                    && !r.get("trusted").and_then(|t| t.as_bool()).unwrap_or(false)
                     && !crate::validate::function_explicitly_allowed(&func),
                 label: format!(
                     "{}.{} -> {}.{}{}",

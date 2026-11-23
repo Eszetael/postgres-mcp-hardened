@@ -4054,6 +4054,165 @@ pub(crate) fn order_by_using_operators(sql: &str) -> Vec<(String, Option<String>
     out
 }
 
+/// What a statement can make PostgreSQL run without naming it (P2 of the 0.1.12 review): the
+/// relations it reads (their column types, and a view's own calls), every type it converts a value
+/// to (a domain's CHECK, a cast function, a composite's fields), and names called like functions,
+/// which may be a type cast written as a call (`dpeek(150)`). Names are returned quoted exactly as
+/// PostgreSQL folds them, ready for `to_regclass`/`to_regtype`. `unsure` is set for a `FROM`
+/// item whose column types this collector does not read (none that PostgreSQL has, today).
+#[derive(Debug, Default, PartialEq)]
+pub(crate) struct ImplicitCodeInputs {
+    pub(crate) relations: Vec<String>,
+    pub(crate) types: Vec<String>,
+    pub(crate) unsure: bool,
+}
+
+fn quoted_name(name: &ObjectName) -> Option<String> {
+    let parts: Option<Vec<String>> = name
+        .0
+        .iter()
+        .map(|p| {
+            let id = p.as_ident()?;
+            let v = if id.quote_style.is_some() {
+                id.value.clone()
+            } else {
+                id.value.to_lowercase()
+            };
+            Some(format!("\"{}\"", v.replace('"', "\"\"")))
+        })
+        .collect();
+    parts.map(|p| p.join("."))
+}
+
+pub(crate) fn implicit_code_inputs(sql: &str) -> ImplicitCodeInputs {
+    let mut out = ImplicitCodeInputs::default();
+    let Ok(ast) = parse(sql) else {
+        return out;
+    };
+    struct C<'a>(&'a mut ImplicitCodeInputs);
+    impl Visitor for C<'_> {
+        type Break = ();
+        fn pre_visit_expr(&mut self, e: &Expr) -> ControlFlow<()> {
+            match e {
+                Expr::Cast { data_type, .. } => self.0.types.push(data_type.to_string()),
+                Expr::TypedString(ts) => self.0.types.push(ts.data_type.to_string()),
+                Expr::Function(f) => {
+                    if let Some(n) = quoted_name(&f.name) {
+                        self.0.types.push(n);
+                    }
+                }
+                _ => {}
+            }
+            ControlFlow::Continue(())
+        }
+        fn pre_visit_table_factor(&mut self, tf: &TableFactor) -> ControlFlow<()> {
+            let alias = match tf {
+                TableFactor::Table {
+                    name, alias, args, ..
+                } => {
+                    if args.is_none() {
+                        if let Some(n) = quoted_name(name) {
+                            self.0.relations.push(n);
+                        }
+                    } else if let Some(n) = quoted_name(name) {
+                        self.0.types.push(n);
+                    }
+                    alias
+                }
+                TableFactor::Derived { alias, .. }
+                | TableFactor::TableFunction { alias, .. }
+                | TableFactor::Function { alias, .. }
+                | TableFactor::UNNEST { alias, .. }
+                | TableFactor::NestedJoin { alias, .. } => alias,
+                TableFactor::XmlTable { columns, alias, .. } => {
+                    for c in columns {
+                        if let sqlparser::ast::XmlTableColumnOption::NamedInfo { r#type, .. } =
+                            &c.option
+                        {
+                            self.0.types.push(r#type.to_string());
+                        }
+                    }
+                    alias
+                }
+                TableFactor::JsonTable { columns, alias, .. } => {
+                    fn walk(cs: &[sqlparser::ast::JsonTableColumn], out: &mut Vec<String>) {
+                        for c in cs {
+                            match c {
+                                sqlparser::ast::JsonTableColumn::Named(n) => {
+                                    out.push(n.r#type.to_string())
+                                }
+                                sqlparser::ast::JsonTableColumn::Nested(n) => walk(&n.columns, out),
+                                sqlparser::ast::JsonTableColumn::ForOrdinality(_) => {}
+                            }
+                        }
+                    }
+                    walk(columns, &mut self.0.types);
+                    alias
+                }
+                _ => {
+                    self.0.unsure = true;
+                    return ControlFlow::Continue(());
+                }
+            };
+            if let Some(a) = alias {
+                for c in &a.columns {
+                    if let Some(dt) = &c.data_type {
+                        self.0.types.push(dt.to_string());
+                    }
+                }
+            }
+            ControlFlow::Continue(())
+        }
+    }
+    for st in &ast {
+        let _ = st.visit(&mut C(&mut out));
+    }
+    out.relations.sort();
+    out.relations.dedup();
+    out.types.sort();
+    out.types.dedup();
+    out
+}
+
+#[cfg(test)]
+mod implicit_code_tests {
+    use super::*;
+
+    #[test]
+    fn casts_relations_and_call_shaped_casts_are_collected() {
+        let i = implicit_code_inputs(
+            "SELECT 150::dpeek, CAST(x AS public.\"Dom\"[]), dpeek(1), int4 '5' \
+             FROM \"VPeek\" v JOIN s.t ON true, jsonb_to_record('{}') AS r(a dpeek)",
+        );
+        for t in ["dpeek", "public.\"Dom\"[]", "\"dpeek\"", "INT4"] {
+            assert!(
+                i.types.iter().any(|x| x.eq_ignore_ascii_case(t)),
+                "{t} in {:?}",
+                i.types
+            );
+        }
+        assert!(
+            i.relations.contains(&"\"VPeek\"".to_string()),
+            "{:?}",
+            i.relations
+        );
+        assert!(
+            i.relations.contains(&"\"s\".\"t\"".to_string()),
+            "{:?}",
+            i.relations
+        );
+        assert!(!i.unsure);
+        let j = implicit_code_inputs(
+            "SELECT * FROM JSON_TABLE('[1]'::jsonb, '$[*]' COLUMNS (a dpeek PATH '$')) jt",
+        );
+        assert!(!j.unsure && j.types.iter().any(|t| t == "dpeek"), "{j:?}");
+        let x = implicit_code_inputs(
+            "SELECT * FROM XMLTABLE('/r' PASSING '<r/>' COLUMNS a dpeek PATH 'a') x",
+        );
+        assert!(!x.unsure && x.types.iter().any(|t| t == "dpeek"), "{x:?}");
+    }
+}
+
 #[cfg(test)]
 mod operator_site_tests {
     use super::*;
