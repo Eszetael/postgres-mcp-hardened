@@ -3705,6 +3705,20 @@ fn binary_probe(l: &Expr, r: &Expr) -> String {
     .to_string()
 }
 
+/// The probe for `x [I]LIKE p` and `x [I]LIKE ANY (array)`: the latter compares with each element.
+fn like_probe(expr: &Expr, pattern: &Expr, any: bool) -> String {
+    if !any {
+        return binary_probe(expr, pattern);
+    }
+    Expr::Nested(Box::new(Expr::AnyOp {
+        left: nested(expr),
+        compare_op: probe_op(),
+        right: Box::new(pattern.clone()),
+        is_some: false,
+    }))
+    .to_string()
+}
+
 /// The operator uses one expression node makes, each with the probe text for that use.
 fn expr_operator_uses(expr: &Expr) -> Vec<(String, Option<String>, Option<String>)> {
     use sqlparser::ast::UnaryOperator;
@@ -3806,11 +3820,7 @@ fn expr_operator_uses(expr: &Expr) -> Vec<(String, Option<String>, Option<String
             ..
         } => {
             let sym = if *negated { "!~~" } else { "~~" };
-            vec![(
-                sym.into(),
-                None,
-                (!*any).then(|| binary_probe(expr, pattern)),
-            )]
+            vec![(sym.into(), None, Some(like_probe(expr, pattern, *any)))]
         }
         Expr::ILike {
             negated,
@@ -3820,11 +3830,7 @@ fn expr_operator_uses(expr: &Expr) -> Vec<(String, Option<String>, Option<String
             ..
         } => {
             let sym = if *negated { "!~~*" } else { "~~*" };
-            vec![(
-                sym.into(),
-                None,
-                (!*any).then(|| binary_probe(expr, pattern)),
-            )]
+            vec![(sym.into(), None, Some(like_probe(expr, pattern, *any)))]
         }
         Expr::SimilarTo {
             negated,
@@ -4017,6 +4023,11 @@ mod operator_site_tests {
         assert!(has("SELECT a FROM t WHERE a BETWEEN 1 AND 2", "<="));
         assert!(has("SELECT a FROM t WHERE a LIKE 'x%'", "~~"));
         assert!(has("SELECT a FROM t WHERE a NOT ILIKE 'x%'", "!~~*"));
+        let any = operator_sites("SELECT a FROM t WHERE a ILIKE ANY (ARRAY['a%', 'b%'])");
+        assert!(
+            any.iter().any(|s| s.symbol == "~~*" && s.probe.as_deref().is_some_and(|p| p.contains("ANY"))),
+            "{any:?}"
+        );
         assert!(has("SELECT a FROM t WHERE a IS DISTINCT FROM 1", "="));
         assert!(has("SELECT CASE a WHEN 1 THEN 2 END FROM t", "="));
         assert!(has("SELECT nullif(a, 1) FROM t", "="));
