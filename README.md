@@ -1,33 +1,39 @@
 # postgres-mcp-hardened
 
-> ### 🚧 Version 0.1.11: our own audit of the published 0.1.10
+> ### 🚧 Version 0.1.12: our own audit of the published 0.1.11
 >
-> Published: binaries for five platforms with checksums, Sigstore signatures and build provenance;
-> `.mcpb` bundles for one-click install; an image on `ghcr.io` for amd64 and arm64; a package on npm,
-> now published from GitHub Actions through npm trusted publishing, with no long-lived token; and an
-> entry in the official MCP registry.
+> Published the same way as before: binaries for five platforms with checksums, Sigstore signatures
+> and build provenance; `.mcpb` bundles; an image on `ghcr.io`; a package on npm from GitHub Actions
+> through trusted publishing; and an entry in the official MCP registry.
 >
-> **0.1.11 closes three bypasses of the main read-only control, found by us in the released 0.1.10.**
-> `SELECT * FROM LATERAL pg_read_file('/etc/hostname') x` returned the file, because the parser gives
-> `FROM LATERAL f()` a different node from `FROM f()` and only one of them had its name checked.
-> `ts_stat` and `ts_rewrite` run a query given as text, and through them a redacted column came back
-> as words. And with a column redacted, `UNION ALL SELECT *` or `(s.*)::text` returned it by position
-> or inside a whole row. If you run 0.1.10 or older, upgrade.
+> **0.1.12 closes bypasses of the schema allowlist and of the audit log's own protection, found by us
+> in the released 0.1.11** ([GHSA-cxv3-jw58-9gr9](https://github.com/Eszetael/postgres-mcp-hardened/security/advisories/GHSA-cxv3-jw58-9gr9)).
+> With `MCP_ALLOW_SCHEMAS` set, a function outside the allowlist still ran when the query never named
+> it: through an operator (`SELECT 1 ### 1`), a domain's `CHECK`, a cast `WITH FUNCTION`, a default
+> operator class or a view. Over a `SECURITY DEFINER` function, `SELECT 50::d` returned a row and
+> `SELECT 150::d` an error: an oracle on data outside the allowlist. Casts to `regclass` told whether a
+> hidden table exists. `--verify-audit` with a key accepted entries written without it. For six
+> spellings of `DATABASE_URL` the password was written to the audit log: **if you shipped audit logs
+> from 0.1.11 or older to a log collector, rotate the database password.** If you run 0.1.11 or older,
+> upgrade.
 >
-> **What the three share is the lesson of this release.** Each rule was written for one variant of
-> the syntax tree, and the grammar had a second. A test now tries eleven denied functions at 28
-> places a call can stand, and the match over `FROM` items has no catch-all arm, so a new variant
-> brought in by a parser upgrade stops the build instead of passing.
+> **The lesson of this release: PostgreSQL runs code the query does not name.** A check over the
+> words of a statement cannot see a domain constraint or a cast, so with an allowlist active, types
+> and views that carry user code are now refused before planning, and the message names the type and
+> the function. Extensions in `MCP_TRUSTED_EXTENSIONS` count as built-in.
 >
-> Also fixed: `EXPLAIN (ANALYSE)`, in the British spelling, executed the statement; one failed `SHOW`
-> left a pooled connection broken for ten seconds; host names such as `fd-prod.example.com` passed
-> for private addresses and skipped TLS; and CI had been red for three weeks on dependency advisories.
+> Also fixed: two `X-Forwarded-For` lines gave a client its own rate-limit bucket; filling the session
+> table logged every client out; another token could end a session it did not open; an idle client
+> could hold HTTP connections without limit; `MCP_REDACT_REQUIRE_REVOKE=1` reported success when its
+> check failed. An independent review before the tag found 17 faults in the first round of these
+> fixes; each is in [`CHANGELOG.md`](CHANGELOG.md) with its query.
 >
-> A resource limit is still documented and **not** solved, in [`THREAT_MODEL.md`](THREAT_MODEL.md):
-> 49 bytes of SQL make PostgreSQL fold a constant into 5.9 GB of backend memory during planning.
+> The advisory for 0.1.10, [GHSA-xjfm-h4wm-qmp6](https://github.com/Eszetael/postgres-mcp-hardened/security/advisories/GHSA-xjfm-h4wm-qmp6),
+> stayed a draft after 0.1.11 shipped. It is published now.
 >
-> Every change here was reproduced against a running server before being fixed, and each is in
-> [`CHANGELOG.md`](CHANGELOG.md) with the query.
+> Still documented and **not** solved, in [`THREAT_MODEL.md`](THREAT_MODEL.md): 49 bytes of SQL make
+> PostgreSQL fold a constant into 5.9 GB of backend memory during planning, and enough client addresses
+> can fill the connection table; put a reverse proxy with its own limits in front of a public listener.
 >
 > Everything here is 0.1.x because nobody outside this project has run it against their own data.
 
@@ -841,7 +847,7 @@ defeated in review and are therefore described as depth rather than as boundarie
 - **Audit:** every tool decision is logged as a tamper-evident, hash-chained JSON line (no raw SQL).
 - **Supply chain:** dependency licences, sources and advisories enforced in CI (`cargo deny`,
   `cargo audit`); a CycloneDX SBOM is attached to every release.
-- **Runtime:** ships as a distroless, non-root container — **14.9 MB to download** (`docker save | gzip`), 38 MB on disk for `linux/amd64` at 0.1.11, built and smoke-tested in CI. Both numbers, because a single one is always the flattering one: `docker images` shows the second, your bandwidth pays the first.
+- **Runtime:** ships as a distroless, non-root container — **15.4 MB to download** (`docker save | gzip`), 40 MB on disk for `linux/amd64` at 0.1.12, built and smoke-tested in CI. Both numbers, because a single one is always the flattering one: `docker images` shows the second, your bandwidth pays the first.
 
 ## Footprint
 
@@ -854,8 +860,8 @@ Rust" claim rather than take it:
 | Resident memory, after 200 requests | 9.4 MB, and flat afterwards |
 | Median request latency | ~8 ms — including the `curl` process the measurement spawns, so the server's own share is lower |
 | Start to first validated statement | 5 ms — median of five `--validate` runs, 5 to 7 ms observed |
-| Binary | 10.7 MB (linux x86_64, 0.1.11). Nothing to install alongside it — no Node, no Python, no shared library we ship. It is *not* statically linked: like any `-gnu` target it uses the system `libc`, `libm` and `libgcc_s`. |
-| Container image | 14.9 MB compressed (`docker save \| gzip`), 38.4 MB unpacked (linux/amd64, 0.1.11), distroless on Debian 13, non-root |
+| Binary | 12.7 MB (linux x86_64, 0.1.12). Nothing to install alongside it — no Node, no Python, no shared library we ship. It is *not* statically linked: like any `-gnu` target it uses the system `libc`, `libm` and `libgcc_s`. |
+| Container image | 15.4 MB compressed (`docker save \| gzip`), 40.4 MB unpacked (linux/amd64, 0.1.12), distroless on Debian 13, non-root |
 
 Two lines here were wrong until 0.1.7. Idle memory said 5.2 MB and measures 7.7 — five starts under
 identical conditions landed within 0.1 MB of one another, so the old figure is not noise, it is a
