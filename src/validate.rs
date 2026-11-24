@@ -125,8 +125,26 @@ pub fn validate_readonly(sql: &str) -> Result<(), ValidationError> {
     // 0. Nothing invisible outside a literal. Before any rule that reasons about a name, because
     //    every one of them compares text a hidden character can quietly change.
     reject_invisible_outside_literals(sql)?;
+    // 0. No comment glued to an operator. sqlparser lexes `###/**/` and `>--` as one operator, while
+    //    PostgreSQL ends the operator where `/*` or `--` begins and reads the rest as a comment: the
+    //    operator checks then looked up a name that exists nowhere (`1 ###/**/ 1` ran `###`), and a
+    //    `--` comments out whatever this server puts after it on the same line. Found by the fuzzer
+    //    in the 0.1.12 review round.
+    reject_comment_in_operator(sql)?;
     // 1. The statement shape must be purely read-only (SELECT/WITH/EXPLAIN/SHOW).
     structural_readonly(&ast[0])?;
+    // `ORDER BY x USING OPERATOR(s.op)`: sqlparser 0.63 parses it (0.62 did not), and it calls the
+    // operator's function on every comparison of the sort. One outside pg_catalog is refused
+    // always, with or without a surface (R15 of the 0.1.12 review).
+    if let Some((op, schema)) = order_by_using_operators(sql)
+        .into_iter()
+        .find_map(|(o, s)| s.filter(|s| s != "pg_catalog").map(|s| (o, s)))
+    {
+        return Err(ValidationError::NotReadOnly(format!(
+            "ORDER BY ... USING OPERATOR({schema}.{op}) sorts with an operator outside pg_catalog, \
+             whose function this server cannot see inside"
+        )));
+    }
     // 2. Defence in depth: functions with SIDE EFFECTS (setval, dblink_exec, lo_export, pg_read_file…).
     //    We scan the AST (Expr::Function nodes and relation/table-function names in FROM), NOT the text —
     //    we read `ident.value`, so how a literal is rendered (quotes, $$…$$, E'…') and where comments sit
@@ -345,6 +363,26 @@ fn reject_invisible_outside_literals(sql: &str) -> Result<(), ValidationError> {
     Ok(())
 }
 
+/// See the call site: an operator token that contains `/*` or `--` means two different statements
+/// to sqlparser and to PostgreSQL.
+fn reject_comment_in_operator(sql: &str) -> Result<(), ValidationError> {
+    let Ok(tokens) = Tokenizer::new(&PostgreSqlDialect {}, sql).tokenize() else {
+        return Ok(()); // unlexable input is rejected by the parser
+    };
+    for t in &tokens {
+        let Token::CustomBinaryOperator(text) = t else {
+            continue;
+        };
+        if text.contains("/*") || text.contains("--") {
+            return Err(ValidationError::NotParseable(format!(
+                "the operator {text:?} runs into a comment; PostgreSQL would end the operator where \
+                 the comment starts and read the rest differently. Put a space before the comment"
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Is there a `;` outside literals and comments with any further token after it?
 /// The sqlparser tokenizer shares the parser lexis, so quoting cannot be used to sneak past this.
 fn has_trailing_statement(sql: &str) -> bool {
@@ -458,9 +496,16 @@ impl SecurityScanner {
                     return ControlFlow::Break(());
                 }
                 let lowered = table.to_lowercase();
-                if matches!(classify_function(&lowered), FnVerdict::SideEffect) {
-                    self.hit = Some(format!("side-effect function: {}", lowered));
-                    return ControlFlow::Break(());
+                match classify_function(&lowered) {
+                    FnVerdict::SideEffect => {
+                        self.hit = Some(format!("side-effect function: {}", lowered));
+                        return ControlFlow::Break(());
+                    }
+                    FnVerdict::ServerConfig => {
+                        self.hit = Some(server_config_refusal(&lowered));
+                        return ControlFlow::Break(());
+                    }
+                    _ => {}
                 }
                 ControlFlow::Continue(())
             }
@@ -575,8 +620,26 @@ impl SecurityScanner {
                     | JoinOperator::RightSemi(c)
                     | JoinOperator::Anti(c)
                     | JoinOperator::LeftAnti(c)
-                    | JoinOperator::RightAnti(c) => c,
-                    _ => continue,
+                    | JoinOperator::RightAnti(c)
+                    | JoinOperator::CrossJoin(c)
+                    | JoinOperator::StraightJoin(c) => c,
+                    // Joins PostgreSQL does not have. No `_` arm, and refused rather than skipped: the
+                    // old `_ => continue` meant a join kind added by a parser upgrade was waved
+                    // through the very check that reads join constraints, so the upgrade has to stop
+                    // the build here and an unwritten rule must refuse, not pass.
+                    JoinOperator::CrossApply
+                    | JoinOperator::OuterApply
+                    | JoinOperator::AsOf { .. }
+                    | JoinOperator::ArrayJoin
+                    | JoinOperator::LeftArrayJoin
+                    | JoinOperator::InnerArrayJoin => {
+                        self.evasion = Some(
+                            "a join kind PostgreSQL does not have, refused because no rule here \
+                             was written for it while redaction is configured"
+                                .into(),
+                        );
+                        return ControlFlow::Break(());
+                    }
                 };
                 match constraint {
                     JoinConstraint::Using(cols) => {
@@ -659,6 +722,26 @@ impl Visitor for SecurityScanner {
         // false comfort: `SELECT password AS pw` renames it, `SELECT md5(password)` leaks it a
         // character at a time. Refusing the reference closes both, and masking the value in the
         // output still covers `SELECT *`, where the column is never named.
+        // `'secret.salaries'::regclass` answers "does this relation exist, and in which schema" with
+        // an error or a value, and `to_regclass` and friends do the same in function form (refused in
+        // `cost_guard`). While a surface allowlist is configured and the catalogue is not opened,
+        // that is a way to ask about relations the caller was told are not there.
+        if crate::surface::active() && !crate::surface::catalog_allowed() {
+            let cast_to = match expr {
+                Expr::Cast { data_type, .. } => Some(data_type),
+                Expr::TypedString(ts) => Some(&ts.data_type),
+                _ => None,
+            };
+            if cast_to.is_some_and(is_reg_type) {
+                self.hit = Some(
+                    "a cast to a reg* type looks a name up in the catalogue; while a surface \
+                     allowlist is configured the catalogue is out of reach (MCP_ALLOW_CATALOG=1 \
+                     opens it)"
+                        .into(),
+                );
+                return ControlFlow::Break(());
+            }
+        }
         match expr {
             Expr::Identifier(id) => {
                 if is_redacted(&id.value.to_lowercase()) {
@@ -738,6 +821,28 @@ impl Visitor for SecurityScanner {
             _ => {}
         }
         if let Expr::Function(f) = expr {
+            // `SHOW data_directory` is refused; `SELECT current_setting('data_directory')` answered
+            // the same question. Only a literal name can be read here (`current_setting('data_' ||
+            // 'directory')` is not), which is why `cost_guard` also refuses the function itself
+            // while a surface is configured, and why `pg_settings` is documented as the way round.
+            if last_part_name(&f.name).as_deref() == Some("current_setting") {
+                // Every spelling of a string literal counts (R11 of the 0.1.12 review: E'',
+                // $$..$$, U&'', a cast to text and parentheses went through), and so does a
+                // concatenation of literals.
+                if let FunctionArguments::List(l) = &f.args {
+                    if let Some(FunctionArg::Unnamed(FunctionArgExpr::Expr(arg))) = l.args.first() {
+                        for name in literal_texts(arg) {
+                            let name = name.to_lowercase();
+                            if SENSITIVE_SHOW_VARS.contains(&name.as_str()) {
+                                self.hit = Some(format!(
+                                    "current_setting('{name}') reads server configuration, which SHOW {name} refuses too"
+                                ));
+                                return ControlFlow::Break(());
+                            }
+                        }
+                    }
+                }
+            }
             // `t.*` as a function argument is a FunctionArgExpr, not an Expr, so the whole-row check
             // never saw `ROW(t.*)::text` or `to_jsonb(t.*)::text` — both of which flatten the record
             // into one string and carry the redacted column out inside it. In a plain projection
@@ -759,14 +864,19 @@ impl Visitor for SecurityScanner {
                             }
                     )
                 });
-                if whole_row
-                    && !f
-                        .name
-                        .0
-                        .last()
-                        .and_then(|n| n.as_ident())
-                        .is_some_and(|n| n.value.eq_ignore_ascii_case("count"))
-                {
+                // `count(*)` and `count(t.*)` count rows and carry no value out. `count(DISTINCT t.*)`
+                // does: it counts DISTINCT rows, so it answers "are these two rows equal" over the
+                // redacted column too, and a binary search on that is a read. DISTINCT turns the one
+                // exception into a refusal.
+                let distinct = matches!(&f.args, FunctionArguments::List(l)
+                    if matches!(l.duplicate_treatment, Some(sqlparser::ast::DuplicateTreatment::Distinct)));
+                let is_count = f
+                    .name
+                    .0
+                    .last()
+                    .and_then(|n| n.as_ident())
+                    .is_some_and(|n| n.value.eq_ignore_ascii_case("count"));
+                if whole_row && !(is_count && !distinct) {
                     self.evasion =
                         Some("serialising a whole row through a wildcard argument".into());
                     return ControlFlow::Break(());
@@ -806,9 +916,16 @@ impl Visitor for SecurityScanner {
             return ControlFlow::Break(());
         }
         if let Some(n) = last_part_name(name) {
-            if matches!(classify_function(&n), FnVerdict::SideEffect) {
-                self.hit = Some(format!("side-effect function: {}", n));
-                return ControlFlow::Break(());
+            match classify_function(&n) {
+                FnVerdict::SideEffect => {
+                    self.hit = Some(format!("side-effect function: {}", n));
+                    return ControlFlow::Break(());
+                }
+                FnVerdict::ServerConfig => {
+                    self.hit = Some(server_config_refusal(&n));
+                    return ControlFlow::Break(());
+                }
+                _ => {}
             }
         }
         ControlFlow::Continue(())
@@ -863,7 +980,9 @@ impl Visitor for SecurityScanner {
             | TableFactor::JsonTable { .. }
             | TableFactor::XmlTable { .. } => ControlFlow::Continue(()),
             TableFactor::Pivot { .. } => refuse_unwritten_factor(self, "PIVOT"),
-            TableFactor::Unpivot { .. } => refuse_unwritten_factor(self, "UNPIVOT"),
+            TableFactor::Unpivot { .. } | TableFactor::UnpivotExpr { .. } => {
+                refuse_unwritten_factor(self, "UNPIVOT")
+            }
             TableFactor::MatchRecognize { .. } => refuse_unwritten_factor(self, "MATCH_RECOGNIZE"),
             TableFactor::OpenJsonTable { .. } => refuse_unwritten_factor(self, "OPENJSON"),
             TableFactor::SemanticView { .. } => refuse_unwritten_factor(self, "SEMANTIC_VIEW"),
@@ -952,6 +1071,17 @@ fn structural_readonly(stmt: &Statement) -> Result<(), ValidationError> {
                     "SHOW {} (server layout)",
                     name
                 )))
+            } else if name == "all"
+                && crate::surface::active()
+                && !crate::surface::catalog_allowed()
+            {
+                // `SHOW ALL` is `pg_settings` in another form, and the surface refuses pg_settings.
+                Err(ValidationError::NotReadOnly(
+                    "SHOW ALL lists every server setting, like pg_settings; while a surface \
+                     allowlist is configured the catalogue is out of reach (MCP_ALLOW_CATALOG=1 \
+                     opens it)"
+                        .into(),
+                ))
             } else {
                 Ok(())
             }
@@ -982,6 +1112,8 @@ pub enum FnVerdict {
     RawStorage,
     /// Runs SQL it was handed as text, so nothing in the statement shows what it will read.
     SqlAsText,
+    /// Server configuration or statement history, refused like the `SHOW` it duplicates.
+    ServerConfig,
 }
 
 /// Relations that ARE the storage, rather than a view of it.
@@ -1191,11 +1323,10 @@ fn folded_size_estimate(expr: &Expr) -> Option<u64> {
             _ => None,
         },
         // `a || b` concatenates, so the sizes add.
-        Expr::BinaryOp {
-            left,
-            op: BinaryOperator::StringConcat,
-            right,
-        } => {
+        Expr::BinaryOp { left, op, right }
+            if matches!(op, BinaryOperator::StringConcat)
+                || matches!(op, BinaryOperator::Custom(c) if pg_operator_name(c) == "||") =>
+        {
             let (a, b) = (folded_size_estimate(left)?, folded_size_estimate(right)?);
             Some(a.saturating_add(b).min(CAP))
         }
@@ -1363,6 +1494,9 @@ pub fn classify_function(name: &str) -> FnVerdict {
     if SQL_AS_TEXT_FUNCS.contains(&name) {
         return FnVerdict::SqlAsText;
     }
+    if SERVER_CONFIG_NAMES.contains(&name) {
+        return FnVerdict::ServerConfig;
+    }
     if SIDE_EFFECT_FUNCS.contains(&name)
         || EXTENSION_WRITE_FUNCS.contains(&name)
         || DENY_FAMILIES.iter().any(|p| name.starts_with(p))
@@ -1376,12 +1510,20 @@ pub fn classify_function(name: &str) -> FnVerdict {
     FnVerdict::Allowed
 }
 
+fn server_config_refusal(name: &str) -> String {
+    format!(
+        "{name} reads server configuration or the server's statement history, which SHOW and \
+         pg_file_settings refuse too"
+    )
+}
+
 /// Rejection message — distinguishes "this writes" from "we do not know this catalog function", so the
 /// operator can tell a real control from a gap in our knowledge (and how to close it).
 fn function_rejection(name: &str) -> Option<String> {
     match classify_function(name) {
         FnVerdict::Allowed => None,
         FnVerdict::SideEffect => Some(format!("side-effect function: {}", name)),
+        FnVerdict::ServerConfig => Some(server_config_refusal(name)),
         FnVerdict::RawStorage => Some(format!(
             "raw-storage function: {} — it returns pages or tuples as bytes, which column controls \
              (redaction, projection) cannot inspect",
@@ -1459,7 +1601,6 @@ fn is_known_read(name: &str) -> bool {
         "pg_visible_in_snapshot",
         "pg_settings_get_flags",
         "pg_show_all_settings",
-        "pg_show_all_file_settings",
         "pg_tablespace_databases",
         "pg_partition_tree",
         "pg_partition_root",
@@ -1798,7 +1939,32 @@ const SAFE_DESPITE_FAMILY: &[&str] = &["lo_get", "lo_get_fragment"];
 
 /// Known built-in PostgreSQL functions with side effects (they write, mutate the session, cause DoS
 /// or do I/O) even though they may appear syntactically inside a SELECT. Explicit, fail-closed list.
+/// Server configuration and statement history, by full name. Exact names rather than families
+/// (R14 of the 0.1.12 review): the prefixes `pg_config` and `pg_stat_statements` also refused a
+/// user's own `public.pg_configs`, and told them it was a "side-effect function".
+///
+/// `pg_file_settings` was refused (the `pg_file_` family) while `pg_show_all_file_settings()`, the
+/// function behind it, and the views `pg_hba_file_rules` and `pg_ident_file_mappings` went through.
+/// `pg_stat_statements` (view and function) is the text of every statement the server ran,
+/// literals included, so a redacted value typed into somebody's WHERE clause comes back out;
+/// `top_queries` reads it through the server's own connection instead. `pg_replication_slots` was
+/// refused through the `pg_replication_` family while `pg_get_replication_slots()` was not;
+/// `pg_config` lists the build's install paths and was open as a view while the function was
+/// refused. Found by walking every catalogue view against the function it is built on (0.1.12).
+const SERVER_CONFIG_NAMES: &[&str] = &[
+    "pg_show_all_file_settings",
+    "pg_hba_file_rules",
+    "pg_ident_file_mappings",
+    "pg_stat_statements",
+    "pg_stat_statements_info",
+    "pg_get_replication_slots",
+    "pg_config",
+];
+
 const SIDE_EFFECT_FUNCS: &[&str] = &[
+    // closes connections held by this session's foreign servers: a side effect
+    "postgres_fdw_disconnect",
+    "postgres_fdw_disconnect_all",
     // sequences (writes)
     "setval",
     "nextval",
@@ -2112,9 +2278,18 @@ fn is_count_or_exists(q: &Query) -> bool {
         SelectItem::ExprWithAlias { expr, .. } => expr,
         _ => return false,
     };
+    // Only a statement that returns ONE row needs no LIMIT. `count(*) OVER ()` and `count(*)` with
+    // GROUP BY return a row per input row or per group, and `SELECT EXISTS(...) FROM t` one row per
+    // row of t: each used to skip the limit because the projection merely looked like a count.
+    let one_row_aggregate =
+        matches!(&s.group_by, sqlparser::ast::GroupByExpr::Expressions(v, _) if v.is_empty());
     match expr {
-        Expr::Function(f) => last_part_name(&f.name).as_deref() == Some("count"),
-        Expr::Exists { .. } => true,
+        Expr::Function(f) => {
+            last_part_name(&f.name).as_deref() == Some("count")
+                && f.over.is_none()
+                && one_row_aggregate
+        }
+        Expr::Exists { .. } => s.from.is_empty(),
         _ => false,
     }
 }
@@ -2359,6 +2534,47 @@ mod tests {
             .to_uppercase();
         assert!(!count.contains("LIMIT"), "count should be skipped: {count}");
     }
+
+    /// What reaches PostgreSQL is `enforce_limit`'s reserialisation, not the caller's text, so a
+    /// statement that parses but serialises into something PostgreSQL rejects fails only at the
+    /// database, after every check here said yes. Round-trip: parse, render, parse again, and the
+    /// rendering must itself be accepted.
+    #[test]
+    fn what_we_send_to_the_database_parses_again() {
+        for sql in [
+            "SELECT 1 x UNION ALL TABLE seq",
+            "SELECT 1 UNION SELECT 2 ORDER BY 1",
+            "(SELECT 1) UNION ALL (SELECT 2)",
+            "VALUES (1), (2)",
+            "WITH c AS (SELECT 1 UNION ALL SELECT 2) SELECT * FROM c",
+        ] {
+            let sent = enforce_limit(sql, 100).unwrap_or_else(|e| panic!("{sql}: {e}"));
+            let again = Parser::parse_sql(&PostgreSqlDialect {}, &sent).unwrap_or_else(|e| {
+                panic!("{sql} was sent as `{sent}`, which does not parse: {e}")
+            });
+            assert_eq!(again.len(), 1, "{sent}");
+        }
+    }
+
+    /// Only statements that return ONE row skip the limit. These looked like counts and were not.
+    #[test]
+    fn a_projection_that_only_resembles_a_count_still_gets_a_limit() {
+        for sql in [
+            "SELECT count(*) OVER () FROM users",
+            "SELECT EXISTS(SELECT 1) FROM users",
+            "SELECT count(*) FROM users GROUP BY id",
+        ] {
+            let out = enforce_limit(sql, 100).unwrap().to_uppercase();
+            assert!(out.contains("LIMIT 100"), "{sql} -> {out}");
+        }
+        for sql in [
+            "SELECT count(*) FROM users",
+            "SELECT EXISTS(SELECT 1 FROM users)",
+        ] {
+            let out = enforce_limit(sql, 100).unwrap().to_uppercase();
+            assert!(!out.contains("LIMIT"), "{sql} -> {out}");
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2367,6 +2583,46 @@ mod adversarial {
 
     // Attack vectors: EVERY one must return Err(ValidationError)
     const MUST_REJECT: &[&str] = &[
+        // a comment glued to an operator: one statement to sqlparser, another to PostgreSQL
+        "SELECT 1 ###/**/ 1",
+        "SELECT id FROM t ORDER BY id USING >--",
+        "SELECT id FROM t WHERE id >/**/ 0",
+        // R15: a sort operator outside pg_catalog
+        r#"SELECT id FROM t ORDER BY id USING OPERATOR(s.<<<)"#,
+        r#"SELECT array_agg(id ORDER BY id USING OPERATOR(public.<<<)) FROM t"#,
+        r#"SELECT row_number() OVER (ORDER BY id USING OPERATOR(s.<<<)) FROM t"#,
+        // R14: the exact names stay refused, in any schema (an extension lives where it was created)
+        r#"SELECT * FROM public.pg_stat_statements"#,
+        r#"SELECT * FROM pg_config"#,
+        r#"SELECT * FROM pg_hba_file_rules()"#,
+        r#"SELECT postgres_fdw_disconnect_all()"#,
+        // R11 of the 0.1.12 review: every spelling of the literal
+        r#"SELECT current_setting(E'data_directory')"#,
+        r#"SELECT current_setting(E'data\x5fdirectory')"#,
+        r#"SELECT current_setting($$data_directory$$)"#,
+        r#"SELECT current_setting($x$hba_file$x$)"#,
+        r#"SELECT current_setting(U&'data_directory')"#,
+        r#"SELECT current_setting(U&'d\0061ta_directory')"#,
+        r#"SELECT current_setting('data_directory'::text)"#,
+        r#"SELECT current_setting(('data_directory'))"#,
+        r#"SELECT current_setting(CAST('data_directory' AS text))"#,
+        r#"SELECT current_setting('data_' || 'directory')"#,
+        r#"SELECT current_setting('data_' ||/*?*/ 'directory')"#,
+        r#"SELECT current_setting(text('data_directory'))"#,
+        // one fact, one answer: the function, the view and its siblings (0.1.12 audit)
+        "SELECT * FROM pg_show_all_file_settings()",
+        "SELECT * FROM LATERAL pg_show_all_file_settings() x",
+        "SELECT * FROM pg_hba_file_rules",
+        "SELECT * FROM pg_ident_file_mappings",
+        "SELECT * FROM pg_file_settings",
+        "SELECT * FROM pg_stat_statements",
+        "SELECT postgres_fdw_disconnect_all()",
+        "SELECT * FROM pg_get_replication_slots()",
+        "SELECT * FROM pg_config",
+        // current_setting answers what SHOW refuses (0.1.12 audit F10).
+        "SELECT current_setting('data_directory')",
+        "SELECT current_setting('SSL_KEY_FILE')",
+        "SELECT current_setting('archive_command', true)",
         // SQL passed as TEXT: the AST cannot see inside a string literal, so nothing this validator
         // enforces applies to what these run. Live proof before the fix: server files read, the data
         // directory listed, a catalog-writing function executed, two statements from one call.
@@ -2529,6 +2785,19 @@ mod adversarial {
 
     // Legitimate reads: EVERY one must return Ok(())
     const MUST_ALLOW: &[&str] = &[
+        r#"SELECT id FROM t ORDER BY id USING <"#,
+        r#"SELECT id FROM t ORDER BY id USING OPERATOR(pg_catalog.<)"#,
+        // R14: a user's table whose name merely starts like a refused catalogue object
+        r#"SELECT * FROM public.pg_configs"#,
+        r#"SELECT * FROM pg_stat_statements_archive"#,
+        r#"SELECT current_setting(E'search_path')"#,
+        r#"SELECT current_setting($$statement_timeout$$)"#,
+        // a user's type named reg-something, and reg* casts without a surface (R8, 0.1.12 review)
+        r#"SELECT * FROM sales WHERE region = 'EU'::region"#,
+        r#"SELECT '{a}'::regclass[]"#,
+        // an ordinary setting stays readable
+        "SELECT current_setting('statement_timeout')",
+        "SELECT current_setting('search_path')",
         r#"SELECT * FROM users"#,
         r#"SELECT a,b FROM t WHERE x>1 ORDER BY a LIMIT 10"#,
         r#"WITH r AS (SELECT 1 AS n) SELECT * FROM r"#,
@@ -2879,6 +3148,69 @@ mod join_oracle_tests {
             .filter(|m| m.contains(redacted) || m.contains("NATURAL"))
     }
 
+    /// Existence oracle through a cast: `'secret.salaries'::regclass` resolves a name in the
+    /// catalogue. The rule applies only while a surface is configured (environment), so the unit test
+    /// pins the recogniser and the live suite pins the refusal.
+    #[test]
+    fn a_cast_to_an_object_identifier_type_is_recognised_in_every_spelling() {
+        for (sql, want) in [
+            ("SELECT 'a.b'::regclass", true),
+            ("SELECT 'a'::regtype", true),
+            ("SELECT regclass 'a'", true),
+            ("SELECT CAST('a' AS regproc)", true),
+            ("SELECT 'a'::regnamespace", true),
+            ("SELECT 'a'::pg_catalog.regclass", true),
+            ("SELECT 'a'::\"regclass\"", true),
+            ("SELECT '{a}'::regclass[]", true),
+            ("SELECT ARRAY['a']::regclass[]", true),
+            ("SELECT CAST(ARRAY['a'] AS regclass[])", true),
+            ("SELECT '{a}'::pg_catalog.regtype[]", true),
+            ("SELECT 'a'::regcollation", true),
+            ("SELECT '{a}'::regclass ARRAY", true),
+            ("SELECT 1::int", false),
+            ("SELECT 'a'::text", false),
+            // R8: user types that merely start with "reg"
+            ("SELECT 'EU'::region", false),
+            ("SELECT CAST('US' AS region)", false),
+            ("SELECT 'ok'::registry_status", false),
+            ("SELECT NULL::regular_t", false),
+            ("SELECT '{EU}'::region[]", false),
+            ("SELECT 'a'::app.regclass", false),
+            ("SELECT 'a'::regclassx", false),
+        ] {
+            let ast = Parser::parse_sql(&PostgreSqlDialect {}, sql).expect("parses");
+            let mut found = false;
+            let _ = sqlparser::ast::visit_expressions(&ast, |e| {
+                match e {
+                    Expr::Cast { data_type, .. } => found |= is_reg_type(data_type),
+                    Expr::TypedString(ts) => found |= is_reg_type(&ts.data_type),
+                    _ => {}
+                }
+                ControlFlow::<()>::Continue(())
+            });
+            assert_eq!(found, want, "{sql}");
+        }
+    }
+
+    /// `count(DISTINCT s.*)` compares whole rows for equality, redacted column included (0.1.12).
+    #[test]
+    fn distinct_over_a_whole_row_is_refused_but_a_plain_count_is_not() {
+        for sql in [
+            "SELECT count(DISTINCT s.*) FROM staff s",
+            "SELECT count(DISTINCT staff.*) FROM staff",
+            "SELECT array_agg(s.*) FROM staff s",
+        ] {
+            assert!(refusal_with_redaction(sql).is_some(), "{sql}");
+        }
+        for sql in [
+            "SELECT count(*) FROM staff",
+            "SELECT count(s.*) FROM staff s",
+            "SELECT count(DISTINCT first_name) FROM staff",
+        ] {
+            assert!(refusal_with_redaction(sql).is_none(), "{sql}");
+        }
+    }
+
     /// What the scanner says about a statement with redaction on, whatever the wording. Structural
     /// rules (a wildcard as a value, a positional rename) name no column, so `evasion_for`'s filter
     /// on the column name would hide them.
@@ -3134,5 +3466,823 @@ mod folded_constant_tests {
         assert!(!e.contains("non-read-only"), "{e}");
         assert!(e.contains("planning"), "{e}");
         assert!(v("DROP TABLE t").unwrap_err().contains("non-read-only"));
+    }
+}
+
+/// The texts a string-literal expression can stand for: every literal spelling (plain, `E''` with
+/// its escapes read, `$$..$$`, `U&''` with its escapes read), under parentheses and casts, and the
+/// concatenation of such literals. Both the raw and the decoded text are returned when they differ.
+/// Empty when the expression is not built from literals alone.
+fn literal_texts(e: &Expr) -> Vec<String> {
+    match e {
+        Expr::Nested(inner) => literal_texts(inner),
+        Expr::Cast { expr, .. } => literal_texts(expr),
+        Expr::TypedString(ts) => literal_texts(&Expr::Value(ts.value.clone())),
+        // `text('x')`, `varchar('x')`: a cast written as a call
+        Expr::Function(f)
+            if matches!(
+                last_part_name(&f.name).as_deref(),
+                Some("text" | "varchar" | "name" | "bpchar")
+            ) =>
+        {
+            match &f.args {
+                FunctionArguments::List(l) => match l.args.as_slice() {
+                    [FunctionArg::Unnamed(FunctionArgExpr::Expr(a))] => literal_texts(a),
+                    _ => vec![],
+                },
+                _ => vec![],
+            }
+        }
+        Expr::Value(v) => {
+            let raw = match &v.value {
+                Value::SingleQuotedString(s)
+                | Value::TripleSingleQuotedString(s)
+                | Value::NationalStringLiteral(s) => vec![s.clone()],
+                Value::EscapedStringLiteral(s) => vec![s.clone(), decode_c_escapes(s)],
+                Value::UnicodeStringLiteral(s) => vec![s.clone(), decode_unicode_escapes(s)],
+                Value::DollarQuotedString(d) => vec![d.value.clone()],
+                _ => vec![],
+            };
+            let mut raw = raw;
+            raw.dedup();
+            raw
+        }
+        Expr::BinaryOp { left, op, right }
+            if matches!(op, BinaryOperator::StringConcat)
+                || matches!(op, BinaryOperator::Custom(c) if pg_operator_name(c) == "||") =>
+        {
+            let (l, r) = (literal_texts(left), literal_texts(right));
+            let mut out = Vec::new();
+            for a in &l {
+                for b in &r {
+                    out.push(format!("{a}{b}"));
+                }
+            }
+            out
+        }
+        _ => vec![],
+    }
+}
+
+/// `E'...'` escapes: `\n`-style letters, octal, `\xHH`, `\uXXXX`, `\UXXXXXXXX`, and `\c` = `c`.
+fn decode_c_escapes(s: &str) -> String {
+    let c: Vec<char> = s.chars().collect();
+    let (mut out, mut i) = (String::new(), 0);
+    let hex = |from: usize, max: usize| -> (Option<char>, usize) {
+        let digits: String = c[from..]
+            .iter()
+            .take(max)
+            .take_while(|d| d.is_ascii_hexdigit())
+            .collect();
+        let n = digits.len();
+        (
+            u32::from_str_radix(&digits, 16)
+                .ok()
+                .and_then(char::from_u32),
+            n,
+        )
+    };
+    while i < c.len() {
+        if c[i] != '\\' || i + 1 >= c.len() {
+            out.push(c[i]);
+            i += 1;
+            continue;
+        }
+        let k = c[i + 1];
+        let (ch, used) = match k {
+            'n' => (Some('\n'), 1),
+            't' => (Some('\t'), 1),
+            'r' => (Some('\r'), 1),
+            'b' => (Some('\u{8}'), 1),
+            'f' => (Some('\u{c}'), 1),
+            'x' => {
+                let (ch, n) = hex(i + 2, 2);
+                (ch, 1 + n)
+            }
+            'u' => {
+                let (ch, n) = hex(i + 2, 4);
+                (ch, 1 + n)
+            }
+            'U' => {
+                let (ch, n) = hex(i + 2, 8);
+                (ch, 1 + n)
+            }
+            '0'..='7' => {
+                let digits: String = c[i + 1..]
+                    .iter()
+                    .take(3)
+                    .take_while(|d| ('0'..='7').contains(d))
+                    .collect();
+                let n = digits.len();
+                (
+                    u32::from_str_radix(&digits, 8)
+                        .ok()
+                        .and_then(char::from_u32),
+                    n,
+                )
+            }
+            other => (Some(other), 1),
+        };
+        if let Some(ch) = ch {
+            out.push(ch);
+        }
+        i += 1 + used;
+    }
+    out
+}
+
+/// `U&'...'` escapes with the default escape character: `\XXXX` and `\+XXXXXX`.
+fn decode_unicode_escapes(s: &str) -> String {
+    let c: Vec<char> = s.chars().collect();
+    let (mut out, mut i) = (String::new(), 0);
+    while i < c.len() {
+        if c[i] == '\\' {
+            let (start, len) = if c.get(i + 1) == Some(&'+') {
+                (i + 2, 6)
+            } else {
+                (i + 1, 4)
+            };
+            let digits: String = c
+                .get(start..start + len)
+                .map(|d| d.iter().collect())
+                .unwrap_or_default();
+            if digits.len() == len {
+                if let Some(ch) = u32::from_str_radix(&digits, 16)
+                    .ok()
+                    .and_then(char::from_u32)
+                {
+                    out.push(ch);
+                    i = start + len;
+                    continue;
+                }
+            }
+            if c.get(i + 1) == Some(&'\\') {
+                out.push('\\');
+                i += 2;
+                continue;
+            }
+        }
+        out.push(c[i]);
+        i += 1;
+    }
+    out
+}
+
+/// The object-identifier aliases whose input function resolves a name through the catalogue. An
+/// exact list: "starts with reg" also caught a user's `region` enum (R8 of the 0.1.12 review).
+pub(crate) const REG_TYPES: &[&str] = &[
+    "regclass",
+    "regtype",
+    "regproc",
+    "regprocedure",
+    "regoper",
+    "regoperator",
+    "regnamespace",
+    "regrole",
+    "regconfig",
+    "regdictionary",
+    "regcollation",
+];
+
+/// A reg* type in any spelling: bare or `pg_catalog.`-qualified, quoted, or as the element of an
+/// array (`regclass[]`, R7 of the 0.1.12 review: `'{secret.t}'::regclass[]` was the same oracle).
+fn is_reg_type(dt: &sqlparser::ast::DataType) -> bool {
+    use sqlparser::ast::{ArrayElemTypeDef, DataType};
+    match dt {
+        DataType::Regclass => true,
+        DataType::Array(
+            ArrayElemTypeDef::AngleBracket(inner)
+            | ArrayElemTypeDef::SquareBracket(inner, _)
+            | ArrayElemTypeDef::Parenthesis(inner)
+            | ArrayElemTypeDef::Qualified(inner, _),
+        ) => is_reg_type(inner),
+        DataType::Custom(name, _) => {
+            let parts: Vec<String> = name
+                .0
+                .iter()
+                .map(|p| {
+                    p.as_ident()
+                        .map(|i| i.value.to_lowercase())
+                        .unwrap_or_default()
+                })
+                .collect();
+            match parts.as_slice() {
+                [t] => REG_TYPES.contains(&t.as_str()),
+                [schema, t] => schema == "pg_catalog" && REG_TYPES.contains(&t.as_str()),
+                _ => false,
+            }
+        }
+        _ => false,
+    }
+}
+
+// --- Operators (P1 of the 0.1.12 review) ---
+//
+// An operator is a function call written as a symbol: `1 ### 1` runs whatever function the operator
+// names, SECURITY DEFINER included, and the surface rule for functions never saw it because there was
+// no call in the statement to look at. These helpers list every place a statement makes PostgreSQL
+// look an operator up by name, so `cost_guard` can resolve each one against `pg_operator`.
+
+/// The operator name that never exists, used to make PostgreSQL report the operand types of one use.
+pub(crate) const PROBE_OPERATOR: &str = "pg_catalog.@@@@@";
+const PROBE_PLACEHOLDER: &str = "__mcp_operator_probe__";
+
+/// One use of an operator in a statement.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct OperatorSite {
+    /// the operator's name, e.g. `=` or `###`
+    pub(crate) symbol: String,
+    /// the schema written in `OPERATOR(schema.op)`, lowercased; `None` when unqualified
+    pub(crate) schema: Option<String>,
+    /// the statement with this use replaced by the same operands around [`PROBE_OPERATOR`], whose
+    /// "operator does not exist" error names the operand types; `None` when it cannot be built
+    pub(crate) probe: Option<String>,
+}
+
+fn is_operator_symbol(s: &str) -> bool {
+    !s.is_empty() && s.chars().all(|c| "+-*/<>=~!@#%^&|`?".contains(c))
+}
+
+fn probe_op() -> BinaryOperator {
+    BinaryOperator::PGCustomBinaryOperator(vec!["pg_catalog".into(), "@@@@@".into()])
+}
+
+/// The operator name PostgreSQL's lexer reads from `s`. A multi-character operator ends where `/*`
+/// or `--` begins, and cannot end in `+` or `-` unless it also contains one of `~ ! @ # % ^ & | ` ?`.
+/// sqlparser lexes a custom operator greedily, so `1 ###/**/ 1` reached here as the operator
+/// `###/**/`, which exists nowhere, while PostgreSQL ran `###` (found by the fuzzer in the 0.1.12
+/// review round: it walked straight past the operator check).
+pub(crate) fn pg_operator_name(s: &str) -> String {
+    let end = ["/*", "--"]
+        .iter()
+        .filter_map(|p| s.find(p))
+        .min()
+        .unwrap_or(s.len());
+    let mut name = &s[..end];
+    if !name.contains(['~', '!', '@', '#', '%', '^', '&', '|', '`', '?']) {
+        while name.len() > 1 && (name.ends_with('+') || name.ends_with('-')) {
+            name = &name[..name.len() - 1];
+        }
+    }
+    name.to_string()
+}
+
+fn binary_symbol(op: &BinaryOperator) -> Option<(String, Option<String>)> {
+    if let BinaryOperator::Custom(c) = op {
+        let name = pg_operator_name(c);
+        return is_operator_symbol(&name).then_some((name, None));
+    }
+    if let BinaryOperator::PGCustomBinaryOperator(parts) = op {
+        return Some(match parts.as_slice() {
+            [o] => (pg_operator_name(o), None),
+            [s, o] => (pg_operator_name(o), Some(s.to_lowercase())),
+            // a name we cannot read is judged as qualified with a schema that matches nothing safe
+            _ => (parts.join("."), Some(String::new())),
+        });
+    }
+    let s = op.to_string();
+    is_operator_symbol(&s).then_some((s, None))
+}
+
+fn nested(e: &Expr) -> Box<Expr> {
+    Box::new(Expr::Nested(Box::new(e.clone())))
+}
+
+/// `(L) OPERATOR(pg_catalog.@@@@@) (R)` as text.
+fn binary_probe(l: &Expr, r: &Expr) -> String {
+    Expr::Nested(Box::new(Expr::BinaryOp {
+        left: nested(l),
+        op: probe_op(),
+        right: nested(r),
+    }))
+    .to_string()
+}
+
+/// The probe for `x [I]LIKE p` and `x [I]LIKE ANY (array)`: the latter compares with each element.
+fn like_probe(expr: &Expr, pattern: &Expr, any: bool) -> String {
+    if !any {
+        return binary_probe(expr, pattern);
+    }
+    Expr::Nested(Box::new(Expr::AnyOp {
+        left: nested(expr),
+        compare_op: probe_op(),
+        right: Box::new(pattern.clone()),
+        is_some: false,
+    }))
+    .to_string()
+}
+
+/// The operator uses one expression node makes, each with the probe text for that use.
+fn expr_operator_uses(expr: &Expr) -> Vec<(String, Option<String>, Option<String>)> {
+    use sqlparser::ast::UnaryOperator;
+    let eq = |l: &Expr, r: &Expr, sym: &str| (sym.to_string(), None, Some(binary_probe(l, r)));
+    match expr {
+        Expr::BinaryOp { left, op, right } => match binary_symbol(op) {
+            Some((sym, None)) => vec![(sym, None, Some(binary_probe(left, right)))],
+            Some((sym, schema)) => vec![(sym, schema, None)],
+            None => vec![],
+        },
+        Expr::AnyOp {
+            left,
+            compare_op,
+            right,
+            is_some,
+        } => match binary_symbol(compare_op) {
+            Some((sym, None)) => {
+                let probe = Expr::Nested(Box::new(Expr::AnyOp {
+                    left: nested(left),
+                    compare_op: probe_op(),
+                    right: right.clone(),
+                    is_some: *is_some,
+                }))
+                .to_string();
+                vec![(sym, None, Some(probe))]
+            }
+            Some((sym, schema)) => vec![(sym, schema, None)],
+            None => vec![],
+        },
+        Expr::AllOp {
+            left,
+            compare_op,
+            right,
+        } => match binary_symbol(compare_op) {
+            Some((sym, None)) => {
+                let probe = Expr::Nested(Box::new(Expr::AllOp {
+                    left: nested(left),
+                    compare_op: probe_op(),
+                    right: right.clone(),
+                }))
+                .to_string();
+                vec![(sym, None, Some(probe))]
+            }
+            Some((sym, schema)) => vec![(sym, schema, None)],
+            None => vec![],
+        },
+        Expr::UnaryOp { op, expr } => {
+            let sym = op.to_string();
+            if !is_operator_symbol(&sym) {
+                return vec![];
+            }
+            // postfix operators are gone since PostgreSQL 14; no probe, judged by name alone
+            let probe = (*op != UnaryOperator::PGPostfixFactorial)
+                .then(|| format!("(OPERATOR({PROBE_OPERATOR}) ({expr}))"));
+            vec![(sym, None, probe)]
+        }
+        // The forms that look `=`, `<>`, `<`, `~~` and friends up by name without writing them.
+        Expr::InList {
+            expr,
+            list,
+            negated,
+        } => list
+            .iter()
+            .map(|e| eq(expr, e, if *negated { "<>" } else { "=" }))
+            .collect(),
+        Expr::InSubquery {
+            expr,
+            subquery,
+            negated,
+        } => {
+            let probe = Expr::Nested(Box::new(Expr::AnyOp {
+                left: nested(expr),
+                compare_op: probe_op(),
+                right: Box::new(Expr::Subquery(subquery.clone())),
+                is_some: false,
+            }))
+            .to_string();
+            vec![(
+                (if *negated { "<>" } else { "=" }).into(),
+                None,
+                Some(probe),
+            )]
+        }
+        Expr::Between {
+            expr,
+            negated,
+            low,
+            high,
+        } => {
+            let (lo, hi) = if *negated { ("<", ">") } else { (">=", "<=") };
+            vec![eq(expr, low, lo), eq(expr, high, hi)]
+        }
+        Expr::IsDistinctFrom(a, b) | Expr::IsNotDistinctFrom(a, b) => vec![eq(a, b, "=")],
+        Expr::Like {
+            negated,
+            any,
+            expr,
+            pattern,
+            ..
+        } => {
+            let sym = if *negated { "!~~" } else { "~~" };
+            vec![(sym.into(), None, Some(like_probe(expr, pattern, *any)))]
+        }
+        Expr::ILike {
+            negated,
+            any,
+            expr,
+            pattern,
+            ..
+        } => {
+            let sym = if *negated { "!~~*" } else { "~~*" };
+            vec![(sym.into(), None, Some(like_probe(expr, pattern, *any)))]
+        }
+        Expr::SimilarTo {
+            negated,
+            expr,
+            pattern,
+            ..
+        } => vec![eq(expr, pattern, if *negated { "!~" } else { "~" })],
+        Expr::Case {
+            operand: Some(o),
+            conditions,
+            ..
+        } => conditions
+            .iter()
+            .map(|c| eq(o, &c.condition, "="))
+            .collect(),
+        Expr::Function(f) if last_part_name(&f.name).as_deref() == Some("nullif") => {
+            match &f.args {
+                FunctionArguments::List(l) => match l.args.as_slice() {
+                    [FunctionArg::Unnamed(FunctionArgExpr::Expr(a)), FunctionArg::Unnamed(FunctionArgExpr::Expr(b))] =>
+                    {
+                        vec![eq(a, b, "=")]
+                    }
+                    _ => vec![("=".into(), None, None)],
+                },
+                _ => vec![("=".into(), None, None)],
+            }
+        }
+        _ => vec![],
+    }
+}
+
+/// Every place `sql` makes PostgreSQL look an operator up by name, in the order a pre-order walk of
+/// the statement meets them, followed by the `ORDER BY ... USING` operators (read from the tokens,
+/// because they appear in window and aggregate orderings too). An unparsable statement has none;
+/// the validator refuses it anyway.
+pub(crate) fn operator_sites(sql: &str) -> Vec<OperatorSite> {
+    let Ok(ast) = parse(sql) else {
+        return Vec::new();
+    };
+    let Some(stmt) = ast.into_iter().next() else {
+        return Vec::new();
+    };
+    struct Collect {
+        uses: Vec<(usize, String, Option<String>, Option<String>)>,
+        n: usize,
+    }
+    impl sqlparser::ast::VisitorMut for Collect {
+        type Break = ();
+        fn pre_visit_expr(&mut self, expr: &mut Expr) -> ControlFlow<()> {
+            for (sym, schema, probe) in expr_operator_uses(expr) {
+                self.uses.push((self.n, sym, schema, probe));
+            }
+            self.n += 1;
+            ControlFlow::Continue(())
+        }
+    }
+    struct Replace {
+        target: usize,
+        n: usize,
+    }
+    impl sqlparser::ast::VisitorMut for Replace {
+        type Break = ();
+        fn pre_visit_expr(&mut self, expr: &mut Expr) -> ControlFlow<()> {
+            if self.n == self.target {
+                *expr = Expr::Identifier(sqlparser::ast::Ident::new(PROBE_PLACEHOLDER));
+                return ControlFlow::Break(());
+            }
+            self.n += 1;
+            ControlFlow::Continue(())
+        }
+    }
+    use sqlparser::ast::VisitMut;
+    let mut walk = stmt.clone();
+    let mut c = Collect {
+        uses: Vec::new(),
+        n: 0,
+    };
+    let _ = VisitMut::visit(&mut walk, &mut c);
+    let mut out: Vec<OperatorSite> = c
+        .uses
+        .into_iter()
+        .map(|(ordinal, symbol, schema, probe)| {
+            let probe = probe.and_then(|p| {
+                let mut copy = stmt.clone();
+                let _ = VisitMut::visit(
+                    &mut copy,
+                    &mut Replace {
+                        target: ordinal,
+                        n: 0,
+                    },
+                );
+                let text = copy.to_string();
+                (text.matches(PROBE_PLACEHOLDER).count() == 1)
+                    .then(|| text.replace(PROBE_PLACEHOLDER, &p))
+            });
+            OperatorSite {
+                symbol,
+                schema,
+                probe,
+            }
+        })
+        .collect();
+    out.extend(
+        order_by_using_operators(sql)
+            .into_iter()
+            .map(|(symbol, schema)| OperatorSite {
+                symbol,
+                schema,
+                probe: None,
+            }),
+    );
+    out
+}
+
+/// `USING <op>` and `USING OPERATOR(schema.op)` after an ordering expression, read from the tokens.
+/// A join's `USING (cols)` is followed by a parenthesis and is not an operator.
+pub(crate) fn order_by_using_operators(sql: &str) -> Vec<(String, Option<String>)> {
+    let Ok(tokens) = Tokenizer::new(&PostgreSqlDialect {}, sql).tokenize() else {
+        return Vec::new();
+    };
+    let t: Vec<&Token> = tokens
+        .iter()
+        .filter(|t| !matches!(t, Token::Whitespace(_)))
+        .collect();
+    let mut out = Vec::new();
+    for i in 0..t.len() {
+        let Token::Word(w) = t[i] else { continue };
+        if !w.value.eq_ignore_ascii_case("using") || w.quote_style.is_some() {
+            continue;
+        }
+        match t.get(i + 1) {
+            Some(Token::Word(o)) if o.value.eq_ignore_ascii_case("operator") => {
+                // OPERATOR ( [schema .] op )
+                let mut inner = Vec::new();
+                for tok in t.iter().skip(i + 2) {
+                    match tok {
+                        Token::LParen => continue,
+                        Token::RParen => break,
+                        other => inner.push(other.to_string()),
+                    }
+                }
+                let joined = inner.concat();
+                match joined.rsplit_once('.') {
+                    Some((s, o)) => out.push((
+                        pg_operator_name(o),
+                        Some(s.trim_matches('"').to_lowercase()),
+                    )),
+                    None => out.push((pg_operator_name(&joined), None)),
+                }
+            }
+            Some(Token::LParen) | Some(Token::Word(_)) | None => {}
+            Some(_) => {
+                let mut sym = String::new();
+                for tok in t.iter().skip(i + 1) {
+                    let s = tok.to_string();
+                    if is_operator_symbol(&s) {
+                        sym.push_str(&s);
+                    } else {
+                        break;
+                    }
+                }
+                if !sym.is_empty() {
+                    out.push((pg_operator_name(&sym), None));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// What a statement can make PostgreSQL run without naming it (P2 of the 0.1.12 review): the
+/// relations it reads (their column types, and a view's own calls), every type it converts a value
+/// to (a domain's CHECK, a cast function, a composite's fields), and names called like functions,
+/// which may be a type cast written as a call (`dpeek(150)`). Names are returned quoted exactly as
+/// PostgreSQL folds them, ready for `to_regclass`/`to_regtype`. `unsure` is set for a `FROM`
+/// item whose column types this collector does not read (none that PostgreSQL has, today).
+#[derive(Debug, Default, PartialEq)]
+pub(crate) struct ImplicitCodeInputs {
+    pub(crate) relations: Vec<String>,
+    pub(crate) types: Vec<String>,
+    pub(crate) unsure: bool,
+}
+
+fn quoted_name(name: &ObjectName) -> Option<String> {
+    let parts: Option<Vec<String>> = name
+        .0
+        .iter()
+        .map(|p| {
+            let id = p.as_ident()?;
+            let v = if id.quote_style.is_some() {
+                id.value.clone()
+            } else {
+                id.value.to_lowercase()
+            };
+            Some(format!("\"{}\"", v.replace('"', "\"\"")))
+        })
+        .collect();
+    parts.map(|p| p.join("."))
+}
+
+pub(crate) fn implicit_code_inputs(sql: &str) -> ImplicitCodeInputs {
+    let mut out = ImplicitCodeInputs::default();
+    let Ok(ast) = parse(sql) else {
+        return out;
+    };
+    struct C<'a>(&'a mut ImplicitCodeInputs);
+    impl Visitor for C<'_> {
+        type Break = ();
+        fn pre_visit_expr(&mut self, e: &Expr) -> ControlFlow<()> {
+            match e {
+                Expr::Cast { data_type, .. } => self.0.types.push(data_type.to_string()),
+                Expr::TypedString(ts) => self.0.types.push(ts.data_type.to_string()),
+                Expr::Function(f) => {
+                    if let Some(n) = quoted_name(&f.name) {
+                        self.0.types.push(n);
+                    }
+                }
+                _ => {}
+            }
+            ControlFlow::Continue(())
+        }
+        fn pre_visit_table_factor(&mut self, tf: &TableFactor) -> ControlFlow<()> {
+            let alias = match tf {
+                TableFactor::Table {
+                    name, alias, args, ..
+                } => {
+                    if args.is_none() {
+                        if let Some(n) = quoted_name(name) {
+                            self.0.relations.push(n);
+                        }
+                    } else if let Some(n) = quoted_name(name) {
+                        self.0.types.push(n);
+                    }
+                    alias
+                }
+                TableFactor::Derived { alias, .. }
+                | TableFactor::TableFunction { alias, .. }
+                | TableFactor::Function { alias, .. }
+                | TableFactor::UNNEST { alias, .. }
+                | TableFactor::NestedJoin { alias, .. } => alias,
+                TableFactor::XmlTable { columns, alias, .. } => {
+                    for c in columns {
+                        if let sqlparser::ast::XmlTableColumnOption::NamedInfo { r#type, .. } =
+                            &c.option
+                        {
+                            self.0.types.push(r#type.to_string());
+                        }
+                    }
+                    alias
+                }
+                TableFactor::JsonTable { columns, alias, .. } => {
+                    fn walk(cs: &[sqlparser::ast::JsonTableColumn], out: &mut Vec<String>) {
+                        for c in cs {
+                            match c {
+                                sqlparser::ast::JsonTableColumn::Named(n) => {
+                                    out.push(n.r#type.to_string())
+                                }
+                                sqlparser::ast::JsonTableColumn::Nested(n) => walk(&n.columns, out),
+                                sqlparser::ast::JsonTableColumn::ForOrdinality(_) => {}
+                            }
+                        }
+                    }
+                    walk(columns, &mut self.0.types);
+                    alias
+                }
+                _ => {
+                    self.0.unsure = true;
+                    return ControlFlow::Continue(());
+                }
+            };
+            if let Some(a) = alias {
+                for c in &a.columns {
+                    if let Some(dt) = &c.data_type {
+                        self.0.types.push(dt.to_string());
+                    }
+                }
+            }
+            ControlFlow::Continue(())
+        }
+    }
+    for st in &ast {
+        let _ = st.visit(&mut C(&mut out));
+    }
+    out.relations.sort();
+    out.relations.dedup();
+    out.types.sort();
+    out.types.dedup();
+    out
+}
+
+#[cfg(test)]
+mod implicit_code_tests {
+    use super::*;
+
+    #[test]
+    fn casts_relations_and_call_shaped_casts_are_collected() {
+        let i = implicit_code_inputs(
+            "SELECT 150::dpeek, CAST(x AS public.\"Dom\"[]), dpeek(1), int4 '5' \
+             FROM \"VPeek\" v JOIN s.t ON true, jsonb_to_record('{}') AS r(a dpeek)",
+        );
+        for t in ["dpeek", "public.\"Dom\"[]", "\"dpeek\"", "INT4"] {
+            assert!(
+                i.types.iter().any(|x| x.eq_ignore_ascii_case(t)),
+                "{t} in {:?}",
+                i.types
+            );
+        }
+        assert!(
+            i.relations.contains(&"\"VPeek\"".to_string()),
+            "{:?}",
+            i.relations
+        );
+        assert!(
+            i.relations.contains(&"\"s\".\"t\"".to_string()),
+            "{:?}",
+            i.relations
+        );
+        assert!(!i.unsure);
+        let j = implicit_code_inputs(
+            "SELECT * FROM JSON_TABLE('[1]'::jsonb, '$[*]' COLUMNS (a dpeek PATH '$')) jt",
+        );
+        assert!(!j.unsure && j.types.iter().any(|t| t == "dpeek"), "{j:?}");
+        let x = implicit_code_inputs(
+            "SELECT * FROM XMLTABLE('/r' PASSING '<r/>' COLUMNS a dpeek PATH 'a') x",
+        );
+        assert!(!x.unsure && x.types.iter().any(|t| t == "dpeek"), "{x:?}");
+    }
+}
+
+#[cfg(test)]
+mod operator_site_tests {
+    use super::*;
+
+    fn syms(sql: &str) -> Vec<(String, Option<String>, bool)> {
+        operator_sites(sql)
+            .into_iter()
+            .map(|s| (s.symbol, s.schema, s.probe.is_some()))
+            .collect()
+    }
+
+    #[test]
+    fn every_way_of_naming_an_operator_is_found() {
+        let has = |sql: &str, sym: &str| syms(sql).iter().any(|(s, _, _)| s == sym);
+        assert!(has("SELECT 1 ### 1", "###"));
+        // a comment glued to a custom operator is not part of its name (sqlparser lexes it in)
+        assert!(has("SELECT 1 ###/**/ 1", "###"));
+        assert!(has("SELECT 1 ###/*?*/ 1", "###"));
+        assert_eq!(pg_operator_name("<<<-"), "<<<");
+        assert_eq!(pg_operator_name("@-"), "@-");
+        assert_eq!(pg_operator_name("||/*?*/"), "||");
+        assert_eq!(pg_operator_name("###--x"), "###");
+        assert!(has("SELECT a FROM t WHERE a = 1", "="));
+        assert!(has("SELECT a FROM t WHERE a IN (1, 2)", "="));
+        assert!(has("SELECT a FROM t WHERE a NOT IN (1, 2)", "<>"));
+        assert!(has("SELECT a FROM t WHERE a IN (SELECT b FROM u)", "="));
+        assert!(has("SELECT a FROM t WHERE a BETWEEN 1 AND 2", ">="));
+        assert!(has("SELECT a FROM t WHERE a BETWEEN 1 AND 2", "<="));
+        assert!(has("SELECT a FROM t WHERE a LIKE 'x%'", "~~"));
+        assert!(has("SELECT a FROM t WHERE a NOT ILIKE 'x%'", "!~~*"));
+        let any = operator_sites("SELECT a FROM t WHERE a ILIKE ANY (ARRAY['a%', 'b%'])");
+        assert!(
+            any.iter().any(|s| s.symbol == "~~*" && s.probe.as_deref().is_some_and(|p| p.contains("ANY"))),
+            "{any:?}"
+        );
+        assert!(has("SELECT a FROM t WHERE a IS DISTINCT FROM 1", "="));
+        assert!(has("SELECT CASE a WHEN 1 THEN 2 END FROM t", "="));
+        assert!(has("SELECT nullif(a, 1) FROM t", "="));
+        assert!(has("SELECT a FROM t WHERE a = ANY(ARRAY[1])", "="));
+        assert!(has("SELECT a FROM t WHERE a < ALL(ARRAY[1])", "<"));
+        assert!(has("SELECT -a FROM t", "-"));
+        assert!(has("SELECT j ->> 'k' FROM t", "->>"));
+        assert!(has("SELECT a FROM t ORDER BY a USING <", "<"));
+        let q = syms("SELECT 1 OPERATOR(ext.<<<) 1");
+        assert!(
+            q.contains(&("<<<".into(), Some("ext".into()), false)),
+            "{q:?}"
+        );
+        let u = operator_sites("SELECT a FROM t ORDER BY a USING OPERATOR(ext.<<<)");
+        assert!(
+            u.iter()
+                .any(|s| s.symbol == "<<<" && s.schema.as_deref() == Some("ext")),
+            "{u:?}"
+        );
+        // a join's USING is not an operator
+        assert!(operator_sites("SELECT * FROM a JOIN b USING (id)").is_empty());
+        assert!(operator_sites("SELECT 1").is_empty());
+    }
+
+    #[test]
+    fn the_probe_keeps_the_rest_of_the_statement_and_replaces_one_use() {
+        let s = operator_sites("SELECT a + 1 FROM t WHERE a = 2 AND b = 3");
+        let probes: Vec<String> = s.iter().filter_map(|x| x.probe.clone()).collect();
+        assert_eq!(probes.len(), 3);
+        for p in &probes {
+            assert_eq!(p.matches(PROBE_OPERATOR).count(), 1, "{p}");
+            assert!(p.contains("FROM t"), "{p}");
+        }
+        assert!(probes
+            .iter()
+            .any(|p| p.contains("(a) OPERATOR(pg_catalog.@@@@@) (2)")));
     }
 }

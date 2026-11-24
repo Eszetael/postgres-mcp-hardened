@@ -123,20 +123,38 @@ pub(crate) fn evaluate(db: Option<&str>) -> Result<RoleFacts, String> {
     const MEMBERSHIPS: &str = MEMBERSHIPS_SQL;
     // Bounded: a schema with hundreds of thousands of relations must not turn a start-up check into
     // an outage. When the bound is hit we say so rather than reporting a partial count as the whole.
-    const WRITABLE: &str = "WITH s AS ( \
-             SELECT c.oid, n.nspname, c.relname FROM pg_class c \
+    //
+    // "Can write" is asked of EVERY role the connected one may become, not of `current_user` alone:
+    // a NOINHERIT role (the one `--setup-sql` generates) does not hold its groups' privileges until
+    // `SET ROLE`, and may run it, which is why the membership test above is MEMBER and not USAGE. The
+    // table test had the same blind spot and was left on `current_user`. It also looks at column
+    // privileges (`GRANT UPDATE (status)`), views (writable when simple), and sequences
+    // (`nextval`/`setval` change state), none of which `has_table_privilege` on a table sees.
+    //
+    // Not asked here: CREATE on a schema. On PostgreSQL 14 and older PUBLIC holds it on `public` by
+    // default, so a gate on it would call every stock install excessive; `--setup-sql` checks it.
+    const WRITABLE: &str = "WITH m AS ( \
+             SELECT oid FROM pg_roles WHERE pg_has_role(current_user, oid, 'MEMBER')), \
+         s AS ( \
+             SELECT c.oid, c.relkind, n.nspname, c.relname FROM pg_class c \
              JOIN pg_namespace n ON n.oid = c.relnamespace \
-             WHERE c.relkind IN ('r','p','f') \
+             WHERE c.relkind IN ('r','p','f','v','S') \
                AND n.nspname NOT IN ('pg_catalog','information_schema') \
-               AND n.nspname NOT LIKE 'pg\\_%' LIMIT 5000) \
+               AND n.nspname NOT LIKE 'pg\\_%' LIMIT 5000), \
+         w AS ( \
+             SELECT s.*, EXISTS (SELECT 1 FROM m WHERE \
+                 CASE WHEN s.relkind = 'S' THEN has_sequence_privilege(m.oid, s.oid, 'UPDATE') \
+                      ELSE has_table_privilege(m.oid, s.oid, 'INSERT') \
+                        OR has_table_privilege(m.oid, s.oid, 'UPDATE') \
+                        OR has_table_privilege(m.oid, s.oid, 'DELETE') \
+                        OR has_table_privilege(m.oid, s.oid, 'TRUNCATE') \
+                        OR has_any_column_privilege(m.oid, s.oid, 'INSERT') \
+                        OR has_any_column_privilege(m.oid, s.oid, 'UPDATE') END) AS can_write \
+             FROM s) \
          SELECT count(*) AS scanned, \
-                count(*) FILTER (WHERE has_table_privilege(oid,'INSERT') \
-                                    OR has_table_privilege(oid,'UPDATE') \
-                                    OR has_table_privilege(oid,'DELETE') \
-                                    OR has_table_privilege(oid,'TRUNCATE')) AS writable, \
-                (array_agg(nspname || '.' || relname) FILTER (WHERE has_table_privilege(oid,'INSERT')))[1:3] \
-                  AS examples \
-         FROM s";
+                count(*) FILTER (WHERE can_write) AS writable, \
+                (array_agg(nspname || '.' || relname) FILTER (WHERE can_write))[1:3] AS examples \
+         FROM w";
 
     let rows = |v: Value| -> Vec<Value> {
         v.get("rows")
@@ -348,8 +366,22 @@ pub(crate) fn enforce_start_policy(transport: &str, addr: &str) {
 pub(crate) fn serving_blocked() -> Option<&'static str> {
     if *PENDING.read().unwrap() {
         Some("the server has not yet been able to check what the database role is allowed to do, and does not serve queries until it has")
+    } else if crate::startup::redaction_unverified() {
+        Some("MCP_REDACT_REQUIRE_REVOKE=1 and the database has not yet been checked for redacted columns the role can still read, so no queries are served until it has")
     } else {
         None
+    }
+}
+
+/// [`serving_blocked`] for one JSON-RPC method. Only methods that reach data wait for the checks;
+/// the handshake and the calls that describe the server do not, so a client that connects while the
+/// checks run (an stdio client always does) still gets through `initialize`. The list is of what
+/// may pass, so a method added later waits by default.
+pub(crate) fn serving_blocked_for(method: Option<&str>) -> Option<&'static str> {
+    match method {
+        Some("initialize" | "ping" | "tools/list" | "prompts/list" | "server/discover") => None,
+        Some(m) if m.starts_with("notifications/") => None,
+        _ => serving_blocked(),
     }
 }
 
@@ -443,7 +475,11 @@ pub(crate) fn report(db: Option<&str>) -> Value {
         }),
     }
 
-    let authed = env_set("MCP_BEARER_TOKEN") || env_set("JWT_PUBKEY_PEM");
+    // The platform's own authentication counts, as it does in `enforce_start_policy` (and in the
+    // `authentication` field of this very report). Without it every Apify run graded F and wrote
+    // "critical: transport.anonymous" into the audit chain, a permanent false alarm.
+    let authed =
+        env_set("MCP_BEARER_TOKEN") || env_set("JWT_PUBKEY_PEM") || platform_authenticates();
     if exposed && !authed {
         findings.push(Finding {
             id: "transport.anonymous",
@@ -484,7 +520,7 @@ pub(crate) fn report(db: Option<&str>) -> Value {
             fact: "the audit goes to stderr only, so it does not survive the process".into(),
             fix: Some("set MCP_AUDIT_LOG to a file".into()),
         });
-    } else if !env_set("MCP_AUDIT_HMAC_KEY") && !env_set("MCP_AUDIT_HMAC_KEY_FILE") {
+    } else if crate::audit_log::audit_key().is_none() {
         findings.push(Finding {
             id: "audit.unkeyed",
             severity: Severity::Note,
@@ -654,6 +690,41 @@ pub(crate) fn audit_posture() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_methods_that_reach_data_wait_for_the_start_up_checks() {
+        for m in [
+            "initialize",
+            "ping",
+            "tools/list",
+            "notifications/initialized",
+            "server/discover",
+        ] {
+            assert_eq!(serving_blocked_for(Some(m)), None, "{m}");
+        }
+        // with nothing pending, nothing is blocked either way
+        for m in [
+            "tools/call",
+            "resources/read",
+            "resources/list",
+            "resources/templates/list",
+        ] {
+            assert_eq!(serving_blocked_for(Some(m)), serving_blocked(), "{m}");
+        }
+        *PENDING.write().unwrap() = true;
+        for m in [
+            Some("tools/call"),
+            Some("resources/read"),
+            Some("resources/list"),
+            Some("resources/templates/list"),
+            Some("x/unknown"),
+            None,
+        ] {
+            assert!(serving_blocked_for(m).is_some(), "{m:?}");
+        }
+        assert_eq!(serving_blocked_for(Some("initialize")), None);
+        *PENDING.write().unwrap() = false;
+    }
 
     #[test]
     fn loopback_is_recognised_in_every_spelling() {

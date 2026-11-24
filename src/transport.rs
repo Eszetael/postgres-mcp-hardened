@@ -77,7 +77,13 @@ pub(crate) fn run_stdio() {
         // of them, and every record in the audit named the caller "-".
         let id = req.get("id").cloned().unwrap_or(Value::Null);
         let _scope = audit_log::set_caller(Some(pipeline::stdio_caller()));
+        // The same refusal HTTP gives while the start-up checks are still pending; stdio had none, so
+        // `MCP_REDACT_REQUIRE_REVOKE=1` guarded the network transport and not the one most people use.
+        let blocked = posture::serving_blocked_for(req.get("method").and_then(|m| m.as_str()));
         let mut resp = match pipeline::gate(&caller_key, "stdio") {
+            Ok(_) if blocked.is_some() => {
+                json!({"error": {"code": -32000, "message": blocked.unwrap_or_default()}})
+            }
             Ok(guards) => {
                 let r = handle_request(&req);
                 drop(guards);
@@ -139,9 +145,16 @@ pub(crate) async fn run_http() {
     };
     eprintln!("MCP HTTP listening on http://{}", addr);
     // ConnectInfo: the rate limiter needs the peer address (headers are client-controlled, so untrusted).
+    // The listener caps open connections and closes ones that stall (see `conn_limit`).
+    let listener = conn_limit::Limited::new(
+        listener,
+        conn_limit::max_connections(),
+        conn_limit::max_per_ip(),
+        conn_limit::Clocks::from_budget(conn_limit::timeout()),
+    );
     if let Err(e) = axum::serve(
         listener,
-        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        app.into_make_service_with_connect_info::<conn_limit::Peer>(),
     )
     .await
     {
@@ -153,7 +166,7 @@ pub(crate) async fn run_http() {
 /// `DELETE /mcp` — explicit session termination (Streamable HTTP). Without it a client had no way
 /// to clean up and the entry lingered until the TTL expired; the specification provides for this.
 pub(crate) async fn delete_session_handler(
-    ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
+    ConnectInfo(peer): ConnectInfo<conn_limit::Peer>,
     headers: HeaderMap,
     State(state): State<AppState>,
 ) -> impl IntoResponse {
@@ -166,7 +179,7 @@ pub(crate) async fn delete_session_handler(
     }
     let key = ratelimit::client_key(
         &peer.ip().to_string(),
-        headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()),
+        http::forwarded_for(&headers).as_deref(),
     );
     if !ratelimit::allow(&key) {
         METRICS.denied_rate.fetch_add(1, Ordering::Relaxed);
@@ -176,18 +189,26 @@ pub(crate) async fn delete_session_handler(
     // Session teardown is a state change, so it goes through the same gate as everything else on
     // this surface. A session id travels through logs, proxies and crash reports; anyone who reads
     // one must not be able to end that client's session on an otherwise authenticated server.
-    if let Err((code, msg, _)) = enforce_auth(&headers, &json!({"method": "session/delete"})) {
-        METRICS.denied_auth.fetch_add(1, Ordering::Relaxed);
-        audit("http", "denied_auth", None);
-        return (
-            StatusCode::from_u16(code).unwrap_or(StatusCode::UNAUTHORIZED),
-            msg,
-        )
-            .into_response();
-    }
+    let who = match enforce_auth(&headers, &json!({"method": "session/delete"})) {
+        Ok(c) => c,
+        Err((code, msg, _)) => {
+            METRICS.denied_auth.fetch_add(1, Ordering::Relaxed);
+            audit("http", "denied_auth", None);
+            return (
+                StatusCode::from_u16(code).unwrap_or(StatusCode::UNAUTHORIZED),
+                msg,
+            )
+                .into_response();
+        }
+    };
     match headers.get("mcp-session-id").and_then(|v| v.to_str().ok()) {
         Some(sid) => {
-            if state.sessions.write().await.remove(sid).is_some() {
+            let mut known = state.sessions.write().await;
+            // Only the identity that opened a session may end it.
+            let mine = known
+                .get(sid)
+                .is_some_and(|sess| sess.owner.is_none() || sess.owner == who);
+            if mine && known.remove(sid).is_some() {
                 (StatusCode::NO_CONTENT, "").into_response()
             } else {
                 (StatusCode::NOT_FOUND, "unknown session").into_response()
@@ -253,7 +274,7 @@ pub(crate) async fn root_handler(headers: HeaderMap) -> impl IntoResponse {
 }
 
 pub(crate) async fn mcp_handler(
-    ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
+    ConnectInfo(peer): ConnectInfo<conn_limit::Peer>,
     headers: HeaderMap,
     State(state): State<AppState>,
     Json(req): Json<serde_json::Value>,
@@ -266,7 +287,7 @@ pub(crate) async fn mcp_handler(
         audit("http", "denied_origin", None);
         return (StatusCode::FORBIDDEN, msg).into_response();
     }
-    if let Some(why) = posture::serving_blocked() {
+    if let Some(why) = posture::serving_blocked_for(req.get("method").and_then(|m| m.as_str())) {
         let body = json!({ "jsonrpc": "2.0", "id": req.get("id").cloned().unwrap_or(Value::Null),
             "error": { "code": -32000, "message": why } });
         return (StatusCode::SERVICE_UNAVAILABLE, Json(body)).into_response();
@@ -275,7 +296,7 @@ pub(crate) async fn mcp_handler(
     // bounce earlier. DB_SEM caps concurrency; this caps rate.
     let key = ratelimit::client_key(
         &peer.ip().to_string(),
-        headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()),
+        http::forwarded_for(&headers).as_deref(),
     );
     if let Err(rej) = pipeline::gate_rate(&key, "http") {
         let body =
@@ -283,26 +304,6 @@ pub(crate) async fn mcp_handler(
         let mut hdrs = HeaderMap::new();
         hdrs.insert("Retry-After", HeaderValue::from_static("1"));
         return (StatusCode::TOO_MANY_REQUESTS, hdrs, Json(body)).into_response();
-    }
-    // An unknown `Mcp-Session-Id` gets a 404 so the client knows to initialize again (Streamable
-    // HTTP). Accepting an invented id and echoing it back would let a client believe it holds a
-    // session the server has no record of.
-    // Carries the revision this session agreed on at `initialize`, so a request that arrives
-    // without the header is answered under the contract the client actually negotiated.
-    let mut session_rev: Option<protocol::Rev> = None;
-    if let Some(sid) = headers.get("mcp-session-id").and_then(|v| v.to_str().ok()) {
-        let mut known = state.sessions.write().await;
-        match known.get_mut(sid) {
-            Some((last, rev)) => {
-                *last = uptime_secs(); // refresh so an active session does not expire
-                session_rev = Some(*rev);
-            }
-            None => {
-                let body = json!({ "jsonrpc": "2.0", "id": req.get("id").cloned().unwrap_or(Value::Null),
-                    "error": { "code": -32001, "message": "unknown or expired session — reinitialize" } });
-                return (StatusCode::NOT_FOUND, HeaderMap::new(), Json(body)).into_response();
-            }
-        }
     }
     // Second DoS gate: how many of this client requests are IN FLIGHT. Rate limiting is not enough
     // when a single query runs until `statement_timeout` — without this one client took the whole pool.
@@ -356,6 +357,40 @@ pub(crate) async fn mcp_handler(
             return (sc, hdrs, Json(body)).into_response();
         }
     };
+    let owner = caller.clone();
+    // Looked up only AFTER authentication. Before, an anonymous request refreshed somebody else's
+    // session and learned from 404-versus-401 whether an id existed.
+    // An unknown `Mcp-Session-Id` gets a 404 so the client knows to initialize again (Streamable
+    // HTTP). Accepting an invented id and echoing it back would let a client believe it holds a
+    // session the server has no record of.
+    // Carries the revision this session agreed on at `initialize`, so a request that arrives
+    // without the header is answered under the contract the client actually negotiated.
+    let mut session_rev: Option<protocol::Rev> = None;
+    // `server/discover` answers without credentials (`enforce_auth` gives it no identity), so it
+    // cannot be matched to a session's owner: the owner's own id came back as 404 (R10 of the
+    // 0.1.12 review). It neither needs nor touches the session, and answering it the same way
+    // with any id or none keeps it from saying whether an id exists.
+    let is_discover = req.get("method").and_then(|v| v.as_str()) == Some("server/discover");
+    if let Some(sid) = headers
+        .get("mcp-session-id")
+        .and_then(|v| v.to_str().ok())
+        .filter(|_| !is_discover)
+    {
+        let mut known = state.sessions.write().await;
+        match known.get_mut(sid) {
+            // A session belongs to the identity that opened it. Presenting another valid token with
+            // someone else's id is answered like an unknown id, so the id alone is worth nothing.
+            Some(sess) if sess.owner.is_none() || sess.owner == owner => {
+                sess.last = uptime_secs(); // refresh so an active session does not expire
+                session_rev = Some(sess.rev);
+            }
+            _ => {
+                let body = json!({ "jsonrpc": "2.0", "id": req.get("id").cloned().unwrap_or(Value::Null),
+                    "error": { "code": -32001, "message": "unknown or expired session — reinitialize" } });
+                return (StatusCode::NOT_FOUND, HeaderMap::new(), Json(body)).into_response();
+            }
+        }
+    }
     // Batch: removed from the MCP 2025-06-18 spec. An explicit error rather than a 202 "accepted",
     // which would leave the client waiting for responses that are never coming.
     if req.is_array() {
@@ -450,11 +485,22 @@ pub(crate) async fn mcp_handler(
     // have succeeded, which is the opposite of what the backwards-compatibility clause is for.
     // Negotiation belongs in the body there; the header rule applies from the next request on.
     let is_initialize = req.get("method").and_then(|v| v.as_str()) == Some("initialize");
-    if let Some(asked) = headers
-        .get("mcp-protocol-version")
-        .filter(|_| !is_initialize)
-        .and_then(|v| v.to_str().ok())
-    {
+    // Repeated or non-text counts as a header we cannot parse. `to_str().ok()` used to turn a
+    // non-ASCII value into "absent", the downgrade the paragraph above says must not happen.
+    let proto_hdr = match http::single_header(&headers, "mcp-protocol-version") {
+        Ok(v) => v,
+        // The `initialize` exemption above covers a repeated header too: it was a 400 there,
+        // against the paragraph that says why it must not be (R16 of the 0.1.12 review).
+        // Negotiation happens in the body, so the header is simply not used.
+        Err(()) if is_initialize => None,
+        Err(()) => {
+            let mut body = protocol::unsupported_header_error("<repeated or unreadable>");
+            body["jsonrpc"] = Value::String("2.0".into());
+            body["id"] = req.get("id").cloned().unwrap_or(Value::Null);
+            return (StatusCode::BAD_REQUEST, HeaderMap::new(), Json(body)).into_response();
+        }
+    };
+    if let Some(asked) = proto_hdr.filter(|_| !is_initialize) {
         if protocol::Rev::parse(asked).is_none() {
             let mut body = protocol::unsupported_header_error(asked);
             body["jsonrpc"] = Value::String("2.0".into());
@@ -463,9 +509,7 @@ pub(crate) async fn mcp_handler(
         }
     }
     let rev_for_request = protocol::rev_from_meta(&body_params).unwrap_or_else(|| {
-        headers
-            .get("mcp-protocol-version")
-            .and_then(|v| v.to_str().ok())
+        proto_hdr
             .and_then(protocol::Rev::parse)
             .or(session_rev)
             .unwrap_or(protocol::Rev::V20250618)
@@ -477,12 +521,38 @@ pub(crate) async fn mcp_handler(
     // request than the one that runs — refusing the mismatch is what makes the header safe to
     // trust. The refusal is audited: it is a security event, not a parse hiccup.
     let body_method = req.get("method").and_then(|v| v.as_str()).unwrap_or("");
+    // A repeated or non-text `Mcp-Method`/`Mcp-Name` is refused outright: `get` would read the first
+    // line while a gateway may have authorised on another, so "they agree" would be answered about
+    // a header the gateway never saw.
+    let (hdr_method, hdr_name) = match (
+        http::single_header(&headers, "mcp-method"),
+        http::single_header(&headers, "mcp-name"),
+    ) {
+        (Ok(m), Ok(n)) => (m, n),
+        _ => {
+            let _who = set_caller(caller);
+            audit(
+                "http/header_mismatch",
+                "refused",
+                Some("repeated or unreadable Mcp-Method/Mcp-Name header"),
+            );
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "jsonrpc": "2.0",
+                    "id": req.get("id").cloned().unwrap_or(Value::Null),
+                    "error": { "code": -32600, "message": "Mcp-Method and Mcp-Name must each appear once" }
+                })),
+            )
+                .into_response();
+        }
+    };
     if let Err((code, msg)) = protocol::check_header_agreement(
         rev_for_request,
         body_method,
         protocol::body_target_name(body_method, &body_params).as_deref(),
-        headers.get("mcp-method").and_then(|v| v.to_str().ok()),
-        headers.get("mcp-name").and_then(|v| v.to_str().ok()),
+        hdr_method,
+        hdr_name,
     ) {
         let _who = set_caller(caller);
         audit("http/header_mismatch", "refused", Some(&msg));
@@ -543,15 +613,15 @@ pub(crate) async fn mcp_handler(
             let new_id = Uuid::new_v4().to_string();
             let now = uptime_secs();
             let mut s = state.sessions.write().await;
-            if s.len() >= MAX_SESSIONS {
-                s.retain(|_, (last, _)| now.saturating_sub(*last) < SESSION_IDLE_SECS);
-                if s.len() >= MAX_SESSIONS {
-                    s.clear(); // still full = someone is inflating it; start clean rather than grow
-                }
-            }
+            make_room(&mut s, &key, owner.as_deref(), now);
             s.insert(
                 new_id.clone(),
-                (now, negotiated.unwrap_or(protocol::Rev::V20250618)),
+                Session {
+                    last: now,
+                    rev: negotiated.unwrap_or(protocol::Rev::V20250618),
+                    client: key.clone(),
+                    owner: owner.clone(),
+                },
             );
             new_id
         } else {
@@ -560,7 +630,7 @@ pub(crate) async fn mcp_handler(
             // to change with it — otherwise the session would keep answering under the old one.
             if let Some(rev) = negotiated {
                 if let Some(entry) = state.sessions.write().await.get_mut(&sid) {
-                    entry.1 = rev;
+                    entry.rev = rev;
                 }
             }
             sid
@@ -574,4 +644,138 @@ pub(crate) async fn mcp_handler(
     }
 
     (StatusCode::OK, resp_headers, Json(resp)).into_response()
+}
+
+/// One session as the server remembers it. `client` is the rate-limit key that created it, so a
+/// single address cannot hold the whole table.
+pub(crate) struct Session {
+    pub(crate) last: u64,
+    pub(crate) rev: protocol::Rev,
+    pub(crate) client: String,
+    /// The identity (`enforce_auth`'s caller) that opened it; `None` when the server has no auth.
+    pub(crate) owner: Option<String>,
+}
+
+/// Makes room for one more session without handing anybody else's away.
+///
+/// The map used to `clear()` when it was full of live sessions, so whoever could call `initialize`
+/// 10 000 times logged every other client out (their next request got a 404). `ratelimit.rs` had the
+/// same `clear()` and was fixed in 0.1.8; this copy was left. Now: idle sessions go first, then the
+/// creating client's own oldest above its cap, then the oldest quarter of all, which is the end
+/// farthest from whoever is hammering right now.
+///
+/// The per-client cap counts sessions of one identity from one client key. Counting by client key
+/// alone (R6 of the 0.1.12 review) let bob, on the same address as alice, push her session out
+/// with 70 calls to `initialize`; with the owner in the key he only rotates his own.
+pub(crate) fn make_room(
+    s: &mut std::collections::HashMap<String, Session>,
+    client: &str,
+    owner: Option<&str>,
+    now: u64,
+) {
+    if s.len() >= MAX_SESSIONS {
+        s.retain(|_, v| now.saturating_sub(v.last) < SESSION_IDLE_SECS);
+    }
+    let mut mine: Vec<(String, u64)> = s
+        .iter()
+        .filter(|(_, v)| v.client == client && v.owner.as_deref() == owner)
+        .map(|(k, v)| (k.clone(), v.last))
+        .collect();
+    if mine.len() >= MAX_SESSIONS_PER_CLIENT {
+        mine.sort_by_key(|(_, last)| *last);
+        let excess = mine.len() + 1 - MAX_SESSIONS_PER_CLIENT;
+        for (k, _) in mine.into_iter().take(excess) {
+            s.remove(&k);
+        }
+    }
+    if s.len() >= MAX_SESSIONS {
+        let mut ages: Vec<(String, u64)> = s.iter().map(|(k, v)| (k.clone(), v.last)).collect();
+        ages.sort_by_key(|(_, last)| *last);
+        for (k, _) in ages.into_iter().take(MAX_SESSIONS / 4) {
+            s.remove(&k);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn sess(last: u64, client: &str) -> Session {
+        Session {
+            last,
+            rev: protocol::Rev::V20250618,
+            client: client.into(),
+            owner: None,
+        }
+    }
+
+    #[test]
+    fn a_full_table_drops_the_oldest_quarter_and_keeps_the_newest() {
+        let mut m = HashMap::new();
+        for i in 0..MAX_SESSIONS {
+            m.insert(
+                format!("s{i}"),
+                sess(100_000 + (i * 3000 / MAX_SESSIONS) as u64, &format!("c{i}")),
+            );
+        }
+        // all still within the idle window, so only the quarter rule can make room
+        make_room(&mut m, "attacker", None, 100_000 + 3000);
+        assert_eq!(m.len(), MAX_SESSIONS - MAX_SESSIONS / 4);
+        assert!(!m.contains_key("s0"));
+        assert!(m.contains_key(&format!("s{}", MAX_SESSIONS - 1)));
+    }
+
+    #[test]
+    fn one_client_cannot_hold_more_than_its_share() {
+        let mut m = HashMap::new();
+        for i in 0..MAX_SESSIONS_PER_CLIENT {
+            m.insert(format!("a{i}"), sess(i as u64, "a"));
+        }
+        m.insert("victim".into(), sess(0, "b"));
+        make_room(&mut m, "a", None, 1000);
+        assert!(!m.contains_key("a0"), "its own oldest goes");
+        assert!(m.contains_key("victim"), "someone else's session stays");
+        assert_eq!(
+            m.values().filter(|v| v.client == "a").count(),
+            MAX_SESSIONS_PER_CLIENT - 1
+        );
+    }
+
+    /// R6 of the 0.1.12 review: two identities behind one address do not share the cap.
+    #[test]
+    fn another_identity_on_the_same_address_cannot_push_a_session_out() {
+        let mut m = HashMap::new();
+        let mut alice = sess(0, "10.0.0.1");
+        alice.owner = Some("alice".into());
+        m.insert("alice".to_string(), alice);
+        for i in 0..(MAX_SESSIONS_PER_CLIENT + 10) {
+            make_room(&mut m, "10.0.0.1", Some("bob"), 10 + i as u64);
+            let mut bob = sess(10 + i as u64, "10.0.0.1");
+            bob.owner = Some("bob".into());
+            m.insert(format!("bob{i}"), bob);
+        }
+        assert!(
+            m.contains_key("alice"),
+            "alice's session must survive bob's initialize calls"
+        );
+        assert_eq!(
+            m.values()
+                .filter(|v| v.owner.as_deref() == Some("bob"))
+                .count(),
+            MAX_SESSIONS_PER_CLIENT
+        );
+        // and alice's own calls still rotate alice's own sessions
+        for i in 0..MAX_SESSIONS_PER_CLIENT {
+            make_room(&mut m, "10.0.0.1", Some("alice"), 1000 + i as u64);
+            let mut a = sess(1000 + i as u64, "10.0.0.1");
+            a.owner = Some("alice".into());
+            m.insert(format!("alice{i}"), a);
+        }
+        assert!(
+            !m.contains_key("alice"),
+            "her own oldest goes when she exceeds her cap"
+        );
+    }
 }

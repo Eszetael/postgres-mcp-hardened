@@ -1,15 +1,14 @@
 use jsonwebtoken::{decode, Algorithm, DecodingKey, Validation};
 use serde::{Deserialize, Serialize};
 
-/// Claims per OAuth 2.1 / OIDC: sub, exp, aud, iss, scope (space separated).
+/// Claims we read from the token: sub, exp, scope (space separated). aud and iss are validated by
+/// the library, not stored.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Claims {
     pub sub: String,
     pub exp: usize,
-    #[serde(default)]
-    pub aud: String,
-    #[serde(default)]
-    pub iss: String,
+    // `aud` and `iss` are deliberately NOT fields: `jsonwebtoken` checks both on the raw claims, and
+    // `aud` may be a string or an array (RFC 7519), which a `String` field could not hold.
     #[serde(default)]
     pub scope: String,
 }
@@ -150,6 +149,22 @@ mod tests {
         });
         let key = EncodingKey::from_rsa_pem(&priv_pem()).expect("test priv key load");
         encode(&Header::new(Algorithm::RS256), &claims, &key).expect("encode token")
+    }
+
+    /// RFC 7519: `aud` is a string OR an array of strings. Several identity providers always send the
+    /// array form, and a `String` field made every such token fail to deserialise, whatever its
+    /// audience.
+    #[test]
+    fn an_audience_array_containing_ours_is_accepted() {
+        let claims = json!({"sub":"t","exp":now()+3600,"aud":["other.app","mcp.pg"],
+                            "iss":"https://idp","scope":"mcp:read"});
+        let key = EncodingKey::from_rsa_pem(&priv_pem()).unwrap();
+        let tok = encode(&Header::new(Algorithm::RS256), &claims, &key).unwrap();
+        let ctx = validate_token(&tok, &pub_pem(), "mcp.pg", "https://idp")
+            .expect("an array audience that includes ours is a valid token");
+        assert!(ctx.has_scope("mcp:read"));
+        let err = validate_token(&tok, &pub_pem(), "not.listed", "https://idp").unwrap_err();
+        assert!(err.contains("token invalid"), "{err}");
     }
 
     #[test]

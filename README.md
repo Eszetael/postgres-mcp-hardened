@@ -330,7 +330,7 @@ Beyond unit tests, the repository carries two harnesses that run in CI on every 
 - `--fuzz` — a deterministic fuzzer that mutates a corpus of known writes with transformations
   that do not change SQL meaning (comments, case, dollar-quoting, invisible Unicode, parentheses)
   and asserts that none of them ever becomes an allowed statement.
-- `tests/acceptance.sh` — an end-to-end suite that starts its own PostgreSQL and checks 329
+- `tests/acceptance.sh` — an end-to-end suite that starts its own PostgreSQL and checks 448
   behaviours: every write-bypass reported against the deprecated server (including the
   `COMMIT`/`END` injection), truthful results, schema introspection, protocol conformance,
   configuration mistakes failing loudly, audit tamper detection, fair use under load, and
@@ -679,7 +679,25 @@ and `inet_server_port`, are now refused alongside the catalogue relations, and `
 opens all of them together. Ordinary set-returning functions — `generate_series`, `jsonb_each`,
 `unnest`, `regexp_split_to_table` — carry no such prefix and are unaffected. `current_user`,
 `session_user`, `current_database` and `version` stay readable on purpose: an agent already knows what
-it connected to and as whom.
+it connected to and as whom. `SHOW ALL` lists what `pg_settings` lists and is refused with it.
+
+An operator is a function call written as a symbol, so it follows the same rule: with an allowlist
+active, an operator whose function lies outside `pg_catalog` is refused unless that function is
+named in `MCP_ALLOW_FUNCTIONS`. The built-in operators are unaffected.
+
+The same holds for code a statement runs without naming it. With an allowlist active, a cast to a
+domain whose `CHECK` calls a function outside `pg_catalog` (`SELECT 150::dpeek`), a cast `WITH
+FUNCTION`, a non-built-in default operator class of a column's type (used by `ORDER BY`,
+`DISTINCT`, `GROUP BY`, `UNION`), the input and output functions of a type, a range's helper
+functions, and the functions a view calls are refused, with a message naming the type or view and
+the function. A domain whose `CHECK` uses only built-in functions, enums and composite types are
+unaffected. Row-level security policies are not checked: a policy is the table owner's access
+control, and its functions run as part of it. A generated column runs nothing when it is read.
+
+Functions of the extensions in `MCP_TRUSTED_EXTENSIONS` count as built-in for all three rules
+(called, used as an operator, reached through a type). The default list is `pgcrypto`, `citext`,
+`hstore`, `pg_trgm`, `uuid-ossp`, `ltree`, `cube` and `earthdistance`: code installed by a superuser
+that reads no table. Set the variable to replace the list, or to an empty value to trust none.
 
 ## The corpus of things that got through
 
@@ -800,6 +818,10 @@ defeated in review and are therefore described as depth rather than as boundarie
   a log that has gone away entirely. This is not proof of tampering — an unclean shutdown looks the
   same — but a tamper-*evident* trail owes you the question, not the verdict. Keep the sidecar with
   the log when you archive or move it; deleting it only loses the truncation check, never an entry.
+  With `MCP_AUDIT_HMAC_KEY` the mark carries a MAC, and a mark without a valid one is reported as such
+  in the chain's own `startup` record, as is a keyed log whose mark is missing. A mark without a MAC
+  beside a log written before the key was set (or by 0.1.11) gets a `chain_note` instead: that is
+  what configuring a key looks like.
   The offline verifier is unchanged and still needs an external anchor:
   `--verify-audit <file> --expect-last <hash>`.
   *verified* (acceptance: "a shortened log is noticed at startup, without any external anchor")
@@ -876,12 +898,16 @@ Reproduce it with `tests/soak.sh` rather than believing the paragraph.
 | `MCP_SERVER_LABEL` | name shown in the client UI, e.g. `production` → `postgres-mcp-hardened (production)` |
 | `MCP_SHOW_PARTITIONS` | `1` to list partition children as well (hidden by default) |
 | `MCP_ALLOW_FUNCTIONS` | comma-separated catalog functions to permit that we do not know to be read-only |
+| `MCP_TRUSTED_EXTENSIONS` | comma-separated extensions whose functions count as built-in under a surface allowlist (default `pgcrypto,citext,hstore,pg_trgm,uuid-ossp,ltree,cube,earthdistance`; empty = none) |
 | `MCP_SSLROOTCERT` | path to a PEM CA bundle for TLS to PostgreSQL (e.g. the AWS RDS bundle); system and Mozilla roots are trusted by default |
 | `MCP_MAX_INFLIGHT_PER_CLIENT` | max concurrent requests from one client (default 4; `0` disables) |
 | `MCP_RATE_RPM` | per-client request rate limit (default 120/min; `0` disables) |
 | `MCP_RATE_RPM_STDIO` | the same limit for stdio (default 600/min): an agent exploring a schema legitimately makes dozens of calls a minute, but a runaway loop against a production database is still what a DBA fears most |
 | `MCP_CLIENT_ID` | a name for this client in the audit log over stdio, e.g. `claude-desktop@ada-laptop`; without it the identity falls back to the operating system's user and process |
 | `MCP_RATE_BURST` | burst allowance for that limit (default `MCP_RATE_RPM / 4`, min 5) |
+| `MCP_MAX_CONNECTIONS` | TCP connections held open at once over HTTP (default 1024); past it, new ones wait in the kernel backlog and a warning goes to stderr once a minute |
+| `MCP_MAX_CONNECTIONS_PER_IP` | TCP connections from one peer address (default the larger of 8 and `MCP_MAX_CONNECTIONS`/8; with `MCP_TRUST_PROXY=1`, `MCP_MAX_CONNECTIONS`, since every connection then comes from the proxy). The peer is the TCP address, never `X-Forwarded-For`. A new connection past the cap closes that address's longest-idle connection, or is itself closed if all of them are mid-request |
+| `MCP_CONN_TIMEOUT_SECS` | seconds a started request has to produce its first response byte, and seconds a response may make no progress because the client is not reading, before the connection is closed (default 120). A connection waiting for its next request is closed after 15 s (or this value, if smaller), and none lives longer than ten times this value. Over HTTP it must exceed `MCP_STATEMENT_TIMEOUT` by more than 10 s, or the server refuses to start. These bound slow and idle connections from one address; many addresses can still fill `MCP_MAX_CONNECTIONS`, so put a reverse proxy in front of a public listener |
 | `MCP_METRICS_TOKEN` | token required on `/metrics`. Without it, `/metrics` follows whatever the server itself requires: open when the server has no authentication, the bearer token when one is set, and closed when OAuth is configured (a JWT is the wrong shape for a scraper — set this instead) |
 | `MCP_REDACT_REQUIRE_REVOKE` | `1` to refuse to serve while the database still lets the role read a redacted column — turns the setting above from advisory into a guarantee |
 | `MCP_STRUCTURED_CONTENT` | `1` to also return MCP `structuredContent`; off by default because a client that ignores it pays for every result twice. The provenance marker travels inside the object, but the delimiter escaping that protects the text block does not apply — a client that pastes structured output straight into a prompt loses that layer |

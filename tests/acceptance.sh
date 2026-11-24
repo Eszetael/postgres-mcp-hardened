@@ -1020,8 +1020,8 @@ mint(){ # mint <scope> <aud> <iss> <exp_offset_s> [key] [alg]
   local hdr pay signing sig
   hdr=$(printf '{"alg":"%s","typ":"JWT"}' "$alg" | python3 -c "import sys,base64;print(base64.urlsafe_b64encode(sys.stdin.buffer.read()).decode().rstrip('='))")
   pay=$(python3 -c "
-import sys,base64,json,time
-print(base64.urlsafe_b64encode(json.dumps({'sub':'acc','exp':int(time.time())+int(sys.argv[1]),'aud':sys.argv[2],'iss':sys.argv[3],'scope':sys.argv[4]}).encode()).decode().rstrip('='))" "$off" "$aud" "$iss" "$scope")
+import sys,base64,json,time,os
+print(base64.urlsafe_b64encode(json.dumps({'sub':os.environ.get('SUB','acc'),'exp':int(time.time())+int(sys.argv[1]),'aud':sys.argv[2],'iss':sys.argv[3],'scope':sys.argv[4]}).encode()).decode().rstrip('='))" "$off" "$aud" "$iss" "$scope")
   signing="$hdr.$pay"
   sig=$(printf '%s' "$signing" | openssl dgst -sha256 -sign "$key" -binary | python3 -c "import sys,base64;print(base64.urlsafe_b64encode(sys.stdin.buffer.read()).decode().rstrip('='))")
   printf '%s.%s' "$signing" "$sig"
@@ -1061,6 +1061,35 @@ c=$(jcall "$NOSCOPE" "$RES")
 d=$(curl -s -m 15 -H content-type:application/json "http://127.0.0.1:$PORT/mcp" -d '{"jsonrpc":"2.0","id":1,"method":"server/discover"}')
 echo "$d" | grep -q 'protocolVersions' && ok "server/discover still answers without a token" || no "discovery probe broken" "$d"
 echo "$d" | grep -q 'securityPosture' && no "anonymous discovery leaks the security posture" "$d" || ok "and does not tell an anonymous caller how we are configured"
+# A session id is not a credential. It used to be looked up BEFORE authentication, so an anonymous
+# request kept somebody else's session alive and 404-versus-401 told it whether an id existed; and
+# any valid token could use any id. Now the id is only honoured for the identity that opened it.
+INIT='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"1"}}}'
+PING='{"jsonrpc":"2.0","id":2,"method":"ping"}'
+SID=$(curl -s -D - -o /dev/null -m 15 -H content-type:application/json -H "authorization: Bearer $GOOD" "http://127.0.0.1:$PORT/mcp" -d "$INIT" | tr -d '\r' | awk -F': ' 'tolower($1)=="mcp-session-id"{print $2}')
+scall(){ curl -s -o /dev/null -w '%{http_code}' -m 15 -X "${3:-POST}" -H content-type:application/json -H "mcp-session-id: $SID" \
+   ${1:+-H "authorization: Bearer $1"} "http://127.0.0.1:$PORT/mcp" ${2:+-d "$2"}; }
+[ -n "$SID" ] && ok "initialize under OAuth hands out a session id" || no "no session id" ""
+[ "$(scall "$GOOD" "$PING")" = 200 ] && ok "the identity that opened the session can use it" || no "owner refused" "$(scall "$GOOD" "$PING")"
+[ "$(scall "" "$PING")" = 401 ] && ok "an anonymous request with a live session id is 401, not a probe for the id" || no "anonymous request not 401" "$(scall "" "$PING")"
+OTHER=$(SUB=mallory mint "mcp:query mcp:read" mcp.pg https://idp 300)
+[ "$(scall "$OTHER" "$PING")" = 404 ] && ok "another valid identity presenting that id is told it is unknown" || no "session usable by another identity" "$(scall "$OTHER" "$PING")"
+[ "$(scall "$OTHER" "" DELETE)" = 404 ] && ok "and cannot end it" || no "another identity ended the session" "$(scall "$OTHER" "" DELETE)"
+[ "$(scall "$GOOD" "$PING")" = 200 ] && ok "which is still alive afterwards" || no "session lost" "$(scall "$GOOD" "$PING")"
+# R10 (0.1.12 review): server/discover with the owner's own session id was a 404
+DISC='{"jsonrpc":"2.0","id":3,"method":"server/discover"}'
+[ "$(scall "$GOOD" "$DISC")" = 200 ] && ok "server/discover with the owner's session id is answered" || no "server/discover refused the owner's session id" "$(scall "$GOOD" "$DISC")"
+[ "$(scall "" "$DISC")" = 200 ] && ok "and answered the same without a token, so it says nothing about the id" || no "anonymous discover with a session id differs" "$(scall "" "$DISC")"
+[ "$(scall "$GOOD" "" DELETE)" = 204 ] && ok "the owner can end it" || no "owner cannot end the session" "$(scall "$GOOD" "" DELETE)"
+stop
+# R6 (0.1.12 review): the per-client cap counted the address, so another identity on it pushed the
+# session out with 70 calls to initialize. `last` has one-second resolution, hence the pause; the
+# rate limit is off so the 70 calls arrive.
+start DATABASE_URL="$URL" JWT_PUBKEY_PEM="$JWTDIR/pub.pem" JWT_AUD=mcp.pg JWT_ISS=https://idp MCP_RATE_RPM=0
+SID=$(curl -s -D - -o /dev/null -m 15 -H content-type:application/json -H "authorization: Bearer $GOOD" "http://127.0.0.1:$PORT/mcp" -d "$INIT" | tr -d '\r' | awk -F': ' 'tolower($1)=="mcp-session-id"{print $2}')
+sleep 1.5
+for _ in $(seq 1 70); do curl -s -o /dev/null -m 15 -H content-type:application/json -H "authorization: Bearer $OTHER" "http://127.0.0.1:$PORT/mcp" -d "$INIT"; done
+[ "$(scall "$GOOD" "$PING")" = 200 ] && ok "70 sessions opened by another identity on the same address leave this one alive" || no "another identity evicted the session" "$(scall "$GOOD" "$PING")"
 stop
 rm -rf "$JWTDIR"
 
@@ -1407,6 +1436,18 @@ case "$out" in
   OK*) ok "a chain spanning a key rotation verifies with both keys" ;;
   *)   no "key rotation orphaned the history" "$out" ;;
 esac
+# R13 (0.1.12 review): neither a new log, nor the rotation itself, is reported as tampering
+grep '"decision":"startup"' "$RL" | head -1 | grep -q chain_anomaly && no "a brand-new log was reported as an anomaly" "$(head -c 300 "$RL")" || ok "a brand-new log starts without a chain anomaly"
+grep '"decision":"startup"' "$RL" | tail -1 | grep -q chain_anomaly && no "a key rotation was reported as tampering" "$(grep '"decision":"startup"' "$RL" | tail -1 | head -c 300)" || ok "a key rotation (old key in MCP_AUDIT_HMAC_KEYS_OLD) is not reported as tampering"
+NL=/tmp/acc_r13_$$.log; rm -f "$NL" "$NL.hwm"
+start DATABASE_URL="$URL" MCP_AUDIT_LOG="$NL"
+tool query '{"sql":"SELECT 1"}' >/dev/null
+stop
+start DATABASE_URL="$URL" MCP_AUDIT_LOG="$NL" MCP_AUDIT_HMAC_KEY=r13_key
+stop
+last=$(grep '"decision":"startup"' "$NL" | tail -1)
+case "$last" in *chain_anomaly*) no "configuring a key on an existing log was reported as tampering" "$(echo "$last" | head -c 300)";; *chain_note*) ok "configuring a key on an existing log is a note, not an anomaly";; *) no "key introduction left no note" "$(echo "$last" | head -c 300)";; esac
+rm -f "$NL" "$NL.hwm"
 # Without the retired key the old entries must NOT silently pass: they are unverifiable, and the
 # message has to say which key is missing rather than "tampered".
 out=$(env MCP_AUDIT_HMAC_KEY=rot_new "$BIN" --verify-audit "$RL" 2>&1)
@@ -1428,6 +1469,321 @@ case "$err" in
   *) no "the sidecar did not notice a shortened log" "$(printf '%s' "$err" | grep -v '^AUDIT' | head -c 150)" ;;
 esac
 rm -f "$RL" "$RL.hwm"
+
+section "Found by the 0.1.12 audit of 0.1.11 (each of these was open)"
+# G1: a proxy that appends its OWN X-Forwarded-For line (HAProxy `option forwardfor`) leaves the
+# client's line first. The limiter read only the first line, so the client chose its own bucket.
+start DATABASE_URL="$URL" MCP_TRUST_PROXY=1 MCP_RATE_RPM=8 MCP_RATE_BURST=2
+codes=""
+for i in 1 2 3 4 5 6; do
+  codes="$codes $(curl -s -o /dev/null -w '%{http_code}' -m 10 -H content-type:application/json -H "X-Forwarded-For: 8.8.8.$i" -H "X-Forwarded-For: 203.0.113.99" "http://127.0.0.1:$PORT/mcp" -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}')"
+done
+case "$codes" in *429*) ok "two X-Forwarded-For lines do not give the client its own rate-limit bucket";; *) no "client-chosen rate-limit key" "$codes";; esac
+# R17 (0.1.12 review): a first line that is not text made the key fall back to the peer: a second bucket
+codes=$(python3 - "$PORT" <<'PY7'
+import socket, sys
+body = b'{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
+out = []
+for i in range(3):
+    req = (b"POST /mcp HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nConnection: close\r\n"
+           b"Content-Length: %d\r\nX-Forwarded-For: \xe9%d\r\nX-Forwarded-For: 203.0.113.99\r\n\r\n" % (len(body), i)) + body
+    s = socket.create_connection(("127.0.0.1", int(sys.argv[1]))); s.sendall(req); d = b""
+    while True:
+        c = s.recv(65536)
+        if not c: break
+        d += c
+    out.append(d.split(b" ", 2)[1].decode() if d else "EOF")
+print(" ".join(out))
+PY7
+)
+case "$codes" in "429 429 429") ok "a line that is not text does not move the client to another bucket";; *) no "non-text X-Forwarded-For line gave a fresh bucket" "$codes";; esac
+stop
+# G21: a repeated Mcp-Name is refused, not read from its first line.
+start DATABASE_URL="$URL"
+c=$(curl -s -o /dev/null -w '%{http_code}' -m 10 -H content-type:application/json -H "MCP-Protocol-Version: 2026-07-28" -H "Mcp-Method: tools/call" -H "Mcp-Name: query" -H "Mcp-Name: list_tables" "http://127.0.0.1:$PORT/mcp" -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"query","arguments":{"sql":"SELECT 1"}}}')
+[ "$c" = 400 ] && ok "a repeated Mcp-Name header is refused" || no "repeated Mcp-Name accepted" "HTTP $c"
+# R16 (0.1.12 review): initialize is exempt from the version header rule, a repeated header included
+INIT16='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"1"}}}'
+c=$(curl -s -o /dev/null -w '%{http_code}' -m 10 -H content-type:application/json -H "MCP-Protocol-Version: 2025-06-18" -H "MCP-Protocol-Version: 2025-03-26" "http://127.0.0.1:$PORT/mcp" -d "$INIT16")
+[ "$c" = 200 ] && ok "initialize with a repeated MCP-Protocol-Version is answered (negotiation is in the body)" || no "initialize refused for a repeated version header" "HTTP $c"
+c=$(curl -s -o /dev/null -w '%{http_code}' -m 10 -H content-type:application/json -H "MCP-Protocol-Version: 2025-06-18" -H "MCP-Protocol-Version: 2025-03-26" "http://127.0.0.1:$PORT/mcp" -d '{"jsonrpc":"2.0","id":2,"method":"ping"}')
+[ "$c" = 400 ] && ok "and any other method with a repeated version header is still a 400" || no "repeated version header accepted after the handshake" "HTTP $c"
+# F2/F4: existence and privilege oracles, and current_setting, answer what SHOW refuses
+r=$(tool query '{"sql":"SELECT current_setting('"'"'data_directory'"'"')"}' | body)
+case "$r" in ERROR:*) ok "current_setting('data_directory') is refused like SHOW";; *) no "current_setting leaked the data directory" "$r";; esac
+# R15 (0.1.12 review): ORDER BY ... USING an operator outside pg_catalog
+r=$(tool query '{"sql":"SELECT id FROM customers ORDER BY id USING OPERATOR(public.<<<)"}' | body)
+case "$r" in ERROR:*USING*) ok "ORDER BY ... USING OPERATOR(public.<<<) is refused";; *) no "a sort operator outside pg_catalog was accepted" "$r";; esac
+r=$(tool query '{"sql":"SELECT id FROM customers ORDER BY id USING <"}' | body)
+case "$r" in ERROR:*) no "ORDER BY ... USING < refused" "$r";; *) ok "and ORDER BY ... USING < still works";; esac
+# R14 (0.1.12 review): a user's table named like a refused catalogue object is not refused
+docker exec acc_pg psql -U postgres -qc "CREATE TABLE IF NOT EXISTS public.pg_configs(k text); INSERT INTO public.pg_configs VALUES ('a');" >/dev/null 2>&1
+r=$(tool query '{"sql":"SELECT k FROM public.pg_configs"}' | body)
+case "$r" in ERROR:*) no "a user table named pg_configs was refused" "$r";; *) ok "a user table named pg_configs is readable";; esac
+r=$(tool query '{"sql":"SELECT * FROM pg_config"}' | body)
+case "$r" in ERROR:*configuration*) ok "pg_config is refused as server configuration, not as a side-effect function";; *) no "pg_config not refused with the right reason" "$r";; esac
+for q in "SELECT * FROM pg_hba_file_rules" "SELECT * FROM pg_show_all_file_settings()" "SELECT * FROM pg_stat_statements" "SELECT * FROM pg_ident_file_mappings" \
+         "SELECT current_setting(E'data_directory')" "SELECT current_setting(\$\$data_directory\$\$)" "SELECT current_setting(U&'data_directory')" "SELECT current_setting('data_directory'::text)" "SELECT current_setting(('data_directory'))" "SELECT current_setting('data_' || 'directory')"; do
+  r=$(tool query "{\"sql\":\"$q\"}" | body)
+  case "$r" in ERROR:*) ok "refused: $q";; *) no "server configuration readable through: $q" "$r";; esac
+done
+stop
+# rate limit off: this server answers about forty cases in a row
+start DATABASE_URL="$URL" MCP_ALLOW_SCHEMAS=public MCP_RATE_RPM=0
+for q in "SHOW ALL" "SELECT to_regclass('secret.t')" "SELECT 'secret.t'::regclass" "SELECT has_table_privilege('secret.t','select')" "SELECT col_description('customers'::regclass,1)" \
+         "SELECT '{secret.t}'::regclass[]" "SELECT ARRAY['secret.t']::regclass[]" "SELECT CAST(ARRAY['secret.t'] AS regclass[])" "SELECT regclass('secret.t')" "SELECT regclassin('secret.t')" "SELECT 'secret'::pg_catalog.regnamespace" "SELECT pg_relation_size('secret.t')" "SELECT currval('secret.t')"; do
+  r=$(tool query "{\"sql\":\"$q\"}" | body)
+  case "$r" in ERROR:*) ok "surface: refused $q";; *) no "surface leaks existence through: $q" "$r";; esac
+done
+# R8: a user's type whose name merely starts with "reg" is not an object-identifier type
+docker exec acc_pg psql -U postgres -qc "CREATE TYPE acc_region AS ENUM ('EU','US'); CREATE TYPE registry_status AS ENUM ('ok');" >/dev/null 2>&1
+for q in "SELECT 'EU'::acc_region" "SELECT CAST('US' AS acc_region)" "SELECT 'ok'::registry_status" "SELECT '{EU}'::acc_region[]"; do
+  r=$(tool query "{\"sql\":\"$q\"}" | body)
+  case "$r" in ERROR:*) no "surface refused a user type: $q" "$r";; *) ok "surface: a user type starting with reg works: $q";; esac
+done
+# P1 (0.1.12 review, also in 0.1.11): an operator is a function call written as a symbol
+docker exec -i acc_pg psql -U postgres -q >/dev/null 2>&1 <<'SQL'
+CREATE FUNCTION public.acc_peek(int,int) RETURNS int LANGUAGE plpgsql SECURITY DEFINER AS $$BEGIN RETURN 100; END$$;
+CREATE OPERATOR public.### (LEFTARG=int, RIGHTARG=int, FUNCTION=public.acc_peek);
+CREATE SCHEMA acc_ext; CREATE OPERATOR acc_ext.<<< (LEFTARG=int, RIGHTARG=int, FUNCTION=public.acc_peek);
+CREATE FUNCTION public.acc_fake_eq(text,int) RETURNS bool LANGUAGE sql IMMUTABLE AS 'SELECT true';
+CREATE OPERATOR public.= (LEFTARG=text, RIGHTARG=int, FUNCTION=public.acc_fake_eq);
+CREATE EXTENSION IF NOT EXISTS citext;
+SQL
+for q in "SELECT 1 ### 1" "SELECT 1 OPERATOR(acc_ext.<<<) 1" "SELECT id FROM customers WHERE id ### 1 > 0" "SELECT name FROM customers WHERE name = 1" "SELECT id FROM customers ORDER BY id USING OPERATOR(acc_ext.<<<)" "SELECT 1 ###/**/ 1"; do
+  r=$(tool query "{\"sql\":\"$q\"}" | body)
+  case "$r" in ERROR:*operator*) ok "surface: refused an operator over a function outside pg_catalog: $q";; *) no "operator bypassed the surface: $q" "$r";; esac
+done
+for q in "SELECT 1 = 1, 2 < 3, 'a' || 'b'" "SELECT name FROM customers WHERE name = 'x'" "SELECT '{\\\"a\\\":1}'::jsonb ->> 'a'" "SELECT '{\\\"a\\\":1}'::jsonb @> '{}'" "SELECT name FROM customers WHERE name LIKE 'a%'" "SELECT ARRAY[1] && ARRAY[1]" "SELECT int4range(1,5) @> 3" "SELECT id FROM customers WHERE id IN (1,2) AND id BETWEEN 0 AND 9" "SELECT name FROM customers WHERE name ILIKE ANY (ARRAY['a%','b%'])"; do
+  r=$(tool query "{\"sql\":\"$q\"}" | body)
+  case "$r" in ERROR:*) no "surface refused an ordinary operator: $q" "$r";; *) ok "surface: an ordinary operator still works: $q";; esac
+done
+r=$(tool query '{"sql":"SELECT name::citext = '"'"'x'"'"' FROM customers"}' | body)
+case "$r" in ERROR:*) no "a trusted extension's operator was refused (citext =)" "$r";; *) ok "surface: an operator of a trusted extension works (citext is in MCP_TRUSTED_EXTENSIONS by default)";; esac
+docker exec acc_pg psql -U postgres -qc "DROP OPERATOR public.= (text, int); DROP OPERATOR public.### (int, int); DROP SCHEMA acc_ext CASCADE; DROP EXTENSION IF EXISTS citext;" >/dev/null 2>&1
+# P2 (0.1.12 review, also in 0.1.11): code a statement runs without naming it
+docker exec -i acc_pg psql -U postgres -q >/dev/null 2>&1 <<'SQL'
+CREATE DOMAIN public.acc_dpeek AS int CHECK (public.acc_peek(VALUE, 1) > VALUE);
+CREATE DOMAIN public.acc_dpos AS int CHECK (VALUE > 0);
+CREATE TYPE public.acc_mood AS ENUM ('ok', 'bad');
+CREATE FUNCTION public.acc_t2m(text) RETURNS public.acc_mood LANGUAGE plpgsql SECURITY DEFINER AS $$BEGIN RETURN enum_first(NULL::public.acc_mood); END$$;
+CREATE CAST (text AS public.acc_mood) WITH FUNCTION public.acc_t2m(text) AS IMPLICIT;
+CREATE VIEW public.acc_vpeek AS SELECT public.acc_peek(1, 1) AS s;
+CREATE TYPE public.acc_m2 AS ENUM ('a', 'b');
+CREATE FUNCTION public.acc_m2cmp(public.acc_m2, public.acc_m2) RETURNS int LANGUAGE plpgsql IMMUTABLE SECURITY DEFINER AS $$BEGIN RETURN enum_cmp($1, $2); END$$;
+CREATE OPERATOR CLASS public.acc_m2_ops DEFAULT FOR TYPE public.acc_m2 USING btree AS
+  OPERATOR 1 pg_catalog.< (anyenum, anyenum), OPERATOR 2 pg_catalog.<= (anyenum, anyenum), OPERATOR 3 pg_catalog.= (anyenum, anyenum),
+  OPERATOR 4 pg_catalog.>= (anyenum, anyenum), OPERATOR 5 pg_catalog.> (anyenum, anyenum), FUNCTION 1 public.acc_m2cmp(public.acc_m2, public.acc_m2);
+CREATE TABLE public.acc_m2t (k public.acc_m2); INSERT INTO public.acc_m2t VALUES ('a'), ('b');
+SQL
+for q in "SELECT 150::acc_dpeek" "SELECT '{150}'::acc_dpeek[]" "SELECT acc_dpeek(150)" "SELECT * FROM (VALUES (150::acc_dpeek)) v(x)" "SELECT 'x'::text::acc_mood" "SELECT * FROM acc_vpeek" "SELECT k FROM acc_m2t ORDER BY k" "SELECT DISTINCT k FROM acc_m2t"; do
+  r=$(tool query "{\"sql\":\"$q\"}" | body)
+  case "$r" in ERROR:*"without naming it"*) ok "surface: implicit code refused: $q";; *) no "implicit code ran under the surface: $q" "$r";; esac
+done
+for q in "SELECT 5::acc_dpos" "SELECT 'ok'::acc_mood" "SELECT id FROM customers ORDER BY name"; do
+  r=$(tool query "{\"sql\":\"$q\"}" | body)
+  case "$r" in ERROR:*) no "surface refused code-free types: $q" "$r";; *) ok "surface: a domain with a built-in CHECK, an enum and ordinary sorting work: $q";; esac
+done
+docker exec acc_pg psql -U postgres -qc "DROP VIEW public.acc_vpeek; DROP TABLE public.acc_m2t; DROP TYPE public.acc_m2 CASCADE; DROP CAST (text AS public.acc_mood); DROP TYPE public.acc_mood CASCADE; DROP DOMAIN public.acc_dpeek; DROP DOMAIN public.acc_dpos;" >/dev/null 2>&1
+stop
+# G5/G16: the password in the connection string never reaches the audit record or stderr
+i=0
+for u in "postgres://u@127.0.0.1:1/db?password=SEKRET" "postgres://u:pa@SEKRET@127.0.0.1:1/db" "host=127.0.0.1 port=1 user=u password='a SEKRET' dbname=db" "host=127.0.0.1 port=1 user=u password = SEKRET dbname=db" "postgres://u@127.0.0.1:1/db?sslpassword=SEKRET" "postgres://u:x@127.0.0.1:1/db?PassWord=SEKRET"; do
+  i=$((i+1)); PL=/tmp/acc_pw_${i}_$$.log; rm -f "$PL"
+  env DATABASE_URL="$u" MCP_AUDIT_LOG="$PL" MCP_ADDR=127.0.0.1:$((PORT+30+i)) timeout 3 "$BIN" >/tmp/acc_pw_${i}_$$.err 2>&1
+  n=$(cat "$PL" /tmp/acc_pw_${i}_$$.err 2>/dev/null | grep -c SEKRET)
+  [ "$n" = 0 ] && ok "connection string shape $i leaves no password in the audit or stderr" || no "password leaked (shape $i)" "$u"
+  rm -f "$PL" /tmp/acc_pw_${i}_$$.err
+done
+# R1/R12 (0.1.12 review): the driver takes the credentials up to the FIRST `@`, past `/`, `?` and `#`;
+# `;` is part of a DATABASE_URL password; parameter names are percent-decoded
+i=0
+for u in "postgres://u:SE/KRET@127.0.0.1:1/db" "postgres://u:SE?KRET@127.0.0.1:1/db" "postgres://u:SE#KRET@127.0.0.1:1/db" "postgres://u:SE;KRET@127.0.0.1:1/db" "postgres://127.0.0.1:1/db?password=SE;KRET" "postgres://127.0.0.1:1/db?pass%77ord=SEKRET" "postgres://127.0.0.1:1/db?password%3DSEKRET" "postgres://127.0.0.1:1/db?x=1?password=SEKRET" "host=127.0.0.1 port=1 password=SE;KRET" "host=127.0.0.1 port=1 password='SE\\\\' user=SEKRET"; do
+  i=$((i+1)); PL=/tmp/acc_pw2_${i}_$$.log; rm -f "$PL"
+  env DATABASE_URL="$u" MCP_AUDIT_LOG="$PL" MCP_ADDR=127.0.0.1:$((PORT+60+i)) timeout 3 "$BIN" >/tmp/acc_pw2_${i}_$$.err 2>&1
+  n=$(cat "$PL" /tmp/acc_pw2_${i}_$$.err 2>/dev/null | grep -c KRET)
+  [ "$n" = 0 ] && ok "review shape $i leaves no password in the audit or stderr" || no "password leaked (review shape $i)" "$u"
+  rm -f "$PL" /tmp/acc_pw2_${i}_$$.err
+done
+PL=/tmp/acc_pw3_$$.log; rm -f "$PL"
+env MCP_DATABASE_URLS="a=postgres://u:pa;SEKRET@127.0.0.1:1/db" MCP_AUDIT_LOG="$PL" MCP_ADDR=127.0.0.1:$((PORT+75)) timeout 3 "$BIN" >/tmp/acc_pw3_$$.err 2>&1
+n=$(cat "$PL" /tmp/acc_pw3_$$.err 2>/dev/null | grep -c SEKRET)
+[ "$n" = 0 ] && ok "a ';' inside a password in MCP_DATABASE_URLS is not echoed in the error" || no "MCP_DATABASE_URLS error echoed a password fragment" "$(cat /tmp/acc_pw3_$$.err | head -3)"
+rm -f "$PL" /tmp/acc_pw3_$$.err
+# the base64 password of the review connects, and the startup record still hides it
+docker exec acc_pg psql -U postgres -qc "CREATE ROLE acc_b64 LOGIN PASSWORD 'Zm9v/YmFy+cXV4'; GRANT CONNECT ON DATABASE postgres TO acc_b64;" >/dev/null
+PL=/tmp/acc_pw4_$$.log; rm -f "$PL"
+start DATABASE_URL="postgres://acc_b64:Zm9v/YmFy+cXV4@127.0.0.1:$PGPORT_ACC/postgres" MCP_AUDIT_LOG="$PL"
+r=$(tool query '{"sql":"SELECT current_user"}')
+stop
+n=$(grep -c 'YmFy' "$PL" 2>/dev/null)
+case "$r" in *acc_b64*) [ "$n" = 0 ] && ok "a password with '/' connects and stays out of the audit log" || no "password with '/' in the audit log" "$(grep -o '"DATABASE_URL":"[^"]*"' "$PL")";; *) no "password with '/' did not connect" "$r";; esac
+rm -f "$PL" "$PL.hwm"
+# G6: with the key given, stripping `key_fp` and recomputing the tail is no longer "OK (HMAC-SHA256)"
+FL=/tmp/acc_forge_$$.log; rm -f "$FL" "$FL.hwm"
+start DATABASE_URL="$URL" MCP_AUDIT_LOG="$FL" MCP_AUDIT_HMAC_KEY=forge_key
+tool query '{"sql":"SELECT 1"}' >/dev/null; tool query '{"sql":"SELECT 2"}' >/dev/null; tool query '{"sql":"SELECT 3"}' >/dev/null
+stop
+out=$(env MCP_AUDIT_HMAC_KEY=forge_key "$BIN" --verify-audit "$FL" 2>&1)
+case "$out" in "OK [HMAC-SHA256]"*) ok "an honest keyed log verifies and says HMAC-SHA256";; *) no "keyed log did not verify as keyed" "$out";; esac
+python3 - "$FL" <<'PY3'
+import json, sys, hashlib
+lines = [json.loads(l) for l in open(sys.argv[1]).read().splitlines()]
+keep = lines[:2] + lines[3:]            # cut one entry out of the middle
+prev = keep[1]["hash"]; out = keep[:2]
+for i, e in enumerate(keep[2:], start=3):
+    e = dict(e); e.pop("key_fp", None); e.pop("prev", None); e.pop("hash", None)
+    e["seq"] = i
+    body = json.dumps(e, sort_keys=True, separators=(",", ":"))
+    h = hashlib.sha256((prev + body).encode()).hexdigest()
+    e["prev"] = prev; e["hash"] = h; prev = h
+    out.append(e)
+open(sys.argv[1], "w").write("\n".join(json.dumps(e, sort_keys=True, separators=(",", ":")) for e in out) + "\n")
+PY3
+out=$(env MCP_AUDIT_HMAC_KEY=forge_key "$BIN" --verify-audit "$FL" 2>&1)
+case "$out" in TAMPERED*) ok "stripping the signature from the tail is caught when the key is given";; *) no "UNSIGNED TAIL VERIFIED AS HMAC" "$out";; esac
+rm -f "$FL" "$FL.hwm"
+# G8: an empty MCP_AUDIT_HMAC_KEY (compose expands a missing ${VAR} to "") must not hide the key file
+KF=/tmp/acc_keyfile_$$; printf 'key-from-file\n' > "$KF"
+GL=/tmp/acc_g8_$$.log; rm -f "$GL" "$GL.hwm"
+start DATABASE_URL="$URL" MCP_AUDIT_LOG="$GL" MCP_AUDIT_HMAC_KEY= MCP_AUDIT_HMAC_KEY_FILE="$KF"
+tool query '{"sql":"SELECT 1"}' >/dev/null
+stop
+grep -q '"key_fp"' "$GL" && ok "an empty MCP_AUDIT_HMAC_KEY falls through to MCP_AUDIT_HMAC_KEY_FILE" || no "empty key variable silently disabled the keyed chain" "$(head -c 200 "$GL")"
+printf '\n' > "$KF"
+r=$(env DATABASE_URL="$URL" MCP_AUDIT_HMAC_KEY_FILE="$KF" MCP_ADDR=127.0.0.1:$((PORT+40)) timeout 5 "$BIN" 2>&1; echo "rc=$?")
+case "$r" in *"rc=2"*) ok "a key file holding only a newline is refused at start";; *) no "newline-only key file accepted" "$r";; esac
+rm -f "$KF" "$GL" "$GL.hwm"
+# G9: delete the log and keep the sidecar: the restart says so IN the chain, and the new file is refused
+DL=/tmp/acc_g9_$$.log; rm -f "$DL" "$DL.hwm"
+start DATABASE_URL="$URL" MCP_AUDIT_LOG="$DL" MCP_AUDIT_HMAC_KEY=g9_key
+tool query '{"sql":"SELECT 1"}' >/dev/null
+stop
+rm -f "$DL"
+start DATABASE_URL="$URL" MCP_AUDIT_LOG="$DL" MCP_AUDIT_HMAC_KEY=g9_key
+stop
+grep -q 'chain_anomaly' "$DL" && ok "a removed log is recorded in the new chain's startup entry" || no "log removal left no trace in the chain" "$(head -c 300 "$DL")"
+out=$(env MCP_AUDIT_HMAC_KEY=g9_key "$BIN" --verify-audit "$DL" 2>&1)
+case "$out" in TAMPERED*"not 1"*) ok "and a log that does not start at entry 1 is refused";; *) no "log with its head missing verified" "$out";; esac
+rm -f "$DL" "$DL.hwm"
+# R5 (0.1.12 review): with a key, cutting the tail AND deleting the mark is still noticed
+HL=/tmp/acc_r5_$$.log; rm -f "$HL" "$HL.hwm"
+start DATABASE_URL="$URL" MCP_AUDIT_LOG="$HL" MCP_AUDIT_HMAC_KEY=r5_key
+tool query '{"sql":"SELECT 1"}' >/dev/null; tool query '{"sql":"SELECT 2"}' >/dev/null
+stop
+head -n -1 "$HL" > "$HL.short" && mv "$HL.short" "$HL"; rm -f "$HL.hwm"
+start DATABASE_URL="$URL" MCP_AUDIT_LOG="$HL" MCP_AUDIT_HMAC_KEY=r5_key
+stop
+grep '"decision":"startup"' "$HL" | tail -1 | grep -q 'mark is missing although the log is keyed' && ok "a keyed log whose mark was deleted is reported in the startup record" || no "deleting the mark hid a truncation" "$(grep '"decision":"startup"' "$HL" | tail -1 | head -c 300)"
+rm -f "$HL" "$HL.hwm"
+# G14: strict redaction + a database that cannot be asked = nothing served, and no "verified"
+r=$(env DATABASE_URL="postgres://x:y@127.0.0.1:1/x" MCP_REDACT_COLUMNS=email MCP_REDACT_REQUIRE_REVOKE=1 MCP_RATE_RPM=0 MCP_ADDR=127.0.0.1:$((PORT+41)) timeout 8 "$BIN" 2>&1 >/dev/null | grep -c 'verified against the database')
+[ "$r" = 0 ] && ok "an unreachable database is never reported as 'verified'" || no "claimed verification without reaching the database" "$r"
+env DATABASE_URL="postgres://x:y@127.0.0.1:1/x" MCP_REDACT_COLUMNS=email MCP_REDACT_REQUIRE_REVOKE=1 MCP_RATE_RPM=0 MCP_ADDR=127.0.0.1:$((PORT+42)) "$BIN" >/dev/null 2>&1 &
+G14PID=$!; sleep 3
+c=$(curl -s -o /dev/null -w '%{http_code}' -m 10 -H content-type:application/json "http://127.0.0.1:$((PORT+42))/mcp" -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"query","arguments":{"sql":"SELECT 1"}}}')
+c2=$(curl -s -o /dev/null -w '%{http_code}' -m 10 -H content-type:application/json "http://127.0.0.1:$((PORT+42))/mcp" -d '{"jsonrpc":"2.0","id":1,"method":"resources/list"}')
+kill -9 $G14PID 2>/dev/null
+[ "$c $c2" = "503 503" ] && ok "MCP_REDACT_REQUIRE_REVOKE=1 serves nothing until the database has been checked" || no "strict redaction served before verification" "HTTP $c $c2"
+# R4 (0.1.12 review): strict redaction over stdio blocks what reaches data, not the handshake
+INIT='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"1"}}}'
+QCALL='{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"query","arguments":{"sql":"SELECT 1"}}}'
+# (initialize asks the database for the posture it reports; unreachable, that takes the pool's ~10 s)
+r=$( (echo "$INIT"; echo "$QCALL"; sleep 14) | env DATABASE_URL="postgres://x:y@127.0.0.1:1/x" MCP_REDACT_COLUMNS=email MCP_REDACT_REQUIRE_REVOKE=1 timeout 20 "$BIN" --stdio 2>/dev/null)
+case "$r" in *'"id":1'*'"result"'*) ok "strict redaction over stdio answers an immediate initialize";; *) no "initialize refused while redaction was unverified" "$r";; esac
+case "$(echo "$r" | grep '"id":2')" in *'"code":-32000'*REVOKE*) ok "and refuses tools/call until the database has been checked";; *) no "tools/call served before verification" "$r";; esac
+c=$( (sleep 3; curl -s -m 15 -H content-type:application/json "http://127.0.0.1:$((PORT+43))/mcp" -d "$INIT") & env DATABASE_URL="postgres://x:y@127.0.0.1:1/x" MCP_REDACT_COLUMNS=email MCP_REDACT_REQUIRE_REVOKE=1 MCP_RATE_RPM=0 MCP_ADDR=127.0.0.1:$((PORT+43)) timeout 20 "$BIN" >/dev/null 2>&1; wait)
+case "$c" in *'"result"'*protocolVersion*) ok "the same over HTTP: initialize passes while the check is pending";; *) no "HTTP initialize refused while redaction was unverified" "$c";; esac
+docker exec acc_pg psql -U postgres -qc "CREATE ROLE acc_rv LOGIN PASSWORD 'rv'; GRANT CONNECT ON DATABASE postgres TO acc_rv; GRANT USAGE ON SCHEMA public TO acc_rv; GRANT SELECT (id, name) ON customers TO acc_rv;" >/dev/null
+r=$( (echo "$INIT"; sleep 4; echo "$QCALL"; sleep 2) | env DATABASE_URL="postgres://acc_rv:rv@127.0.0.1:$PGPORT_ACC/postgres" MCP_REDACT_COLUMNS=email MCP_REDACT_REQUIRE_REVOKE=1 timeout 12 "$BIN" --stdio 2>/dev/null)
+case "$r" in *'"id":1'*'"result"'*) case "$(echo "$r" | grep '"id":2')" in *'"result"'*) ok "a revoked column over stdio: initialize at once, queries after the check";; *) no "query refused after verification (stdio)" "$r";; esac;; *) no "initialize refused (stdio, revoked role)" "$r";; esac
+# G4: a connection that starts a request and never finishes it is closed
+start DATABASE_URL="$URL" MCP_CONN_TIMEOUT_SECS=3 MCP_STATEMENT_TIMEOUT=0
+python3 - "$PORT" <<'PY4' && ok "a stalled connection is closed after MCP_CONN_TIMEOUT_SECS" || no "a stalled connection was left open" ""
+import socket, sys, time
+s = socket.socket(); s.settimeout(1); s.connect(("127.0.0.1", int(sys.argv[1])))
+s.send(b"POST /mcp HTTP/1.1\r\nHost: x\r\n")
+end = time.time() + 10
+while time.time() < end:
+    try:
+        if s.recv(1) == b"": sys.exit(0)      # server closed it
+    except socket.timeout:
+        try: s.send(b"X-a: b\r\n")            # dribble, as a slow-connection attack does
+        except OSError: sys.exit(0)
+    except OSError: sys.exit(0)
+sys.exit(1)
+PY4
+stop
+# R2 (0.1.12 review): one address holding every slot and pinging each one; /health must keep answering
+start DATABASE_URL="$URL" MCP_MAX_CONNECTIONS=40 MCP_CONN_TIMEOUT_SECS=10 MCP_STATEMENT_TIMEOUT=0
+python3 - "$PORT" <<'PY5' && ok "one address cannot hold every connection: /health answers throughout" || no "one address starved /health" ""
+import socket, sys, time
+port = int(sys.argv[1])
+def health():
+    try:
+        s = socket.create_connection(("127.0.0.1", port), timeout=3)
+        s.sendall(b"GET /health HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+        return s.recv(15) == b"HTTP/1.1 200 OK"
+    except OSError:
+        return False
+socks = [socket.create_connection(("127.0.0.1", port)) for _ in range(40)]
+good = health()
+for _ in range(3):
+    for s in socks:
+        try: s.sendall(b"GET /health HTTP/1.1\r\nHost: x\r\n\r\n"); s.settimeout(0.2); s.recv(4096)
+        except OSError: pass
+    time.sleep(1)
+    good = good and health()
+sys.exit(0 if good else 1)
+PY5
+grep -q "MCP_MAX_CONNECTIONS_PER_IP (8)" /tmp/acc_$PORT.log && ok "and the operator is told why connections are being closed" || no "no warning about the per-address cap" "$(tail -3 /tmp/acc_$PORT.log)"
+stop
+# R3: pipelining requests and never reading the answers no longer keeps a connection past the budget
+start DATABASE_URL="$URL" MCP_CONN_TIMEOUT_SECS=3 MCP_STATEMENT_TIMEOUT=0
+python3 - "$PORT" <<'PY6' && ok "a client that never reads its responses is closed within the budget" || no "a non-reading client outlived the budget" ""
+import socket, sys, time
+s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
+s.connect(("127.0.0.1", int(sys.argv[1]))); s.setblocking(False)
+req = b"GET /.well-known/mcp/server-card.json HTTP/1.1\r\nHost: x\r\n\r\n" * 200
+t0 = time.time()
+while time.time() - t0 < 12:
+    try: s.send(req)
+    except BlockingIOError: pass
+    except OSError: sys.exit(0 if time.time() - t0 < 9 else 1)
+    time.sleep(0.2)
+sys.exit(1)
+PY6
+stop
+# R9 (0.1.12 review): a connection budget shorter than the statement timeout cut long queries off unanswered
+r=$(env DATABASE_URL="$URL" MCP_CONN_TIMEOUT_SECS=20 MCP_ADDR=127.0.0.1:$((PORT+45)) timeout 5 "$BIN" 2>&1; echo "rc=$?")
+case "$r" in *"must exceed the statement timeout"*rc=2*) ok "MCP_CONN_TIMEOUT_SECS not above statement_timeout + 10 s stops the start";; *) no "a budget shorter than the statement timeout was accepted" "$r";; esac
+r=$(env DATABASE_URL="$URL" MCP_CONN_TIMEOUT_SECS=45 MCP_ADDR=127.0.0.1:$((PORT+46)) timeout 3 "$BIN" 2>&1; echo "rc=$?")
+case "$r" in *"must exceed"*) no "a sufficient budget was refused" "$r";; *) ok "and 45 s over the default 30 s statement timeout starts";; esac
+r=$(env DATABASE_URL="$URL" MCP_MAX_CONNECTIONS_PER_IP=1.5 MCP_ADDR=127.0.0.1:$((PORT+44)) timeout 5 "$BIN" 2>&1; echo "rc=$?")
+case "$r" in *"MCP_MAX_CONNECTIONS_PER_IP must be a whole number"*rc=2*) ok "MCP_MAX_CONNECTIONS_PER_IP that is not a whole number stops the start";; *) no "bad MCP_MAX_CONNECTIONS_PER_IP accepted" "$r";; esac
+# G11/G12: the role check sees column grants, sequences, and the groups a NOINHERIT role may become
+docker exec -i acc_pg psql -U postgres -q -v ON_ERROR_STOP=1 <<'SQL' >/dev/null || { echo "fixture failed: gate roles 0.1.12"; exit 1; }
+CREATE ROLE acc_colup LOGIN PASSWORD 'c'; GRANT CONNECT ON DATABASE postgres TO acc_colup; GRANT USAGE ON SCHEMA public TO acc_colup;
+GRANT SELECT ON customers TO acc_colup; GRANT UPDATE (name) ON customers TO acc_colup;
+CREATE ROLE acc_grp NOLOGIN; GRANT INSERT ON customers TO acc_grp;
+CREATE ROLE acc_noinh LOGIN PASSWORD 'n' NOINHERIT; GRANT CONNECT ON DATABASE postgres TO acc_noinh; GRANT USAGE ON SCHEMA public TO acc_noinh;
+GRANT SELECT ON customers TO acc_noinh; GRANT acc_grp TO acc_noinh;
+CREATE SEQUENCE acc_seq; CREATE ROLE acc_seq_r LOGIN PASSWORD 's'; GRANT CONNECT ON DATABASE postgres TO acc_seq_r; GRANT USAGE ON SCHEMA public TO acc_seq_r; GRANT SELECT ON customers TO acc_seq_r; GRANT UPDATE ON SEQUENCE acc_seq TO acc_seq_r;
+SQL
+k=0
+for who in "acc_colup:c:a column-level UPDATE" "acc_noinh:n:membership of a role that can INSERT" "acc_seq_r:s:UPDATE on a sequence"; do
+  k=$((k+1)); u="${who%%:*}"; rest="${who#*:}"; pw="${rest%%:*}"; what="${rest#*:}"
+  r=$(env DATABASE_URL="postgres://$u:$pw@127.0.0.1:$PGPORT_ACC/postgres" MCP_ADDR="0.0.0.0:$((PORT+920+k))" MCP_BEARER_TOKEN=gate_tok_0112_long_enough_xx timeout 10 "$BIN" 2>&1; echo "rc=$?")
+  case "$r" in *"rc=3"*) ok "a role with $what is refused a network listener";; *) no "role with $what was allowed to listen" "$r";; esac
+done
+# G13: on Apify the platform authenticates; the report must not call the listener anonymous
+APORT=$((PORT+930))
+env DATABASE_URL="$RURL" APIFY_IS_AT_HOME=1 ACTOR_WEB_SERVER_PORT=$APORT MCP_ADDR="0.0.0.0:$APORT" MCP_RATE_RPM=0 "$BIN" >/tmp/acc_apify_$$.log 2>&1 &
+APID=$!; sleep 3
+r=$(curl -s -m 10 -H content-type:application/json "http://127.0.0.1:$APORT/mcp" -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"security_posture","arguments":{}}}')
+kill -9 $APID 2>/dev/null; rm -f /tmp/acc_apify_$$.log
+case "$r" in *transport.anonymous*) no "Apify listener reported as anonymous" "$(echo "$r" | head -c 300)";; *posture*|*grade*|*role*) ok "on Apify the report does not call the platform-authenticated listener anonymous";; *) no "no posture answer" "$(echo "$r" | head -c 200)";; esac
+PORT=$((PORT+940))
 
 section "Deployment shapes"
 start MCP_DATABASE_URLS="a=$URL;b=$URL"

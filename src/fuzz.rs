@@ -144,6 +144,16 @@ const WRITE_SEEDS: &[&str] = &[
     "SELECT * FROM pg_read_file('/etc/passwd')",
     "SELECT 1 UNION SELECT setval('s', 1)",
     "SELECT array_agg(x) FROM (SELECT pg_sleep(1) AS x) t",
+    // current_setting of a variable SHOW refuses, in the literal spellings a mutation keeps equal
+    // (R11, 0.1.12 review). `U&'x'` is pinned in MUST_REJECT instead: a comment inserted between
+    // `U` and `&` makes it a different expression, which is not a bypass.
+    "SELECT current_setting(E'data_directory')",
+    "SELECT current_setting($$hba_file$$)",
+    "SELECT current_setting(('data_directory'::text))",
+    "SELECT current_setting('data_' || 'directory')",
+    // a sort operator outside pg_catalog (R15, 0.1.12 review)
+    "SELECT id FROM users ORDER BY id USING OPERATOR(public.<<<)",
+    "SELECT array_agg(id ORDER BY id USING OPERATOR(ext.<<<)) FROM users",
 ];
 
 /// Corpus of legitimate READS — exercises I3/I4 (canonicalisation, cost routing) and panic freedom.
@@ -301,8 +311,11 @@ fn comment_junk(rng: &mut Rng, n: usize) -> String {
 /// so the mutation would change semantics and produce false findings.
 fn is_token_boundary(sql: &str, at: usize) -> bool {
     let ident = |c: char| c.is_alphanumeric() || c == '_' || c == '$';
+    // Between two operator characters is inside an operator: `|/**/|` is not `||` but two `|`, a
+    // different statement, which the checks then rightly did not treat as the seed.
+    let op = |c: char| "+-*/<>=~!@#%^&|`?".contains(c);
     match (sql[..at].chars().next_back(), sql[at..].chars().next()) {
-        (Some(p), Some(n)) => !(ident(p) && ident(n)),
+        (Some(p), Some(n)) => !(ident(p) && ident(n)) && !(op(p) && op(n)),
         _ => true,
     }
 }
@@ -323,7 +336,7 @@ fn mutate_once(rng: &mut Rng, sql: &str) -> String {
         return flip_case_outside_literals(rng, sql);
     }
     let at = *rng.pick(&boundaries);
-    match rng.below(8) {
+    match rng.below(9) {
         0 => insert(sql, at, rng.pick(WS)),
         1 => {
             let n = 1 + rng.below(12);
@@ -345,8 +358,61 @@ fn mutate_once(rng: &mut Rng, sql: &str) -> String {
         4 => insert(sql, at, rng.pick(INVISIBLE)),
         5 => flip_case_outside_literals(rng, sql),
         6 => requote_literal(rng, sql),
+        7 => wrap_table_function(rng, sql).unwrap_or_else(|| sql.to_string()),
         _ => format!("({})", sql),
     }
+}
+
+/// Structural mutation: rewrites a table function in `FROM` into the other shapes PostgreSQL parses it
+/// as. `FROM f(..)` and `FROM LATERAL f(..)` are different AST nodes, and the 0.1.11 audit found the
+/// second one unread by every rule written for the first (`SELECT * FROM LATERAL pg_read_file(..)`
+/// returned the file). Text mutations (whitespace, comments, case) never change the node, so a fuzzer
+/// limited to them cannot rediscover that class; this one can.
+fn wrap_table_function(rng: &mut Rng, sql: &str) -> Option<String> {
+    let lower = sql.to_ascii_lowercase();
+    // every `from ` that is followed by `ident(`
+    let mut hits = Vec::new();
+    let mut from = 0;
+    while let Some(i) = lower[from..].find("from ") {
+        let start = from + i + 5;
+        let rest = &lower[start..];
+        let ident_len = rest
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '.')
+            .count();
+        if ident_len > 0 && rest[ident_len..].starts_with('(') {
+            hits.push((start, start + ident_len));
+        }
+        from = start;
+    }
+    if hits.is_empty() {
+        return None;
+    }
+    let (start, open) = *rng.pick(&hits);
+    // matching close paren, skipping single-quoted literals
+    let (mut depth, mut quoted, mut close) = (0i32, false, None);
+    for (off, c) in sql[open..].char_indices() {
+        match c {
+            '\'' => quoted = !quoted,
+            '(' if !quoted => depth += 1,
+            ')' if !quoted => {
+                depth -= 1;
+                if depth == 0 {
+                    close = Some(open + off + 1);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let close = close?;
+    let (head, call, tail) = (&sql[..start], &sql[start..close], &sql[close..]);
+    Some(match rng.below(4) {
+        0 => format!("{head}LATERAL {call}{tail}"),
+        1 => format!("{head}(SELECT 1 AS o) q CROSS JOIN LATERAL {call} x{tail}"),
+        2 => format!("{head}{call} WITH ORDINALITY AS x(a, b){tail}"),
+        _ => format!("{head}(SELECT 1 AS o) q JOIN LATERAL {call} x ON true{tail}"),
+    })
 }
 
 fn insert(sql: &str, at: usize, what: &str) -> String {
@@ -404,7 +470,14 @@ fn requote_literal(rng: &mut Rng, sql: &str) -> String {
         .iter()
         .filter(|(s, e)| {
             let inner = &sql[s + 1..e - 1];
-            !inner.contains('$') && !inner.contains('\\') && !inner.is_empty()
+            // A prefixed literal (`E'x'`, `U&'x'`, `N'x'`) is not `'x'`: replacing only the quoted
+            // part turned `E'x'` into the identifier `E$$x$$`, a different statement, which the
+            // checks then rightly did not treat as the seed.
+            let prefixed = *s > 0 && {
+                let p = b[s - 1];
+                p.is_ascii_alphanumeric() || p == b'_' || p == b'&'
+            };
+            !prefixed && !inner.contains('$') && !inner.contains('\\') && !inner.is_empty()
         })
         .collect();
     if usable.is_empty() {
@@ -631,6 +704,32 @@ mod tests {
     }
 
     /// The literal scanner must never point at a position inside a string or comment.
+    #[test]
+    fn a_table_function_is_rewritten_into_the_lateral_and_ordinality_shapes() {
+        let mut rng = Rng::new(7);
+        let sql = "SELECT * FROM pg_read_file('/etc/passwd') x";
+        let seen: std::collections::HashSet<String> = (0..200)
+            .filter_map(|_| wrap_table_function(&mut rng, sql))
+            .collect();
+        assert!(
+            seen.iter().any(|s| s.contains("FROM LATERAL pg_read_file")),
+            "{seen:?}"
+        );
+        assert!(
+            seen.iter().any(|s| s.contains("CROSS JOIN LATERAL")),
+            "{seen:?}"
+        );
+        assert!(
+            seen.iter().any(|s| s.contains("WITH ORDINALITY")),
+            "{seen:?}"
+        );
+        assert!(wrap_table_function(&mut rng, "SELECT 1").is_none());
+        // and the validator still refuses every variant
+        for m in &seen {
+            assert!(crate::validate::validate_readonly(m).is_err(), "{m}");
+        }
+    }
+
     #[test]
     fn safe_positions_skips_literals() {
         let sql = "SELECT 'a b', $$c d$$, \"e f\" /* g */ -- h\n FROM t";

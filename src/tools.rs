@@ -603,32 +603,10 @@ pub(crate) fn cost_guard(sql: &str, max_cost: f64, db: Option<&str>) -> Result<(
         if !outside.is_empty() {
             return Err(CostErr::OutsideSurface(surface::refusal_message(&outside)));
         }
-    }
-    let row = client
-        .query_one(&format!("EXPLAIN (FORMAT JSON, VERBOSE) {}", sql), &[])
-        .map_err(|e| CostErr::QueryError(friendly_pg_error_for(&e, Some(sql))))?;
-    let plan: Value = row.get(0); // kolumna json: [{"Plan":{"Total Cost":..}}]
-                                  // Fail CLOSED. This was `.unwrap_or(0.0)`, so a plan whose shape we did not recognise — a
-                                  // different PostgreSQL version, a renamed field — scored zero and sailed past the cost limit
-                                  // with nothing in the log to say the guard had abstained. A cost guard that cannot read the cost
-                                  // has not measured a cheap query; it has failed to measure, and those are different answers.
-    let Some(total) = plan
-        .get(0)
-        .and_then(|v| v.get("Plan"))
-        .and_then(|v| v.get("Total Cost"))
-        .and_then(|v| v.as_f64())
-    else {
-        return Err(CostErr::QueryError(
-            "could not read the estimated cost out of the query plan, so the cost limit cannot be \
-             applied — refusing rather than guessing. This usually means an unexpected PostgreSQL \
-             version; please report it"
-                .to_string(),
-        ));
-    };
-    // The surface check belongs here, on the plan, for the reason the module explains: the planner
-    // has already resolved aliases, applied search_path, expanded views and distinguished a CTE from
-    // the table it shadows. Reading the statement instead is what lost three rounds.
-    if surface::active() {
+        // Functions are judged by name, before the plan: planning a call folds constants, and
+        // `regclass('secret.t')` or `pg_relation_size('secret.t')` resolve the name WHILE planning,
+        // so "permission denied" versus "does not exist" came back from the EXPLAIN before any of
+        // the checks below had run (0.1.12 review, R7).
         // Functions first, because a plan cannot answer for them. A function body is opaque to the
         // planner, so `SELECT secret_lookup('x')` plans to a bare Result node and reads whatever it
         // likes; with SECURITY DEFINER it reads it with the owner's privileges, defeating the role
@@ -653,9 +631,29 @@ pub(crate) fn cost_guard(sql: &str, max_cost: f64, db: Option<&str>) -> Result<(
                 .iter()
                 .filter(|f| {
                     f.starts_with("pg_")
+                        // Existence and privilege oracles. `to_regclass('secret.salaries')` is NULL or
+                        // a name, `has_table_privilege` is true or false, and `col_description` reads
+                        // the comment of a column the caller may not know exists: each answers a
+                        // question about a relation outside the surface. Families again, not a list.
+                        || f.starts_with("to_reg")
+                        // The same lookup in function form: `regclass('x')` (a cast written as a
+                        // call), the I/O functions `regclassin('x')`, `regclassout('x')` (R7, 0.1.12
+                        // review), and `currval('x')`, whose argument is a regclass, so a string
+                        // literal is looked up as a relation name while planning.
+                        || crate::validate::REG_TYPES.iter().any(|t| {
+                            f.strip_prefix(t)
+                                .is_some_and(|rest| matches!(rest, "" | "in" | "out" | "send" | "recv"))
+                        })
+                        || (f.starts_with("has_") && f.ends_with("_privilege"))
                         || matches!(
                             f.as_str(),
-                            "current_setting" | "inet_server_addr" | "inet_server_port"
+                            "current_setting"
+                                | "currval"
+                                | "inet_server_addr"
+                                | "inet_server_port"
+                                | "col_description"
+                                | "obj_description"
+                                | "shobj_description"
                         )
                 })
                 .collect();
@@ -676,8 +674,9 @@ pub(crate) fn cost_guard(sql: &str, max_cost: f64, db: Option<&str>) -> Result<(
             let v = query_catalog(
                 "SELECT p.proname AS name, n.nspname AS schema, p.prosecdef AS definer \
                  FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace \
-                 WHERE lower(p.proname) = ANY($1) AND n.nspname <> 'pg_catalog'",
-                &[&called],
+                 WHERE lower(p.proname) = ANY($1) AND n.nspname <> 'pg_catalog' \
+                   AND NOT EXISTS (SELECT 1 FROM pg_depend e JOIN pg_extension x ON x.oid = e.refobjid WHERE e.classid = 'pg_proc'::regclass AND e.objid = p.oid AND e.refclassid = 'pg_extension'::regclass AND e.deptype = 'e' AND x.extname = ANY($2))",
+                &[&called, &trusted_extensions()],
                 db,
             )
             .map_err(CostErr::QueryError)?;
@@ -710,6 +709,58 @@ pub(crate) fn cost_guard(sql: &str, max_cost: f64, db: Option<&str>) -> Result<(
                 )));
             }
         }
+        // P1 of the 0.1.12 review: an operator is a function call written as a symbol, and
+        // `1 ### 1` over a SECURITY DEFINER function read a table outside the surface while the
+        // same function called by name was refused. Same rule as for functions, after resolving
+        // each operator the way PostgreSQL does.
+        let offenders = operator_offenders(&mut client, sql, db)?;
+        if !offenders.is_empty() {
+            return Err(CostErr::OutsideSurface(format!(
+                "uses an operator whose function this server cannot see inside: {}. While a \
+                 surface allowlist is configured, only operators backed by built-in functions are \
+                 permitted, for the same reason as functions. Add the function to \
+                 MCP_ALLOW_FUNCTIONS if you have read it and it stays within the surface",
+                offenders.join(", ")
+            )));
+        }
+        // P2: code a statement runs without naming it.
+        let implicit = implicit_code_offenders(sql, db)?;
+        if !implicit.is_empty() {
+            return Err(CostErr::OutsideSurface(format!(
+                "would run code this server cannot see inside, without naming it: {}. While a \
+                 surface allowlist is configured, only built-in functions (and those of the \
+                 extensions in MCP_TRUSTED_EXTENSIONS) may run, whether called, used as an \
+                 operator, or reached through a type. Add the function to MCP_ALLOW_FUNCTIONS if \
+                 you have read it and it stays within the surface",
+                implicit.join(", ")
+            )));
+        }
+    }
+    let row = client
+        .query_one(&format!("EXPLAIN (FORMAT JSON, VERBOSE) {}", sql), &[])
+        .map_err(|e| CostErr::QueryError(friendly_pg_error_for(&e, Some(sql))))?;
+    let plan: Value = row.get(0); // kolumna json: [{"Plan":{"Total Cost":..}}]
+                                  // Fail CLOSED. This was `.unwrap_or(0.0)`, so a plan whose shape we did not recognise — a
+                                  // different PostgreSQL version, a renamed field — scored zero and sailed past the cost limit
+                                  // with nothing in the log to say the guard had abstained. A cost guard that cannot read the cost
+                                  // has not measured a cheap query; it has failed to measure, and those are different answers.
+    let Some(total) = plan
+        .get(0)
+        .and_then(|v| v.get("Plan"))
+        .and_then(|v| v.get("Total Cost"))
+        .and_then(|v| v.as_f64())
+    else {
+        return Err(CostErr::QueryError(
+            "could not read the estimated cost out of the query plan, so the cost limit cannot be \
+             applied — refusing rather than guessing. This usually means an unexpected PostgreSQL \
+             version; please report it"
+                .to_string(),
+        ));
+    };
+    // The surface check belongs here, on the plan, for the reason the module explains: the planner
+    // has already resolved aliases, applied search_path, expanded views and distinguished a CTE from
+    // the table it shadows. Reading the statement instead is what lost three rounds.
+    if surface::active() {
         let found = surface::relations_in_plan(&plan);
         // An empty relation list is not consent. `SELECT x FROM secret.t WHERE false` plans to a
         // `Result` node with a one-time false filter and no relation at all, so the allowlist had
@@ -898,6 +949,385 @@ pub(crate) fn wrap_untrusted(data: &Value, tool: &str) -> Value {
         result["structuredContent"] = structured;
     }
     json!({ "result": result })
+}
+
+/// Extensions whose functions count as built-in for the surface rules: their code is the
+/// extension's, installed by a superuser, and reads no table. `MCP_TRUSTED_EXTENSIONS` replaces the
+/// default list (empty = none).
+pub(crate) const DEFAULT_TRUSTED_EXTENSIONS: &[&str] = &[
+    "pgcrypto",
+    "citext",
+    "hstore",
+    "pg_trgm",
+    "uuid-ossp",
+    "ltree",
+    "cube",
+    "earthdistance",
+];
+
+pub(crate) fn trusted_extensions() -> Vec<String> {
+    match std::env::var("MCP_TRUSTED_EXTENSIONS") {
+        Ok(v) => v
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect(),
+        Err(_) => DEFAULT_TRUSTED_EXTENSIONS
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
+    }
+}
+
+/// The catalogue walk behind P2, as one statement. $1: the relations the statement names, $2: the
+/// type names it converts to or calls, $3: trusted extensions. A view adds the relations and
+/// functions its rules depend on; a type adds its base, element, range subtype and composite
+/// fields. Then every function those reach: type input/output, a domain's CHECK (only for a type
+/// converted to, since reading a stored value does not check it), a cast whose source and target
+/// are both in play, a range's canonical and subtype_diff, the default btree and hash operator
+/// classes (sorting, grouping, DISTINCT, UNION, hashing), the comparison operators of a type in
+/// play that is not built in (`JOIN ... USING` looks `=` up by name), and the functions a view calls.
+/// Comparisons written in the statement are resolved exactly by the operator check (P1).
+const IMPLICIT_CODE_SQL: &str = "
+WITH RECURSIVE
+rels(oid) AS (
+  SELECT DISTINCT to_regclass(n)::oid FROM unnest($1::text[]) n WHERE to_regclass(n) IS NOT NULL
+  UNION
+  SELECT d.refobjid FROM rels r JOIN pg_rewrite rw ON rw.ev_class = r.oid
+    JOIN pg_depend d ON d.classid = 'pg_rewrite'::regclass AND d.objid = rw.oid
+     AND d.refclassid = 'pg_class'::regclass AND d.refobjid <> r.oid
+),
+seed(oid, via_cast) AS (
+  SELECT a.atttypid, false FROM pg_attribute a JOIN rels r ON a.attrelid = r.oid
+   WHERE a.attnum > 0 AND NOT a.attisdropped
+  UNION
+  SELECT to_regtype(n)::oid, true FROM unnest($2::text[]) n WHERE to_regtype(n) IS NOT NULL
+),
+types(oid, via_cast) AS (
+  SELECT oid, via_cast FROM seed
+  UNION
+  SELECT c.child, t.via_cast FROM types t JOIN pg_type ty ON ty.oid = t.oid
+  CROSS JOIN LATERAL (
+    SELECT NULLIF(ty.typbasetype, 0)
+    UNION ALL SELECT NULLIF(ty.typelem, 0)
+    UNION ALL SELECT rngsubtype FROM pg_range WHERE rngtypid = ty.oid
+    UNION ALL SELECT atttypid FROM pg_attribute
+              WHERE attrelid = ty.typrelid AND ty.typrelid <> 0 AND attnum > 0 AND NOT attisdropped
+  ) c(child) WHERE c.child IS NOT NULL
+),
+alltypes AS (SELECT DISTINCT oid FROM types),
+funcs(fn, why) AS (
+  SELECT f, 'input/output of type ' || format_type(ty.oid, NULL)
+    FROM alltypes t JOIN pg_type ty ON ty.oid = t.oid,
+    LATERAL unnest(ARRAY[ty.typinput, ty.typoutput, ty.typreceive, ty.typsend,
+                         ty.typmodin, ty.typmodout]::oid[]) f WHERE f <> 0
+  UNION ALL
+  SELECT d.refobjid, 'CHECK of domain ' || format_type(t.oid, NULL)
+    FROM types t JOIN pg_constraint c ON c.contypid = t.oid
+    JOIN pg_depend d ON d.classid = 'pg_constraint'::regclass AND d.objid = c.oid
+     AND d.refclassid = 'pg_proc'::regclass
+   WHERE t.via_cast
+  UNION ALL
+  SELECT c.castfunc, 'cast ' || format_type(c.castsource, NULL) || ' -> ' || format_type(c.casttarget, NULL)
+    FROM pg_cast c WHERE c.castfunc <> 0
+     AND c.castsource IN (SELECT oid FROM alltypes) AND c.casttarget IN (SELECT oid FROM alltypes)
+  UNION ALL
+  SELECT f, 'range type ' || format_type(r.rngtypid, NULL)
+    FROM pg_range r, LATERAL unnest(ARRAY[r.rngcanonical, r.rngsubdiff]::oid[]) f
+   WHERE r.rngtypid IN (SELECT oid FROM alltypes) AND f <> 0
+  UNION ALL
+  SELECT ap.amproc, 'operator class ' || oc.opcname || ' of ' || format_type(oc.opcintype, NULL)
+    FROM pg_opclass oc JOIN pg_am am ON am.oid = oc.opcmethod AND am.amname IN ('btree', 'hash')
+    JOIN pg_amproc ap ON ap.amprocfamily = oc.opcfamily
+   WHERE oc.opcdefault AND oc.opcintype IN (SELECT oid FROM alltypes)
+  UNION ALL
+  SELECT o.oprcode, 'operator class ' || oc.opcname || ' of ' || format_type(oc.opcintype, NULL)
+    FROM pg_opclass oc JOIN pg_am am ON am.oid = oc.opcmethod AND am.amname IN ('btree', 'hash')
+    JOIN pg_amop ao ON ao.amopfamily = oc.opcfamily JOIN pg_operator o ON o.oid = ao.amopopr
+   WHERE oc.opcdefault AND oc.opcintype IN (SELECT oid FROM alltypes)
+  UNION ALL
+  SELECT o.oprcode, 'operator ' || o.oprname || ' between ' || format_type(o.oprleft, NULL)
+         || ' and ' || format_type(o.oprright, NULL)
+    FROM pg_operator o JOIN pg_type lt ON lt.oid = o.oprleft
+   WHERE o.oprname IN ('=', '<>', '<', '<=', '>', '>=') AND o.oprleft = o.oprright
+     AND lt.typnamespace <> 'pg_catalog'::regnamespace
+     AND o.oprleft IN (SELECT oid FROM alltypes)
+  UNION ALL
+  SELECT d.refobjid, 'view ' || r.oid::regclass::text
+    FROM rels r JOIN pg_class rc ON rc.oid = r.oid AND rc.relkind = 'v'
+    JOIN pg_rewrite rw ON rw.ev_class = r.oid
+    JOIN pg_depend d ON d.classid = 'pg_rewrite'::regclass AND d.objid = rw.oid
+     AND d.refclassid = 'pg_proc'::regclass
+)
+SELECT DISTINCT f.why AS why, n.nspname AS schema, p.proname AS name, p.prosecdef AS definer
+  FROM funcs f JOIN pg_proc p ON p.oid = f.fn JOIN pg_namespace n ON n.oid = p.pronamespace
+ WHERE n.nspname <> 'pg_catalog'
+   AND NOT EXISTS (SELECT 1 FROM pg_depend e JOIN pg_extension x ON x.oid = e.refobjid
+                    WHERE e.classid = 'pg_proc'::regclass AND e.objid = p.oid
+                      AND e.refclassid = 'pg_extension'::regclass AND e.deptype = 'e'
+                      AND x.extname = ANY($3))
+";
+
+/// P2 of the 0.1.12 review: with a surface active, no function outside `pg_catalog` may run,
+/// including the ones a statement reaches without naming them. A domain's CHECK
+/// (`150::dpeek` answered "violates check constraint" or a row, an oracle on a salary),
+/// a cast `WITH FUNCTION`, a default operator class (`ORDER BY`, `DISTINCT` on a user type), and a
+/// view that calls a function all ran code the function check never saw. Returns `why: schema.fn`
+/// descriptions; empty when nothing outside the trusted set is reachable.
+fn implicit_code_offenders(sql: &str, db: Option<&str>) -> Result<Vec<String>, CostErr> {
+    let inputs = crate::validate::implicit_code_inputs(sql);
+    if inputs.unsure {
+        return Err(CostErr::OutsideSurface(
+            "uses a FROM item whose column types this server does not read, so it cannot tell \
+             what code converting into them would run; while a surface allowlist is configured \
+             it is refused"
+                .into(),
+        ));
+    }
+    if inputs.relations.is_empty() && inputs.types.is_empty() {
+        return Ok(Vec::new());
+    }
+    let v = query_catalog(
+        IMPLICIT_CODE_SQL,
+        &[&inputs.relations, &inputs.types, &trusted_extensions()],
+        db,
+    )
+    .map_err(CostErr::QueryError)?;
+    let empty = vec![];
+    let mut out: Vec<String> = v
+        .get("rows")
+        .and_then(|r| r.as_array())
+        .unwrap_or(&empty)
+        .iter()
+        .filter_map(|r| {
+            let name = r.get("name")?.as_str()?;
+            if crate::validate::function_explicitly_allowed(name) {
+                return None;
+            }
+            let definer = r.get("definer").and_then(|d| d.as_bool()).unwrap_or(false);
+            Some(format!(
+                "{}: {}.{}{}",
+                r.get("why")?.as_str()?,
+                r.get("schema")?.as_str()?,
+                name,
+                if definer { " (SECURITY DEFINER)" } else { "" }
+            ))
+        })
+        .collect();
+    out.sort();
+    out.dedup();
+    Ok(out)
+}
+
+/// The operators `sql` uses whose function lies outside `pg_catalog` and is not named in
+/// `MCP_ALLOW_FUNCTIONS`, as `schema.op -> schema.function` descriptions.
+///
+/// Resolution follows PostgreSQL: an exact match on the operand types wins, the first one on the
+/// search path; otherwise any candidate the operands can reach by an implicit cast might be chosen,
+/// so one outside `pg_catalog` is an offender. The operand types come from PostgreSQL itself: the
+/// use is replaced by an operator that does not exist and the statement is prepared (parsed and
+/// analysed, never run), and the error names both types. When that cannot be done the answer is
+/// a refusal. The common case costs one catalogue query: no operator of the names used exists
+/// outside `pg_catalog`.
+fn operator_offenders(
+    client: &mut postgres::Client,
+    sql: &str,
+    db: Option<&str>,
+) -> Result<Vec<String>, CostErr> {
+    let sites = crate::validate::operator_sites(sql);
+    if sites.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut names: Vec<String> = sites.iter().map(|s| s.symbol.clone()).collect();
+    names.sort();
+    names.dedup();
+    let v = query_catalog(
+        "SELECT o.oprname AS op, n.nspname AS schema, \
+                COALESCE(array_position(current_schemas(true), n.nspname), 0) AS pos, \
+                format_type(o.oprleft, NULL) AS l, format_type(o.oprright, NULL) AS r, \
+                COALESCE((SELECT typcategory::text FROM pg_type WHERE oid = o.oprleft), '') AS lc, \
+                COALESCE((SELECT typcategory::text FROM pg_type WHERE oid = o.oprright), '') AS rc, \
+                p.proname AS func, pn.nspname AS fschema, p.prosecdef AS definer, \
+                EXISTS (SELECT 1 FROM pg_depend e JOIN pg_extension x ON x.oid = e.refobjid WHERE e.classid = 'pg_proc'::regclass AND e.objid = p.oid AND e.refclassid = 'pg_extension'::regclass AND e.deptype = 'e' AND x.extname = ANY($2)) AS trusted \
+         FROM pg_operator o JOIN pg_namespace n ON n.oid = o.oprnamespace \
+         JOIN pg_proc p ON p.oid = o.oprcode JOIN pg_namespace pn ON pn.oid = p.pronamespace \
+         WHERE o.oprname = ANY($1)",
+        &[&names, &trusted_extensions()],
+        db,
+    )
+    .map_err(CostErr::QueryError)?;
+    struct Op {
+        name: String,
+        schema: String,
+        pos: i64,
+        l: String,
+        r: String,
+        lc: String,
+        rc: String,
+        outside: bool,
+        label: String,
+    }
+    let empty = vec![];
+    let ops: Vec<Op> = v
+        .get("rows")
+        .and_then(|r| r.as_array())
+        .unwrap_or(&empty)
+        .iter()
+        .filter_map(|r| {
+            let s = |k: &str| r.get(k).and_then(|x| x.as_str()).map(str::to_string);
+            let (func, fschema) = (s("func")?, s("fschema")?);
+            let definer = r.get("definer").and_then(|d| d.as_bool()).unwrap_or(false);
+            Some(Op {
+                name: s("op")?,
+                schema: s("schema")?,
+                pos: r.get("pos").and_then(|x| x.as_i64()).unwrap_or(0),
+                l: s("l")?,
+                r: s("r")?,
+                lc: s("lc")?,
+                rc: s("rc")?,
+                outside: fschema != "pg_catalog"
+                    && !r.get("trusted").and_then(|t| t.as_bool()).unwrap_or(false)
+                    && !crate::validate::function_explicitly_allowed(&func),
+                label: format!(
+                    "{}.{} -> {}.{}{}",
+                    s("schema")?,
+                    s("op")?,
+                    fschema,
+                    func,
+                    if definer { " (SECURITY DEFINER)" } else { "" }
+                ),
+            })
+        })
+        .collect();
+    let mut out: Vec<String> = Vec::new();
+    for site in &sites {
+        if let Some(schema) = &site.schema {
+            if schema == "pg_catalog" {
+                continue;
+            }
+            out.extend(
+                ops.iter()
+                    .filter(|o| o.name == site.symbol && &o.schema == schema && o.outside)
+                    .map(|o| o.label.clone()),
+            );
+            continue;
+        }
+        let visible: Vec<&Op> = ops
+            .iter()
+            .filter(|o| o.name == site.symbol && o.pos > 0)
+            .collect();
+        let suspects: Vec<&&Op> = visible.iter().filter(|o| o.outside).collect();
+        if suspects.is_empty() {
+            continue;
+        }
+        let Some(probe) = &site.probe else {
+            out.extend(suspects.iter().map(|o| o.label.clone()));
+            continue;
+        };
+        let (lt, rt) = match client.prepare(probe) {
+            Err(e) => match e.as_db_error().map(|d| d.message().to_string()) {
+                Some(m) if m.starts_with("operator does not exist: ") => {
+                    let rest = &m["operator does not exist: ".len()..];
+                    let marker = crate::validate::PROBE_OPERATOR;
+                    if let Some(r) = rest.strip_prefix(&format!("{marker} ")) {
+                        ("-".to_string(), r.to_string())
+                    } else if let Some((l, r)) = rest.split_once(&format!(" {marker} ")) {
+                        (l.to_string(), r.to_string())
+                    } else {
+                        out.extend(suspects.iter().map(|o| o.label.clone()));
+                        continue;
+                    }
+                }
+                // Anything else is an error the statement itself would raise; report it as such.
+                _ => return Err(CostErr::QueryError(friendly_pg_error_for(&e, Some(sql)))),
+            },
+            Ok(_) => {
+                out.extend(suspects.iter().map(|o| o.label.clone()));
+                continue;
+            }
+        };
+        // An unknown-typed literal takes the type of the other side when looking for an exact
+        // match; two unknowns resolve as text, the string category PostgreSQL prefers.
+        let (el, er) = match (lt.as_str(), rt.as_str()) {
+            ("unknown", "unknown") => ("text".to_string(), "text".to_string()),
+            ("unknown", r) => (r.to_string(), rt.clone()),
+            (l, "unknown") => (lt.clone(), l.to_string()),
+            _ => (lt.clone(), rt.clone()),
+        };
+        let exact = visible
+            .iter()
+            .filter(|o| o.l == el && o.r == er)
+            .min_by_key(|o| o.pos);
+        match exact {
+            Some(o) if o.outside => out.push(o.label.clone()),
+            Some(_) => {}
+            None => {
+                // No exact match: PostgreSQL chooses among the candidates the operands reach by
+                // implicit casts. Its first narrowing steps are reproduced (most exact matches on
+                // the known types, then the string category at an unknown position); if a
+                // candidate outside pg_catalog is still among them, it may be the one chosen.
+                let mut cache: std::collections::HashMap<(String, String), bool> =
+                    std::collections::HashMap::new();
+                let mut reach = |from: &str, to: &str| -> Result<bool, CostErr> {
+                    if let Some(b) = cache.get(&(from.to_string(), to.to_string())) {
+                        return Ok(*b);
+                    }
+                    let b = reachable(from, to, db)?;
+                    cache.insert((from.to_string(), to.to_string()), b);
+                    Ok(b)
+                };
+                let mut cands: Vec<&&Op> = Vec::new();
+                for o in &visible {
+                    let left_ok = if lt == "-" {
+                        o.l == "-"
+                    } else {
+                        reach(&lt, &o.l)?
+                    };
+                    if left_ok && reach(&rt, &o.r)? {
+                        cands.push(o);
+                    }
+                }
+                let exactness = |o: &Op| (o.l == lt) as u8 + (o.r == rt) as u8;
+                let best = cands.iter().map(|o| exactness(o)).max().unwrap_or(0);
+                cands.retain(|o| exactness(o) == best);
+                if lt == "unknown" && cands.iter().any(|o| o.lc == "S") {
+                    cands.retain(|o| o.lc == "S");
+                }
+                if rt == "unknown" && cands.iter().any(|o| o.rc == "S") {
+                    cands.retain(|o| o.rc == "S");
+                }
+                out.extend(cands.iter().filter(|o| o.outside).map(|o| o.label.clone()));
+            }
+        }
+    }
+    out.sort();
+    out.dedup();
+    Ok(out)
+}
+
+/// Whether a value of type `from` can be passed where `to` is expected without an explicit cast:
+/// the same type, an unknown literal, a polymorphic parameter, a domain over it, or an implicit cast.
+fn reachable(from: &str, to: &str, db: Option<&str>) -> Result<bool, CostErr> {
+    if from == to || from == "unknown" {
+        return Ok(true);
+    }
+    let v = query_catalog(
+        "SELECT (EXISTS (SELECT 1 FROM pg_type t WHERE t.oid = to_regtype($2) AND t.typtype = 'p') \
+              OR EXISTS (SELECT 1 FROM pg_type d WHERE d.oid = to_regtype($1) AND d.typtype = 'd' \
+                         AND d.typbasetype = to_regtype($2)) \
+              OR EXISTS (SELECT 1 FROM pg_cast c WHERE c.castsource = to_regtype($1) \
+                         AND c.casttarget = to_regtype($2) AND c.castcontext = 'i') \
+              OR to_regtype($1) IS NULL OR to_regtype($2) IS NULL) AS ok",
+        &[&from, &to],
+        db,
+    )
+    .map_err(CostErr::QueryError)?;
+    Ok(v.get("rows")
+        .and_then(|r| r.as_array())
+        .and_then(|r| r.first())
+        .and_then(|r| r.get("ok"))
+        .and_then(|b| b.as_bool())
+        .unwrap_or(true))
 }
 
 #[cfg(test)]

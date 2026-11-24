@@ -223,9 +223,14 @@ pub(crate) static PG_POOLS: Lazy<Result<Vec<(String, PgPool)>, String>> = Lazy::
     let mut out: Vec<(String, PgPool)> = Vec::new();
     if let Ok(spec) = std::env::var("MCP_DATABASE_URLS") {
         for entry in spec.split(';').map(str::trim).filter(|s| !s.is_empty()) {
-            let (name, url) = entry
-                .split_once('=')
-                .ok_or_else(|| format!("MCP_DATABASE_URLS: expected name=url, got {:?}", entry))?;
+            let (name, url) = entry.split_once('=').ok_or_else(|| {
+                // The entry is echoed masked: a `;` inside a password splits it here, and the
+                // half without `=` is the rest of that password.
+                format!(
+                    "MCP_DATABASE_URLS: expected name=url, got {:?}",
+                    crate::startup::strip_password(entry, false)
+                )
+            })?;
             let name = name.trim().to_string();
             if name.is_empty() {
                 return Err("MCP_DATABASE_URLS: empty connection name".to_string());

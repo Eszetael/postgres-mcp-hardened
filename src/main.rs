@@ -13,6 +13,7 @@ use serde_json::{json, Value};
 mod audit_log;
 mod auth;
 mod cli;
+mod conn_limit;
 mod db;
 mod fuzz;
 mod http;
@@ -65,11 +66,13 @@ pub(crate) struct AppState {
     /// server has no other way to establish the version, and names the session negotiated at
     /// `initialize` as exactly that other way. Without it a client that omits the header would be
     /// served an older contract than the one it agreed to.
-    sessions: Arc<tokio::sync::RwLock<std::collections::HashMap<String, (u64, protocol::Rev)>>>,
+    sessions: Arc<tokio::sync::RwLock<std::collections::HashMap<String, transport::Session>>>,
 }
 
 /// How many sessions we keep, and for how long while idle.
 pub(crate) const MAX_SESSIONS: usize = 10_000;
+/// One client key may hold this many; its oldest is dropped for a new one (see `transport::make_room`).
+pub(crate) const MAX_SESSIONS_PER_CLIENT: usize = 64;
 pub(crate) const SESSION_IDLE_SECS: u64 = 3_600;
 
 pub(crate) static PROC_START: Lazy<std::time::Instant> = Lazy::new(std::time::Instant::now);
@@ -199,15 +202,10 @@ pub(crate) async fn main() {
             .map(|s| s.as_str());
         match verify_audit_file(path, expect) {
             Ok((summary, _last)) => {
-                say(format!(
-                    "OK ({}): {}",
-                    if audit_key().is_some() {
-                        "HMAC-SHA256"
-                    } else {
-                        "SHA-256, unkeyed"
-                    },
-                    summary
-                ));
+                // The mode comes from the entries themselves (the summary starts with it), not from
+                // whether a key is configured: a key in the environment proves nothing about how
+                // the file was signed.
+                say(format!("OK {}", summary));
             }
             Err(e) => {
                 say_with_status(format!("TAMPERED: {}", e), 1);
