@@ -36,7 +36,7 @@ webpki-roots = "1"
 
 [dev-dependencies]
 rsa = { version = "0.9", features = ["pem"] }
-rand = "0.8"
+rand = "0.10"
 
 # The release profile was never set, so the shipped binary carried debug symbols it has no use for:
 # 18.9 MB, of which 5.3 MB was symbol table. Stripping is not cosmetic here — this is a security tool
